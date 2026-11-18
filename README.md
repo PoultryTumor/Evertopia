@@ -36,31 +36,17 @@ Only the standard **USA** release of *Secret of Evermore* is accepted (verified 
 
 ## What's Added Over Vanilla SNES
 
-### Widescreen & Visual Upgrades
-- **True Widescreen (`16:9` & `21:9` Ultrawide, plus `4:3`):**
-  - Streams BG1/BG2 room tilemaps directly from WRAM `$7F` for native `342×224` (`16:9`) and `426×224` (`21:9`) output.
-  - Expands enemy/object culling and alchemy targeting bounds across the widened view.
-  - Dynamically clamps room borders cleanly and wraps horizontal 48-tile intro/title backdrops (`Map 17` & `Map 97`) seamlessly without right-edge black bars.
-- **Smart HUD Repositioning:**
-  - Shifts the bottom Boy/Dog status bars and portraits cleanly into the widescreen margins (`Move Left Margin`) or keeps `Original 4:3 Center`.
-  - Automatically detects single-character segments (e.g., Nobilia splits and solo areas) so lone HUD bars and portraits remain cleanly centered.
-- **Extended Mode 4 Stone-Mosaic Menus:**
-  - Widens **Save Select / Load / Name Entry** and all six Ring Menu submenus (**Level**, **Stat.**, **Act.**, **Edit.**, **Edit.**, **Alchemy**) with seamless stone tiling and a subtle black-to-transparent outer edge vignette, decoupled from `Map 97`'s Title Screen pillarbox setting.
-- **Per-Map Pillarbox Editor (`Pillarbox Edit Mode`):**
-  - Off by default at launch so gameplay stays clean. Enable **`Pillarbox Edit Mode`** in the **Debug Tools** overlay (`RT` / `F2` / `` ` ``) to unhide the upper-right **`Map X: [0/1]`** badge, dropdown picker (`[0] 4:3 Pillar` / `[1] Widescreen`), and `0`/`1` quick-toggle keys. Your toggle state saves to `video_config.json`, and per-map changes persist to `map_pillarbox.json`.
-- **Per-Line Sprite Limits Removed:**
-  - Removes the SNES 32-sprite-per-scanline flicker cap by default (toggleable back to `Standard SNES (32)`).
-- **Lock Framerate to 60 FPS:**
-  - Enabled by default under **Video** settings (locks real-time pacing to the SNES NTSC rate; toggleable to `Unlocked`).
-
-### Programmatic Glass Themes & Post-Processing
-- **Dialog & Menu Glass Themes (`dialog_config.json`):**
-  - Choose between **8 translucent Glass themes** (*Omnitopia Blue*, *Volcano Orange*, *Swamp Green*, *Nobilia Gold*, *Ebon Keep Purple*, *Crustacea Teal*, *Colosseum Red*, *Ivor Tower Slate*) or **Original (SNES)**.
-  - Includes configurable drop shadows (`Subtle`, `Medium`, `Off`). Both the slide-out **Settings** drawer and floating **Debug** window follow the active theme, and in-game **Window Prefs** previews themes live.
-- **CRT Emulation (`crt_config.json`):**
-  - Dedicated **CRT** tab with presets (*Off*, *Just Scanlines*, *Fine 1px*, *Deep*, *Subtle*, *Classic*, *Solid Retro*, *Trinitron*, *Custom*) plus individual controls for scanline density, opacity, beam thickness, phosphor masks, luminance boost, and vignette.
-- **Bloom / Glow (`bloom_config.json`):**
-  - Dedicated **Bloom** tab with curated presets (*Default*, *Subtle*, *Soft Focus*, *Warm Sun*, *Mystic Cyan*, *Neon*, *Intense*, *Off*) plus intensity, threshold, spread radius, blend mode (*Screen*, *Additive*, *Soft Light*), and color tint.
+### Features
+- **Widescreen & Targeting:** Full widescreen support with adjusted widescreen targeting.
+- **Automatic Pillarboxing:** Smart 4:3 sidebars for maps and sequences that require original framing.
+- **One-Click Asset Extractor:** Export full map PNGs, soundtrack MP3s, and SFX WAV files with a single click.
+- **3 Save Slots:** Instant save and load states on demand.
+- **9 Custom Glass Themes:** Translucent glass styling that carries seamlessly across both in-game dialog boxes and the program's menus and windows.
+- **Debug Menu:** Packed with warps, toggles, and all the testing tools.
+- **Visual Shaders:** Configurable CRT and Bloom display settings.
+- **Subpixel Smoothness:** Subpixel map scrolling and sprite movement.
+- **Overhauled Ring Menu:** Widened ring-menu screens with enhanced usability.
+- **In-Game Jukebox:** Built-in music player to cue up tracks anytime.
 
 ### Vanilla Bug Fixes & Quality of Life (Enabled by Default)
 Toggleable individually in the **Game** tab:
@@ -68,8 +54,6 @@ Toggleable individually in the **Game** tab:
 - **Atlas / Defend Stat Underflow Fix**
 - **Dog Level 39+ Progression Fix** (fixes Dog EXP curve past Lv 39 up to 99)
 - **Boundary Softlock Prevention**
-- **Toaster Dog Audio Loop Guard:** Prevents infinite/stuck `SFX $0048` sound loops when using the Toaster Dog form.
-- **Exit to Desktop:** At the bottom of the **Game** tab (highlighted in red) to explicitly flush all config files and battery SRAM before exiting.
 
 ### Launcher & Tools
 - **ROM Details Panel:** Displays ROM Title, Header status (`Headered 512B SMC` vs `Unheadered`), Country/Region, ROM Mapping (`HiROM`/`LoROM`, `FastROM`/`SlowROM`), ROM/SRAM size, and Revision/Checksum right below **Browse For ROM**.
