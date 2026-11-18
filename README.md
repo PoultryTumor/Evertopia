@@ -6,6 +6,14 @@ A native PC static recompilation port of **Secret of Evermore** (SNES, USA), bui
 
 ---
 
+<img width="2560" height="1440" alt="Screenshot from 2026-11-18 00-39-09" src="https://github.com/user-attachments/assets/409ad5b3-8b0f-42a9-8ade-b74cc839ee71" /><img width="2560" height="1440" alt="Screenshot from 2026-11-18 00-42-56" src="https://github.com/user-attachments/assets/63b45fe4-e63e-4d1e-a9ad-8ec9fd34680f" />
+<img width="2560" height="1440" alt="Screenshot from 2026-11-18 00-41-33" src="https://github.com/user-attachments/assets/0398ae72-850e-4d28-90aa-acc446172ffb" />
+<img width="2560" height="1440" alt="Screenshot from 2026-11-18 00-32-38" src="https://github.com/user-attachments/assets/d02daaa0-336d-4145-836b-9aafc9b04a40" />
+<img width="1280" height="720" alt="Screenshot from 2026-11-15 06-31-43" src="https://github.com/user-attachments/assets/1f580559-ed46-4238-a2bf-7c2bf86a77e4" />
+<img width="2560" height="1440" alt="Screenshot from 2026-11-13 05-20-49" src="https://github.com/user-attachments/assets/78c5bb1b-94ca-40f7-b7ac-463211e8a3e9" />
+
+
+
 ## What This Is
 
 Instead of running inside a traditional emulator loop, **Evertopia** statically recompiles the USA SNES ROM into native C compiled directly against the `snesrecomp` beam-aligned PPU/APU runtime and SDL3/OpenGL presenter. This allows native enhancements like true 16:9 / 21:9 widescreen rendering, zero sprite flicker limits, custom glass dialog themes, CRT/Bloom post-processing, save-state/rewind browsers, and live debug utilities while preserving authentic SNES gameplay logic and SPC700 audio.
