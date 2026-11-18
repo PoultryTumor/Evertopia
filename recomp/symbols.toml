@@ -1,0 +1,1200 @@
+# Progressive symbol map for Secret of Evermore.
+#
+# Each [[func]] names an address the analyzer should treat as a function.
+# Set emit = true to promote one into ahead-of-time codegen; leave it false
+# to keep it interpreted. tools/regen.sh syncs labels and tier choices into
+# each recomp/bankNN.cfg; only emit=true adds a func/funcs.h declaration.
+# Do not hand-edit the generated blocks in the bank configs.
+
+[[func]]
+name = "I_RESET"
+addr = "8020"
+bank = 0
+emit = true
+note = "Emulation RESET vector ($FFFC)"
+
+[[func]]
+name = "I_NMI"
+addr = "823a"
+bank = 0
+emit = true
+note = "Native NMI vector ($FFEA)"
+
+[[func]]
+name = "soe_80_858B"
+addr = "858b"
+bank = 0x80
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_9DE8"
+addr = "9de8"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_A914"
+addr = "a914"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_AA51"
+addr = "aa51"
+bank = 0x8f
+emit = true
+entry_m = 1
+entry_x = 0
+
+[[func]]
+name = "soe_8F_9EC3"
+addr = "9ec3"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_A458"
+addr = "a458"
+bank = 0x8f
+emit = true
+entry_m = 1
+entry_x = 0
+
+[[func]]
+name = "soe_80_8650"
+addr = "8650"
+bank = 0x80
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_9F05"
+addr = "9f05"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_A963"
+addr = "a963"
+bank = 0x8f
+emit = true
+entry_m = 1
+entry_x = 0
+
+[[func]]
+name = "soe_80_859B"
+addr = "859b"
+bank = 0x80
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_9BDD"
+addr = "9bdd"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_A97D"
+addr = "a97d"
+bank = 0x8f
+emit = true
+entry_m = 1
+entry_x = 0
+
+[[func]]
+name = "soe_8F_A774"
+addr = "a774"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_A9B1"
+addr = "a9b1"
+bank = 0x8f
+emit = true
+entry_m = 1
+entry_x = 0
+
+[[func]]
+name = "soe_8F_9E49"
+addr = "9e49"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_80_960A"
+addr = "960a"
+bank = 0x80
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_80_9033"
+addr = "9033"
+bank = 0x80
+emit = false
+note = "Metasprite OAM builder; dynamically ROM-patched by SoePatchWidescreenSprites"
+
+[[func]]
+name = "soe_80_9040"
+addr = "9040"
+bank = 0x80
+emit = false
+note = "Metasprite OAM builder; dynamically ROM-patched by SoePatchWidescreenSprites"
+
+[[func]]
+name = "soe_CC_8658"
+addr = "8658"
+bank = 0xcc
+emit = false
+note = "IsEntityTargetable; dynamically ROM-patched by SoePatchWidescreenTargeting"
+
+[[func]]
+name = "soe_8F_AF48"
+addr = "af48"
+bank = 0x8f
+emit = false
+note = "Entity step collision check; dynamically ROM-patched for Walk Through Walls"
+
+[[func]]
+name = "soe_8F_B9F8"
+addr = "b9f8"
+bank = 0x8f
+emit = false
+note = "Running stamina drain; dynamically ROM-patched at $8F:BA71 for Infinite Stamina"
+
+[[func]]
+name = "soe_8C_EA43"
+addr = "ea43"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_D474"
+addr = "d474"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_CC1E"
+addr = "cc1e"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_80D2"
+addr = "80d2"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_86A9"
+addr = "86a9"
+bank = 0x90
+emit = true
+entry_m = 1
+entry_x = 0
+
+[[func]]
+name = "soe_90_999C"
+addr = "999c"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_C6C5"
+addr = "c6c5"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_C773"
+addr = "c773"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_8195"
+addr = "8195"
+bank = 0x8c
+emit = true
+entry_m = 1
+entry_x = 0
+
+[[func]]
+name = "soe_8C_818D"
+addr = "818d"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_D09C"
+addr = "d09c"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_80_9685"
+addr = "9685"
+bank = 0x80
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_9210"
+addr = "9210"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_946B"
+addr = "946b"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_89A3"
+addr = "89a3"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_9A98"
+addr = "9a98"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8E_E41E"
+addr = "e41e"
+bank = 0x8e
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_F121"
+addr = "f121"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_CFFD"
+addr = "cffd"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_D20D"
+addr = "d20d"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_91_C73F"
+addr = "c73f"
+bank = 0x91
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_AFAE"
+addr = "afae"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_DDBB"
+addr = "ddbb"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_DC34"
+addr = "dc34"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_DCD0"
+addr = "dcd0"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_AC83"
+addr = "ac83"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_A650"
+addr = "a650"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_DE5E"
+addr = "de5e"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_91_BB95"
+addr = "bb95"
+bank = 0x91
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_C9FC"
+addr = "c9fc"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_9535"
+addr = "9535"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8E_E5FC"
+addr = "e5fc"
+bank = 0x8e
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_8619"
+addr = "8619"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_C6CB"
+addr = "c6cb"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_9839"
+addr = "9839"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_CBB3"
+addr = "cbb3"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_D55F"
+addr = "d55f"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_D481"
+addr = "d481"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_A41C"
+addr = "a41c"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_A1B4"
+addr = "a1b4"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_A6EF"
+addr = "a6ef"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_98A5"
+addr = "98a5"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_9E93"
+addr = "9e93"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_98FA"
+addr = "98fa"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_99FB"
+addr = "99fb"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_A4A6"
+addr = "a4a6"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_C61E"
+addr = "c61e"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_91_98EE"
+addr = "98ee"
+bank = 0x91
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_DB9E"
+addr = "db9e"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_D7DD"
+addr = "d7dd"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_C436"
+addr = "c436"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_80_96BB"
+addr = "96bb"
+bank = 0x80
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_98ED"
+addr = "98ed"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_80_8FEE"
+addr = "8fee"
+bank = 0x80
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_9817"
+addr = "9817"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_D428"
+addr = "d428"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_9EA3"
+addr = "9ea3"
+bank = 0x8f
+emit = true
+entry_m = 1
+entry_x = 0
+
+[[func]]
+name = "soe_8C_819E"
+addr = "819e"
+bank = 0x8c
+emit = true
+entry_m = 1
+entry_x = 0
+
+[[func]]
+name = "soe_8C_C88C"
+addr = "c88c"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_8453"
+addr = "8453"
+bank = 0x90
+emit = true
+entry_m = 1
+entry_x = 0
+
+[[func]]
+name = "soe_90_8418"
+addr = "8418"
+bank = 0x90
+emit = true
+entry_m = 1
+entry_x = 0
+
+[[func]]
+name = "soe_90_836C"
+addr = "836c"
+bank = 0x90
+emit = true
+entry_m = 1
+entry_x = 0
+
+[[func]]
+name = "soe_90_83AC"
+addr = "83ac"
+bank = 0x90
+emit = true
+entry_m = 1
+entry_x = 0
+
+[[func]]
+name = "soe_90_878B"
+addr = "878b"
+bank = 0x90
+emit = true
+entry_m = 1
+entry_x = 0
+
+[[func]]
+name = "soe_90_877D"
+addr = "877d"
+bank = 0x90
+emit = true
+entry_m = 1
+entry_x = 0
+
+[[func]]
+name = "soe_90_842F"
+addr = "842f"
+bank = 0x90
+emit = true
+entry_m = 1
+entry_x = 0
+
+[[func]]
+name = "soe_80_85FA"
+addr = "85fa"
+bank = 0x80
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_9967"
+addr = "9967"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_A999"
+addr = "a999"
+bank = 0x8f
+emit = true
+entry_m = 1
+entry_x = 0
+
+[[func]]
+name = "soe_8F_9E77"
+addr = "9e77"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_80_870C"
+addr = "870c"
+bank = 0x80
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_CFB8"
+addr = "cfb8"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_9144"
+addr = "9144"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_CF3A"
+addr = "cf3a"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_D7D1"
+addr = "d7d1"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_A162"
+addr = "a162"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_A0FB"
+addr = "a0fb"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_A1C9"
+addr = "a1c9"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_A463"
+addr = "a463"
+bank = 0x8f
+emit = true
+entry_m = 1
+entry_x = 0
+
+[[func]]
+name = "soe_8F_9ED1"
+addr = "9ed1"
+bank = 0x8f
+emit = true
+entry_m = 1
+entry_x = 0
+
+[[func]]
+name = "soe_8F_9EE5"
+addr = "9ee5"
+bank = 0x8f
+emit = true
+entry_m = 1
+entry_x = 0
+
+[[func]]
+name = "soe_8F_9EE9"
+addr = "9ee9"
+bank = 0x8f
+emit = true
+entry_m = 1
+entry_x = 0
+
+[[func]]
+name = "soe_8C_9C55"
+addr = "9c55"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_9C30"
+addr = "9c30"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_9F49"
+addr = "9f49"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_9C9B"
+addr = "9c9b"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_9C62"
+addr = "9c62"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_9D95"
+addr = "9d95"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_9D8C"
+addr = "9d8c"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8D_B478"
+addr = "b478"
+bank = 0x8d
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_80_8E9A"
+addr = "8e9a"
+bank = 0x80
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_B0A4"
+addr = "b0a4"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_CCF6"
+addr = "ccf6"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_AB10"
+addr = "ab10"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_AC16"
+addr = "ac16"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_934B"
+addr = "934b"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_C2D1"
+addr = "c2d1"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_80_8860"
+addr = "8860"
+bank = 0x80
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_80_B523"
+addr = "b523"
+bank = 0x80
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_801F"
+addr = "801f"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_80_B72B"
+addr = "b72b"
+bank = 0x80
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8D_C905"
+addr = "c905"
+bank = 0x8d
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_80_B394"
+addr = "b394"
+bank = 0x80
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_80_8CC9"
+addr = "8cc9"
+bank = 0x80
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8E_E08B"
+addr = "e08b"
+bank = 0x8e
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_8710"
+addr = "8710"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_80_8D4D"
+addr = "8d4d"
+bank = 0x80
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_CE2A"
+addr = "ce2a"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8D_A07F"
+addr = "a07f"
+bank = 0x8d
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_B1AC"
+addr = "b1ac"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_803C"
+addr = "803c"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8E_9A86"
+addr = "9a86"
+bank = 0x8e
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_9DE7"
+addr = "9de7"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_91_CC15"
+addr = "cc15"
+bank = 0x91
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_9DAF"
+addr = "9daf"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8E_E4E2"
+addr = "e4e2"
+bank = 0x8e
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_8E90"
+addr = "8e90"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_80_8507"
+addr = "8507"
+bank = 0x80
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_91_9795"
+addr = "9795"
+bank = 0x91
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8F_B229"
+addr = "b229"
+bank = 0x8f
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_CBC8"
+addr = "cbc8"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_8E80"
+addr = "8e80"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_A320"
+addr = "a320"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_A0B2"
+addr = "a0b2"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_90_CC1A"
+addr = "cc1a"
+bank = 0x90
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_8C_CE99"
+addr = "ce99"
+bank = 0x8c
+emit = true
+entry_m = 0
+entry_x = 0
+
+[[func]]
+name = "soe_80_8D82"
+addr = "8d82"
+bank = 0x80
+emit = true
+entry_m = 0
+entry_x = 0
