@@ -54,6 +54,9 @@
 #endif
 #if !defined(_WIN32)
 #include <dlfcn.h>
+#define soe_dlsym(h, sym) dlsym((h), (sym))
+#else
+static inline void *soe_dlsym(void *h, const char *sym) { (void)h; (void)sym; return NULL; }
 #endif
 
 #ifdef _WIN32
@@ -5242,15 +5245,15 @@ int SoeExportAllMusic(void)
         fprintf(stderr, "[Music Exporter] libmp3lame not found (install libmp3lame0)\n");
         return 0;
     }
-    lame_init_fn l_init = (lame_init_fn)dlsym(lib, "lame_init");
-    lame_set_int_fn l_set_rate_in = (lame_set_int_fn)dlsym(lib, "lame_set_in_samplerate");
-    lame_set_int_fn l_set_rate_out = (lame_set_int_fn)dlsym(lib, "lame_set_out_samplerate");
-    lame_set_int_fn l_set_ch = (lame_set_int_fn)dlsym(lib, "lame_set_num_channels");
-    lame_set_int_fn l_set_br = (lame_set_int_fn)dlsym(lib, "lame_set_brate");
-    lame_init_params_fn l_params = (lame_init_params_fn)dlsym(lib, "lame_init_params");
-    lame_encode_il_fn l_enc = (lame_encode_il_fn)dlsym(lib, "lame_encode_buffer_interleaved");
-    lame_flush_fn l_flush = (lame_flush_fn)dlsym(lib, "lame_encode_flush");
-    lame_close_fn l_close = (lame_close_fn)dlsym(lib, "lame_close");
+    lame_init_fn l_init = (lame_init_fn)soe_dlsym(lib, "lame_init");
+    lame_set_int_fn l_set_rate_in = (lame_set_int_fn)soe_dlsym(lib, "lame_set_in_samplerate");
+    lame_set_int_fn l_set_rate_out = (lame_set_int_fn)soe_dlsym(lib, "lame_set_out_samplerate");
+    lame_set_int_fn l_set_ch = (lame_set_int_fn)soe_dlsym(lib, "lame_set_num_channels");
+    lame_set_int_fn l_set_br = (lame_set_int_fn)soe_dlsym(lib, "lame_set_brate");
+    lame_init_params_fn l_params = (lame_init_params_fn)soe_dlsym(lib, "lame_init_params");
+    lame_encode_il_fn l_enc = (lame_encode_il_fn)soe_dlsym(lib, "lame_encode_buffer_interleaved");
+    lame_flush_fn l_flush = (lame_flush_fn)soe_dlsym(lib, "lame_encode_flush");
+    lame_close_fn l_close = (lame_close_fn)soe_dlsym(lib, "lame_close");
     if (!l_init || !l_set_rate_in || !l_set_rate_out || !l_set_ch || !l_set_br ||
         !l_params || !l_enc || !l_flush || !l_close) {
         fprintf(stderr, "[Music Exporter] libmp3lame is missing required symbols\n");
@@ -6050,15 +6053,15 @@ void SoeEnsureLauncherMusicExtracted(void)
 
     void *lib = SoeOpenLame();
     if (!lib) return;
-    lame_init_fn l_init = (lame_init_fn)dlsym(lib, "lame_init");
-    lame_set_int_fn l_set_rate_in = (lame_set_int_fn)dlsym(lib, "lame_set_in_samplerate");
-    lame_set_int_fn l_set_rate_out = (lame_set_int_fn)dlsym(lib, "lame_set_out_samplerate");
-    lame_set_int_fn l_set_ch = (lame_set_int_fn)dlsym(lib, "lame_set_num_channels");
-    lame_set_int_fn l_set_br = (lame_set_int_fn)dlsym(lib, "lame_set_brate");
-    lame_init_params_fn l_params = (lame_init_params_fn)dlsym(lib, "lame_init_params");
-    lame_encode_il_fn l_enc = (lame_encode_il_fn)dlsym(lib, "lame_encode_buffer_interleaved");
-    lame_flush_fn l_flush = (lame_flush_fn)dlsym(lib, "lame_encode_flush");
-    lame_close_fn l_close = (lame_close_fn)dlsym(lib, "lame_close");
+    lame_init_fn l_init = (lame_init_fn)soe_dlsym(lib, "lame_init");
+    lame_set_int_fn l_set_rate_in = (lame_set_int_fn)soe_dlsym(lib, "lame_set_in_samplerate");
+    lame_set_int_fn l_set_rate_out = (lame_set_int_fn)soe_dlsym(lib, "lame_set_out_samplerate");
+    lame_set_int_fn l_set_ch = (lame_set_int_fn)soe_dlsym(lib, "lame_set_num_channels");
+    lame_set_int_fn l_set_br = (lame_set_int_fn)soe_dlsym(lib, "lame_set_brate");
+    lame_init_params_fn l_params = (lame_init_params_fn)soe_dlsym(lib, "lame_init_params");
+    lame_encode_il_fn l_enc = (lame_encode_il_fn)soe_dlsym(lib, "lame_encode_buffer_interleaved");
+    lame_flush_fn l_flush = (lame_flush_fn)soe_dlsym(lib, "lame_encode_flush");
+    lame_close_fn l_close = (lame_close_fn)soe_dlsym(lib, "lame_close");
     if (!l_init || !l_set_rate_in || !l_set_rate_out || !l_set_ch || !l_set_br ||
         !l_params || !l_enc || !l_flush || !l_close) {
         return;

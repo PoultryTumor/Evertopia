@@ -9,6 +9,7 @@ A native PC static recompilation port of **Secret of Evermore** (SNES, USA), bui
 ## What's New
 
 ### v0.8.0
+- **Windows x64 Release (Experimental):** Added an automated Windows x64 Setup Pack (`evertopia-0.8.0-windows-x64.zip`) built natively via GitHub Actions with the portable toolchain embedded — unzip, run `Evertopia.exe`, and select your ROM to build and play locally (if Windows SmartScreen prompts on first run, click *More info → Run anyway*).
 - **Map Exporter Fix (Large & Complex Maps):** Fixed garbled PNG exports on large/complex maps (including Great Pyramid Exterior, Gomi's Tower, Jungle South of Fire Eyes' Village, Oglin Caves, Swamp Maze, and Map 113) by waiting for `$7F` decompression, VRAM tileset streaming, CGRAM BG palettes, and screen unblanking to settle before capture, plus SNES-accurate 10-bit tile / 32K-word VRAM wrapping.
 - **Multi-Chamber Widescreen Clamping:** Fixed widescreen and ultrawide room-edge clamping on multi-chamber maps that separate rooms with solid flat dark-void BG2 tiles (e.g. Map 60 — Volcano Two Pots Room), eliminating dark void strips past chamber walls.
 - **Parallax Layer Widescreen Clamping:** Fixed widescreen and ultrawide boundary clamping on parallax-scrolling maps (e.g. Map 56 — Prehistoria Jungle South of Fire Eyes' Village) by probing the active world-camera layer so overhead BG1 foliage/vines no longer expose black void underneath.

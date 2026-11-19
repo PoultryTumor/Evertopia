@@ -1,0 +1,4532 @@
+#include "ppu.h"
+#include "hd_jobs_internal.h"
+#include "mode7_hd.h"
+
+extern unsigned char g_snesrecomp_last_hdmaen;
+static bool s_guest_scope;
+void ppu_setGuestScope(bool active) {s_guest_scope=active;}
+#include "ppu_legacy.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
+#include "snes.h"
+#include "../debug_server.h"
+#if SNESRECOMP_ENABLE_MODS
+#include "../snes_text_xlate.h"
+#endif
+#include "snes_regs.h"
+#include "ws_shadow.h"
+
+#ifndef SNESRECOMP_PPU_8BPP_HLE
+#define SNESRECOMP_PPU_8BPP_HLE 0
+#endif
+#if SNESRECOMP_PPU_8BPP_HLE != 0 && SNESRECOMP_PPU_8BPP_HLE != 1
+#error SNESRECOMP_PPU_8BPP_HLE must be 0 or 1
+#endif
+
+extern Snes *g_snes;
+extern unsigned char g_snesrecomp_last_hdmaen;
+
+/* Detached pictures share the pixel algorithms, but must not publish live
+ * machine diagnostics or consult callbacks owned by another picture. Keep
+ * this render scope private and per thread; it is not emulated PPU state. */
+#ifdef _MSC_VER
+static __declspec(thread) unsigned s_detached_line_depth;
+#else
+static _Thread_local unsigned s_detached_line_depth;
+#endif
+
+#ifdef SNESRECOMP_INTERP_PROFILE
+static double g_ppu_sec_eval_ms = 0;
+static double g_ppu_sec_line_ms = 0;
+static double g_ppu_sec_bg_ms = 0;
+static double g_ppu_sec_spr_ms = 0;
+double g_ppu_sec_hdma_ms = 0;
+uint64_t g_ppu_sec_eval_n = 0, g_ppu_sec_line_n = 0;
+static inline uint64_t ppu_sec_now(void) {
+  extern uint64_t snesrecomp_host_now_ns(void);
+  return snesrecomp_host_now_ns();
+}
+void ppu_sec_reset(void) {
+  g_ppu_sec_eval_ms = 0;
+  g_ppu_sec_line_ms = 0;
+  g_ppu_sec_bg_ms = 0;
+  g_ppu_sec_spr_ms = 0;
+  g_ppu_sec_hdma_ms = 0;
+  g_ppu_sec_eval_n = 0;
+  g_ppu_sec_line_n = 0;
+}
+void ppu_sec_read(double *eval, double *line, double *bg, double *spr,
+                  double *compose, double *hdma) {
+  *eval = g_ppu_sec_eval_ms;
+  *line = g_ppu_sec_line_ms;
+  *bg = g_ppu_sec_bg_ms;
+  *spr = g_ppu_sec_spr_ms;
+  *compose = g_ppu_sec_line_ms - g_ppu_sec_bg_ms - g_ppu_sec_spr_ms;
+  if (*compose < 0.0)
+    *compose = 0.0;
+  *hdma = g_ppu_sec_hdma_ms;
+}
+#define PPU_T0_DECL uint64_t _ppu_t = 0;
+#define PPU_T0 do { if (!s_detached_line_depth) _ppu_t = ppu_sec_now(); } while (0)
+#define PPU_ACC(V) do { if (!s_detached_line_depth) (V) += 1e-6 * (double)(ppu_sec_now() - _ppu_t); } while (0)
+#else
+#define PPU_T0_DECL
+#define PPU_T0 do { } while (0)
+#define PPU_ACC(V) do { } while (0)
+#endif
+
+static void PpuDrawWholeLine(Ppu *ppu, uint y);
+
+static bool ppu_evaluateSprites(Ppu* ppu, int line);
+static void SnesHdCaptureLine(SnesHdCapture *capture, Ppu *ppu, unsigned line);
+static void SnesHdCaptureDetach(SnesHdCapture *capture, Ppu *ppu);
+static uint16_t ppu_getVramRemap(Ppu* ppu);
+static void PpuUpdateWidescreenOamHistory(Ppu *ppu, int line);
+
+
+Ppu* ppu_init(void) {
+  Ppu* ppu = calloc(1, sizeof(Ppu));  /* zero padding: saveload/co-sim hash determinism */
+  if (ppu)
+    ppu->wsOamMotionGraceOn = 1;
+  ppu->wsOamMotionLastLine = -1;
+  return ppu;
+}
+
+void ppu_free(Ppu* ppu) {
+  if (ppu && ppu->hdCapture) SnesHdCaptureDetach(ppu->hdCapture, ppu);
+  free(ppu);
+}
+
+void ppu_reset(Ppu* ppu) {
+  {
+    size_t pitch = ppu->renderPitch;
+    uint8_t *renderBuffer = ppu->renderBuffer;
+    uint32_t renderFlags = ppu->renderFlags;
+    SnesHdCapture *hdCapture = ppu->hdCapture;
+    SnesHdCaptureReset(hdCapture);
+    uint32_t overlayPitch[kPpuOverlaySource_Count];
+    uint8_t *overlayBuffer[kPpuOverlaySource_Count];
+    memcpy(overlayPitch, ppu->overlayRenderPitch, sizeof(overlayPitch));
+    memcpy(overlayBuffer, ppu->overlayRenderBuffer, sizeof(overlayBuffer));
+    memset(ppu, 0, sizeof(*ppu));
+    ppu->renderBuffer = renderBuffer;
+    ppu->renderPitch = (uint32_t)pitch;
+    ppu->renderFlags = renderFlags;
+    ppu->hdCapture = hdCapture;
+    memcpy(ppu->overlayRenderPitch, overlayPitch, sizeof(overlayPitch));
+    memcpy(ppu->overlayRenderBuffer, overlayBuffer, sizeof(overlayBuffer));
+  }
+  ppu->vramIncrement = 1;
+  ppu->wsOamMotionGraceOn = 1;
+  ppu->wsOamMotionLastLine = -1;
+}
+
+void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli) {
+  assert(offsetof(Ppu, cgwsel) + 1 - offsetof(Ppu, inidisp) == PPU_SAVESTATE_REGS_SIZE);
+  assert(offsetof(Ppu, vram) + 0x10000 - offsetof(Ppu, cgram) == PPU_SAVESTATE_MEM_SIZE);
+  uint32 version[2] = {'P' | 'P' << 8 | 'U' << 16 | '0' << 24, PPU_SAVESTATE_REGS_SIZE + PPU_SAVESTATE_MEM_SIZE};
+  sli->func(sli, version, 8);
+  sli->func(sli, &ppu->inidisp, PPU_SAVESTATE_REGS_SIZE);
+  /* The write counters must move on a load (it replaces VRAM and OAM
+   * wholesale) and must NOT move on a save: rewind and run-ahead save every
+   * few frames, and a host pairing "OAM was just uploaded" with what produced
+   * it would take each snapshot for an upload. There is no direction flag,
+   * so compare what the call left behind. */
+  static uint16_t vram_before[0x8000], oam_before[0x100];
+  static uint8_t high_before[0x20];
+  memcpy(vram_before, ppu->vram, sizeof(vram_before));
+  memcpy(oam_before, ppu->oam, sizeof(oam_before));
+  memcpy(high_before, ppu->highOam, sizeof(high_before));
+  sli->func(sli, &ppu->cgram, PPU_SAVESTATE_MEM_SIZE);
+  if (memcmp(vram_before, ppu->vram, sizeof(vram_before)) != 0) ppu->vramWriteCount++;
+  if (memcmp(oam_before, ppu->oam, sizeof(oam_before)) != 0 ||
+      memcmp(high_before, ppu->highOam, sizeof(high_before)) != 0)
+    ppu->oamWriteCount++;
+}
+
+void PpuResetWidescreenOamHistory(Ppu *ppu) {
+  if (!ppu)
+    return;
+  ppu->wsOamMotionGraceOn = 1;
+  ppu->wsOamMotionLastLine = -1;
+  memset(ppu->wsOamMotionX, 0, sizeof(ppu->wsOamMotionX));
+  memset(ppu->wsOamMotionSig, 0, sizeof(ppu->wsOamMotionSig));
+  memset(ppu->wsOamMotionSeen, 0, sizeof(ppu->wsOamMotionSeen));
+  memset(ppu->wsOamMotionGrace, 0, sizeof(ppu->wsOamMotionGrace));
+}
+
+#define PPU_PORT_FIELDS(F) \
+  F(vramPointer) F(vramReadBuffer) F(vramIncrementOnHigh) F(vramRemapMode) \
+  F(vramIncrement) F(cgramPointer) F(cgramSecondWrite) F(cgramBuffer) \
+  F(scrollPrev) F(scrollPrev2) F(m7prev) F(mosaicStartLine) \
+  F(m7startX) F(m7startY) F(hCount) F(vCount) F(hCountSecond) \
+  F(vCountSecond) F(countersLatched) F(timeOver) F(rangeOver) F(evenFrame) \
+  F(frameOverscan) F(frameInterlace)
+
+void ppu_rb_residue_get(const Ppu *ppu, PpuRollbackResidue *out) {
+  if (!ppu || !out)
+    return;
+  memset(out, 0, sizeof(*out));
+#define GET_PORT(field) out->field = ppu->field;
+  PPU_PORT_FIELDS(GET_PORT)
+#undef GET_PORT
+  out->oamAdr = ppu->oamAdr;
+  out->oamInHigh = ppu->oamInHigh ? 1u : 0u;
+  out->oamSecondWrite = ppu->oamSecondWrite ? 1u : 0u;
+  out->oamBuffer = ppu->oamBuffer;
+  out->wsOamMotionLastLine = ppu->wsOamMotionLastLine;
+  memcpy(out->wsOamMotionX, ppu->wsOamMotionX, sizeof(out->wsOamMotionX));
+  memcpy(out->wsOamMotionSig, ppu->wsOamMotionSig, sizeof(out->wsOamMotionSig));
+  memcpy(out->wsOamMotionSeen, ppu->wsOamMotionSeen, sizeof(out->wsOamMotionSeen));
+  memcpy(out->wsOamMotionGrace, ppu->wsOamMotionGrace, sizeof(out->wsOamMotionGrace));
+}
+
+void ppu_rb_residue_set(Ppu *ppu, const PpuRollbackResidue *in) {
+  if (!ppu || !in)
+    return;
+#define SET_PORT(field) ppu->field = in->field;
+  PPU_PORT_FIELDS(SET_PORT)
+#undef SET_PORT
+  ppu->oamAdr = in->oamAdr;
+  ppu->oamInHigh = in->oamInHigh != 0u;
+  ppu->oamSecondWrite = in->oamSecondWrite != 0u;
+  ppu->oamBuffer = in->oamBuffer;
+  ppu->wsOamMotionLastLine = in->wsOamMotionLastLine;
+  memcpy(ppu->wsOamMotionX, in->wsOamMotionX, sizeof(in->wsOamMotionX));
+  memcpy(ppu->wsOamMotionSig, in->wsOamMotionSig, sizeof(in->wsOamMotionSig));
+  memcpy(ppu->wsOamMotionSeen, in->wsOamMotionSeen, sizeof(in->wsOamMotionSeen));
+  memcpy(ppu->wsOamMotionGrace, in->wsOamMotionGrace, sizeof(in->wsOamMotionGrace));
+}
+#undef PPU_PORT_FIELDS
+
+// Debug layer isolation: SNESRECOMP_LAYER_MASK is a bitmask of layers to keep
+// (bit0=BG1 .. bit3=BG4, bit4=OBJ). Host-only render filter — never serialized,
+// never affects guest state. Unset/0xff = all layers (normal).
+uint8_t g_snes_ppu_dbg_layer_mask = 0xff;
+
+void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags) {
+  static bool mask_init;
+  if (!mask_init) {
+    mask_init = true;
+    const char *m = getenv("SNESRECOMP_LAYER_MASK");
+    if (m && *m)
+      g_snes_ppu_dbg_layer_mask = (uint8_t)strtoul(m, NULL, 0);
+  }
+  ppu->renderPitch = (uint)pitch;
+  ppu->renderBuffer = pixels;
+  ppu->renderFlags = render_flags;
+}
+
+void PpuSetWidescreenLineEnhancer(Ppu *ppu,
+                                  PpuWidescreenLineEnhancer *enhancer,
+                                  void *context) {
+  ppu->widescreenLineEnhancer = enhancer;
+  ppu->widescreenLineEnhancerContext = enhancer ? context : NULL;
+}
+
+void PpuClearOverlayCaptures(Ppu *ppu) {
+  memset(ppu->overlayCaptures, 0, sizeof(ppu->overlayCaptures));
+}
+
+void PpuClearOverlayBindings(Ppu *ppu) {
+  memset(ppu->overlayRenderBuffer, 0, sizeof(ppu->overlayRenderBuffer));
+  memset(ppu->overlayRenderPitch, 0, sizeof(ppu->overlayRenderPitch));
+  PpuClearOverlayCaptures(ppu);
+}
+
+bool PpuBindOverlaySurface(Ppu *ppu, PpuOverlaySource source,
+                           uint8_t *pixels, size_t pitch) {
+  if ((unsigned)source >= kPpuOverlaySource_Count ||
+      (pixels && (!pitch || pitch % sizeof(uint32_t) != 0 ||
+                  pitch / sizeof(uint32_t) < kPpuXPixels ||
+                  pitch / sizeof(uint32_t) > kPpuBufWidth)))
+    return false;
+  ppu->overlayRenderBuffer[source] = pixels;
+  ppu->overlayRenderPitch[source] = pixels ? (uint32_t)pitch : 0;
+  if (!pixels)
+    memset(&ppu->overlayCaptures[source], 0,
+           sizeof(ppu->overlayCaptures[source]));
+  return true;
+}
+
+bool PpuSetOverlayCapture(Ppu *ppu, PpuOverlaySource source,
+                          int x, int y, int width, int height, uint8_t flags) {
+  if ((unsigned)source >= kPpuOverlaySource_Count || width <= 0 || height <= 0)
+    return false;
+  int64_t requested_x1 = (int64_t)x + width;
+  int64_t requested_y1 = (int64_t)y + height;
+  int x0 = IntMax(x, -kPpuLineBorder);
+  int x1 = requested_x1 < kPpuXPixels + kPpuLineBorder
+      ? (int)requested_x1 : kPpuXPixels + kPpuLineBorder;
+  int y0 = IntMax(y, 0);
+  int y1 = requested_y1 < 240 ? (int)requested_y1 : 240;
+  if (x1 <= x0 || y1 <= y0)
+    return false;
+  PpuOverlayCapture *capture = &ppu->overlayCaptures[source];
+  capture->x0 = (int16_t)x0;
+  capture->x1 = (int16_t)x1;
+  capture->y0 = (int16_t)y0;
+  capture->y1 = (int16_t)y1;
+  capture->flags = flags & kPpuOverlayFlag_RemoveFromGame;
+  capture->oamFirst = 0;
+  capture->oamCount = source == kPpuOverlaySource_Obj ? 128 : 0;
+  return true;
+}
+
+bool PpuSetOverlayOamRange(Ppu *ppu, uint8_t first, uint8_t count) {
+  PpuOverlayCapture *capture =
+      &ppu->overlayCaptures[kPpuOverlaySource_Obj];
+  if (first >= 128 || !count || count > 128 - first ||
+      capture->x1 <= capture->x0 || capture->y1 <= capture->y0)
+    return false;
+  capture->oamFirst = first;
+  capture->oamCount = count;
+  return true;
+}
+
+static inline void PpuResetLayerPolicies(Ppu *ppu) {
+  ppu->wsLayerClamp = 0;
+  ppu->wsLayerMirror = 0;
+  ppu->wsLayerRepeat = 0;
+  memset(ppu->wsClampY0, 0, sizeof(ppu->wsClampY0));
+  memset(ppu->wsClampY1, 0, sizeof(ppu->wsClampY1));
+  memset(ppu->wsRepeatY0, 0, sizeof(ppu->wsRepeatY0));
+  memset(ppu->wsRepeatY1, 0, sizeof(ppu->wsRepeatY1));
+  memset(ppu->wsStretchY0, 0, sizeof(ppu->wsStretchY0));
+  memset(ppu->wsStretchY1, 0, sizeof(ppu->wsStretchY1));
+  memset(ppu->wsAnchorY0, 0, sizeof(ppu->wsAnchorY0));
+  memset(ppu->wsAnchorY1, 0, sizeof(ppu->wsAnchorY1));
+  memset(ppu->wsAnchorLeftEnd, 0, sizeof(ppu->wsAnchorLeftEnd));
+  memset(ppu->wsAnchorRightStart, 0, sizeof(ppu->wsAnchorRightStart));
+  memset(ppu->wsMarginGapL, 0, sizeof(ppu->wsMarginGapL));
+  memset(ppu->wsMarginGapR, 0, sizeof(ppu->wsMarginGapR));
+  memset(ppu->wsWorldY0, 0, sizeof(ppu->wsWorldY0));
+  memset(ppu->wsWorldY1, 0, sizeof(ppu->wsWorldY1));
+  memset(ppu->wsWorldLeft, 0, sizeof(ppu->wsWorldLeft));
+  memset(ppu->wsWorldRight, 0, sizeof(ppu->wsWorldRight));
+  memset(ppu->wsWorldClip, 0, sizeof(ppu->wsWorldClip));
+  memset(ppu->wsWorldRepeat, 0, sizeof(ppu->wsWorldRepeat));
+  memset(ppu->wsWorldReference, 0, sizeof(ppu->wsWorldReference));
+  memset(ppu->wsElasticY0, 0, sizeof(ppu->wsElasticY0));
+  memset(ppu->wsElasticY1, 0, sizeof(ppu->wsElasticY1));
+  memset(ppu->wsElasticNSeg, 0, sizeof(ppu->wsElasticNSeg));
+  memset(ppu->wsElasticSeg, 0, sizeof(ppu->wsElasticSeg));
+  memset(ppu->wsViewportInsetL, 0, sizeof(ppu->wsViewportInsetL));
+  memset(ppu->wsViewportInsetR, 0, sizeof(ppu->wsViewportInsetR));
+  ppu->wsWindowExpandLayers = 0;
+  ppu->wsWindowExpandWindows = 0;
+  ppu->wsViewAnchor = 0;
+  ppu->wsOamFullXOn = 0;
+}
+
+int PpuWsExtraOverride(void) {
+  static int s_ov = -2;
+  if (s_ov == -2) {
+    const char *e = getenv("SNESRECOMP_WS_EXTRA");
+    s_ov = (e && e[0]) ? atoi(e) : -1;
+    if (s_ov > kPpuMaxFrameExtra)
+      s_ov = kPpuMaxFrameExtra;
+  }
+  return s_ov;
+}
+
+void PpuSetExtraSpace(Ppu *ppu, uint16_t extra) {
+  if (extra > kPpuMaxFrameExtra)
+    extra = kPpuMaxFrameExtra;
+  // Symmetric border: equal columns added on each side. extraLeftRight is the
+  // centering budget; extraLeftCur/extraRightCur are the per-side columns the
+  // window/sprite/composite paths actually render.
+  ppu->extraLeftRight = extra;
+  ppu->extraLeftCur = extra;
+  ppu->extraRightCur = extra;
+  ppu->extraFrameLeft = extra;
+  ppu->extraFrameRight = extra;
+  PpuResetLayerPolicies(ppu);
+}
+
+void PpuSetExtraSpaceCentered(Ppu *ppu, uint16_t budget) {
+  if (budget > kPpuMaxFrameExtra)
+    budget = kPpuMaxFrameExtra;
+  // Render only the authentic 256 columns but keep the centering budget so the
+  // composite places them in the middle of the wider framebuffer (the caller
+  // clears the side margins to black -> letterbox/pillarbox). Used for bounded
+  // screens (overworld, title) where there is no valid BG past 256 to show.
+  ppu->extraLeftRight = budget;
+  ppu->extraLeftCur = 0;
+  ppu->extraRightCur = 0;
+  ppu->extraFrameLeft = budget;
+  ppu->extraFrameRight = budget;
+  PpuResetLayerPolicies(ppu);
+}
+
+void PpuSetExtraSideSpace(Ppu *ppu, int left, int right, int bottom) {
+  // Per-frame asymmetric fill within the centering budget (extraLeftRight).
+  // Mirrors zelda3's PpuSetExtraSideSpace; left/right clamp to the budget so
+  // the line renderer's window edges stay inside the priority buffers, bottom
+  // clamps to the 16px overscan band. See ppu.h for the symmetric-vs-dynamic
+  // distinction.
+  const int budget = ppu->extraLeftRight;
+  if (ppu->wsViewAnchor) {
+    // Anchored (PpuSetWidescreenViewAnchor): the margins share ONE allowance
+    // of 2*budget columns rather than getting budget each, and the frame
+    // origin slides with them so a margin the game clamped to 0 becomes
+    // picture on the other side instead of a black bar on this one.
+    const int span = budget * 2;
+    const int cap = IntMin(span, kPpuLineBorder);
+    left = IntMin(IntMax(left, 0), cap);
+    right = IntMin(IntMax(right, 0), cap);
+    if (right > span - left)
+      right = span - left;
+    // Whatever the two margins leave unclaimed is padding, split evenly; the
+    // odd column goes right, because the origin takes the floor.
+    int frame_left = left + (span - left - right) / 2;
+    // Buffers reserve the whole maximum allowance on either side, so this
+    // clamp is defensive: every supported output budget can slide fully.
+    frame_left = IntMin(IntMax(frame_left, span - kPpuLineBorder),
+                        kPpuLineBorder);
+    ppu->extraLeftCur = (uint16_t)left;
+    ppu->extraRightCur = (uint16_t)right;
+    ppu->extraFrameLeft = (uint16_t)frame_left;
+    ppu->extraFrameRight = (uint16_t)(span - frame_left);
+  } else {
+    ppu->extraLeftCur = (uint16_t)IntMin(IntMax(left, 0), budget);
+    ppu->extraRightCur = (uint16_t)IntMin(IntMax(right, 0), budget);
+    ppu->extraFrameLeft = (uint16_t)budget;
+    ppu->extraFrameRight = (uint16_t)budget;
+  }
+  ppu->extraBottomCur = (uint8_t)IntMin(IntMax(bottom, 0), 16);
+}
+
+void PpuSetWidescreenViewAnchor(Ppu *ppu, bool enabled) {
+  ppu->wsViewAnchor = enabled ? 1 : 0;
+  // Re-derive the origin from the margins already published this frame, so a
+  // game may publish the anchor and the margins in either order.
+  PpuSetExtraSideSpace(ppu, ppu->extraLeftCur, ppu->extraRightCur,
+                       ppu->extraBottomCur);
+}
+
+void PpuSetSemiTransparentDialogBg(Ppu *ppu, bool enable) {
+  if (ppu) ppu->semiTransparentDialogBg = enable ? 1 : 0;
+}
+
+void PpuSetWidescreenHudSplit(Ppu *ppu, uint8_t height, uint8_t left_end,
+                              uint8_t right_start) {
+  // See ppu.h. Chunk bounds must be ordered for the span construction in
+  // PpuDrawBackground_2bpp (strictly ascending edges); disable otherwise.
+  if (left_end == 0 || left_end >= right_start) height = 0;
+  // Bit 7 is host policy for PpuSetWidescreenHudAlwaysVisible. HUD bands are
+  // at most 127 lines, so keep the option in this existing host-only byte.
+  ppu->wsHudSplitHeight = (ppu->wsHudSplitHeight & 0x80) | (height & 0x7f);
+  ppu->wsHudOamHeight = height & 0x7f;
+  ppu->wsHudLeftEnd = left_end;
+  ppu->wsHudRightStart = right_start;
+}
+
+void PpuSetWidescreenHudAlwaysVisible(Ppu *ppu, bool enabled) {
+  ppu->wsHudSplitHeight = (ppu->wsHudSplitHeight & 0x7f) |
+                          (enabled ? 0x80 : 0);
+}
+
+void PpuSetWsHudOamBand(Ppu *ppu, uint8_t height, uint8_t left_end,
+                        uint8_t right_start) {
+  if (left_end == 0 || left_end >= right_start) height = 0;
+  ppu->wsHudOamHeight = height;
+  ppu->wsHudLeftEnd = left_end;
+  ppu->wsHudRightStart = right_start;
+}
+
+void PpuSetWsHudOamShift(Ppu *ppu, uint8_t nslots) {
+  PpuSetWsHudOamShiftRange(ppu, 0, nslots);
+}
+
+void PpuSetWsHudOamShiftRange(Ppu *ppu, uint8_t first_slot, uint8_t nslots) {
+  if (first_slot >= 128 || nslots == 0) {
+    ppu->wsHudOamFirstSlot = 0;
+    ppu->wsHudOamSlots = 0;
+    return;
+  }
+  ppu->wsHudOamFirstSlot = first_slot;
+  ppu->wsHudOamSlots =
+      nslots > 128 - first_slot ? (uint8_t)(128 - first_slot) : nslots;
+}
+
+void PpuSetWsHudOamShiftRange2(Ppu *ppu, uint8_t first_slot, uint8_t nslots) {
+  if (first_slot >= 128 || nslots == 0) {
+    ppu->wsHudOamFirstSlot2 = 0;
+    ppu->wsHudOamSlots2 = 0;
+    return;
+  }
+  ppu->wsHudOamFirstSlot2 = first_slot;
+  ppu->wsHudOamSlots2 =
+      nslots > 128 - first_slot ? (uint8_t)(128 - first_slot) : nslots;
+}
+
+void PpuSetWidescreenBg3Widen(Ppu *ppu, uint8_t from_y) {
+  ppu->wsBg3WidenY = from_y;
+}
+
+void PpuWsSetOamLeftHints(Ppu *ppu, const uint8_t *hints) {
+  if (hints) {
+    ppu->wsOamLeftHintStrict = 1;
+    memcpy(ppu->wsOamLeftHint, hints, sizeof(ppu->wsOamLeftHint));
+  } else {
+    ppu->wsOamLeftHintStrict = 0;
+    memset(ppu->wsOamLeftHint, 0, sizeof(ppu->wsOamLeftHint));
+  }
+}
+
+void PpuWsSetOamRightHints(Ppu *ppu, const uint8_t *hints) {
+  if (hints) {
+    ppu->wsOamRightHintStrict = 1;
+    memcpy(ppu->wsOamRightHint, hints, sizeof(ppu->wsOamRightHint));
+  } else {
+    ppu->wsOamRightHintStrict = 0;
+    memset(ppu->wsOamRightHint, 0, sizeof(ppu->wsOamRightHint));
+  }
+}
+
+void PpuSetWidescreenLayerMask(Ppu *ppu, uint8_t bg_layer_mask) {
+  ppu->wsLayerWidenMask = bg_layer_mask & 0x0f;
+}
+
+void PpuSetMode2LayerCapture(Ppu *ppu, int layer) {
+  ppu->wsMode2CaptureLayer = layer >= 0 && layer < 2 ? (uint8_t)(layer + 1) : 0;
+}
+
+const uint8_t *PpuGetMode2LayerCapture(const Ppu *ppu) {
+  return ppu->wsMode2CaptureLayer ? &ppu->wsMode2Capture[0][0] : NULL;
+}
+
+const uint8_t *PpuGetMode2Bg1Palette(const Ppu *ppu) {
+  return &ppu->wsMode2Bg1Palette[0][0];
+}
+
+void PpuSetWidescreenLayerClamp(Ppu *ppu, uint8_t mask) {
+  ppu->wsLayerClamp = mask;
+}
+
+void PpuSetWidescreenWindowExpansion(Ppu *ppu, uint8_t layer_mask,
+                                     uint8_t window_mask) {
+  ppu->wsWindowExpandLayers = layer_mask & 0x3f;
+  ppu->wsWindowExpandWindows = window_mask & 0x03;
+}
+
+void PpuSetWidescreenLayerMirror(Ppu *ppu, uint8_t mask) {
+  ppu->wsLayerMirror = mask;
+}
+
+void PpuSetWidescreenLayerRepeat(Ppu *ppu, uint8_t mask) {
+  ppu->wsLayerRepeat = mask;
+}
+
+void PpuSetWidescreenLayerClampBand(Ppu *ppu, uint8_t layer, uint8_t y0,
+                                    uint8_t y1) {
+  if (layer < 4) {
+    ppu->wsClampY0[layer] = y0;
+    ppu->wsClampY1[layer] = y1;
+  }
+}
+
+void PpuSetWidescreenLayerRepeatBand(Ppu *ppu, uint8_t layer, uint8_t y0,
+                                     uint8_t y1) {
+  if (layer < 4) {
+    ppu->wsRepeatY0[layer] = y0;
+    ppu->wsRepeatY1[layer] = y1;
+  }
+}
+
+void PpuSetWidescreenLayerStretchBand(Ppu *ppu, uint8_t layer, uint8_t y0,
+                                      uint8_t y1) {
+  if (layer < 4) {
+    ppu->wsStretchY0[layer] = y0;
+    ppu->wsStretchY1[layer] = y1;
+  }
+}
+
+void PpuSetWidescreenLayerAnchorBand(Ppu *ppu, uint8_t layer, uint8_t y0,
+                                     uint8_t y1, uint8_t left_end,
+                                     uint8_t right_start) {
+  PpuSetWidescreenLayerAnchorBandSlot(
+      ppu, 0, layer, y0, y1, left_end, right_start);
+}
+
+void PpuSetWidescreenLayerAnchorBandSlot(
+    Ppu *ppu, uint8_t slot, uint8_t layer, uint8_t y0, uint8_t y1,
+    uint8_t left_end, uint8_t right_start) {
+  if (slot >= kPpuWsAnchorBands || layer >= 4)
+    return;
+  if (y1 <= y0 || left_end == 0 || left_end >= right_start) {
+    y0 = y1 = left_end = right_start = 0;
+  }
+  ppu->wsAnchorY0[slot][layer] = y0;
+  ppu->wsAnchorY1[slot][layer] = y1;
+  ppu->wsAnchorLeftEnd[slot][layer] = left_end;
+  ppu->wsAnchorRightStart[slot][layer] = right_start;
+}
+
+void PpuSetWidescreenLayerMarginGap(Ppu *ppu, uint8_t layer, uint8_t left_px,
+                                    uint8_t right_px) {
+  if (layer < 4) {
+    ppu->wsMarginGapL[layer] = left_px;
+    ppu->wsMarginGapR[layer] = right_px;
+  }
+}
+
+void PpuSetWidescreenLayerViewportInset(Ppu *ppu, uint8_t layer,
+                                        uint8_t left_px, uint8_t right_px) {
+  if (layer < 4) {
+    ppu->wsViewportInsetL[layer] = left_px;
+    ppu->wsViewportInsetR[layer] = right_px;
+  }
+}
+
+void PpuSetWidescreenLayerWorldMirrorBand(Ppu *ppu, uint8_t layer, uint8_t y0,
+                                          uint8_t y1, uint16_t world_left_px,
+                                          uint16_t world_right_px) {
+  PpuSetWidescreenLayerWorldMirrorBandSlot(ppu, 0, layer, y0, y1,
+                                           world_left_px, world_right_px);
+}
+
+static void PpuSetWidescreenWorldBandSlot(
+    Ppu *ppu, uint8_t slot, uint8_t layer, uint8_t y0, uint8_t y1,
+    uint16_t world_left_px, uint16_t world_right_px) {
+  // See ppu.h. An empty band or an empty/inverted world span disables the
+  // slot outright rather than leaving half-configured state behind.
+  if (slot >= kPpuWsWorldBands || layer >= 5)
+    return;
+  if (y1 <= y0 || world_right_px <= world_left_px) {
+    y0 = y1 = 0;
+    world_left_px = world_right_px = 0;
+  }
+  ppu->wsWorldY0[slot][layer] = y0;
+  ppu->wsWorldY1[slot][layer] = y1;
+  ppu->wsWorldLeft[slot][layer] = world_left_px;
+  ppu->wsWorldRight[slot][layer] = world_right_px;
+  ppu->wsWorldClip[slot] &= (uint8_t)~(1u << layer);
+  ppu->wsWorldRepeat[slot][layer] = 0;
+  ppu->wsWorldReference[slot][layer] = 0;
+}
+
+void PpuSetWidescreenLayerWorldMirrorBandSlot(
+    Ppu *ppu, uint8_t slot, uint8_t layer, uint8_t y0, uint8_t y1,
+    uint16_t world_left_px, uint16_t world_right_px) {
+  if (layer < 4)
+    PpuSetWidescreenWorldBandSlot(ppu, slot, layer, y0, y1,
+                                  world_left_px, world_right_px);
+}
+
+void PpuSetWidescreenLayerWorldClipBand(
+    Ppu *ppu, uint8_t layer, uint8_t y0, uint8_t y1, uint8_t reference_layer,
+    uint16_t world_left_px, uint16_t world_right_px) {
+  PpuSetWidescreenLayerWorldClipBandSlot(ppu, 0, layer, y0, y1,
+                                       reference_layer, world_left_px,
+                                       world_right_px);
+}
+
+void PpuSetWidescreenLayerWorldClipBandSlot(
+    Ppu *ppu, uint8_t slot, uint8_t layer, uint8_t y0, uint8_t y1,
+    uint8_t reference_layer, uint16_t world_left_px, uint16_t world_right_px) {
+  if (reference_layer >= 4) y0 = y1 = 0;
+  PpuSetWidescreenWorldBandSlot(ppu, slot, layer, y0, y1,
+                                world_left_px, world_right_px);
+  if (slot < kPpuWsWorldBands && layer < 5 &&
+      ppu->wsWorldY1[slot][layer] > ppu->wsWorldY0[slot][layer]) {
+    ppu->wsWorldClip[slot] |= (uint8_t)(1u << layer);
+    ppu->wsWorldReference[slot][layer] = (uint8_t)(reference_layer + 1);
+  }
+}
+
+void PpuSetWidescreenLayerWorldRepeatBand(
+    Ppu *ppu, uint8_t layer, uint8_t y0, uint8_t y1,
+    uint16_t world_left_px, uint16_t world_right_px, uint16_t strip_width) {
+  PpuSetWidescreenLayerWorldRepeatBandSlot(ppu,0,layer,y0,y1,
+                                         world_left_px,world_right_px,strip_width);
+}
+
+void PpuSetWidescreenLayerWorldRepeatBandSlot(
+    Ppu *ppu, uint8_t slot, uint8_t layer, uint8_t y0, uint8_t y1,
+    uint16_t world_left_px, uint16_t world_right_px, uint16_t strip_width) {
+  if (!strip_width) y0 = y1 = 0;
+  PpuSetWidescreenLayerWorldMirrorBandSlot(ppu,slot,layer,y0,y1,
+                                         world_left_px,world_right_px);
+  if (slot < kPpuWsWorldBands && layer < 4 &&
+      ppu->wsWorldY1[slot][layer] > ppu->wsWorldY0[slot][layer])
+    ppu->wsWorldRepeat[slot][layer] = (uint16_t)IntMin(
+        strip_width,world_right_px-world_left_px);
+}
+
+static void PpuClearElasticBandSlot(Ppu *ppu, uint8_t slot, uint8_t layer) {
+  ppu->wsElasticY0[slot][layer] = 0;
+  ppu->wsElasticY1[slot][layer] = 0;
+  ppu->wsElasticNSeg[slot][layer] = 0;
+  memset(ppu->wsElasticSeg[slot][layer], 0,
+         sizeof(ppu->wsElasticSeg[slot][layer]));
+}
+
+void PpuSetWidescreenLayerElasticBand(Ppu *ppu, uint8_t layer, uint8_t y0,
+                                      uint8_t y1,
+                                      const PpuWsElasticSeg *segs,
+                                      uint8_t nseg) {
+  PpuSetWidescreenLayerElasticBandSlot(ppu, 0, layer, y0, y1, segs, nseg);
+}
+
+void PpuSetWidescreenLayerElasticBandSlot(Ppu *ppu, uint8_t slot,
+                                          uint8_t layer, uint8_t y0,
+                                          uint8_t y1,
+                                          const PpuWsElasticSeg *segs,
+                                          uint8_t nseg) {
+  // See ppu.h. A band that fails validation is cleared outright rather than
+  // left half-applied: a partly-installed remap would tear the very glyphs
+  // this policy exists to protect.
+  if (slot >= kPpuWsElasticBands || layer >= 4)
+    return;
+  if (!segs || nseg == 0 || nseg > kPpuWsElasticSegs || y1 <= y0) {
+    PpuClearElasticBandSlot(ppu, slot, layer);
+    return;
+  }
+  int prev_dst_end = -0x8000;
+  for (uint8_t i = 0; i < nseg; i++) {
+    const PpuWsElasticSeg *s = &segs[i];
+    if (s->srcX1 <= s->srcX0 || s->dstX1 <= s->dstX0 || s->srcX0 < 0 ||
+        s->srcX1 > kPpuXPixels || s->dstX0 < prev_dst_end) {
+      PpuClearElasticBandSlot(ppu, slot, layer);
+      return;
+    }
+    prev_dst_end = s->dstX1;
+  }
+  ppu->wsElasticY0[slot][layer] = y0;
+  ppu->wsElasticY1[slot][layer] = y1;
+  ppu->wsElasticNSeg[slot][layer] = nseg;
+  memset(ppu->wsElasticSeg[slot][layer], 0,
+         sizeof(ppu->wsElasticSeg[slot][layer]));
+  memcpy(ppu->wsElasticSeg[slot][layer], segs,
+         (size_t)nseg * sizeof(PpuWsElasticSeg));
+}
+
+bool PpuSetWidescreenLayerElasticSplitBandSlot(
+    Ppu *ppu, uint8_t slot, uint8_t layer, uint8_t y0, uint8_t y1,
+    uint16_t left_elastic_x0, uint16_t left_elastic_x1,
+    uint16_t right_elastic_x0, uint16_t right_elastic_x1) {
+  if (slot >= kPpuWsElasticBands || layer >= 4)
+    return false;
+  const int lx0 = left_elastic_x0, lx1 = left_elastic_x1;
+  const int rx0 = right_elastic_x0, rx1 = right_elastic_x1;
+  PpuWsElasticSeg segs[kPpuWsElasticSegs];
+  uint8_t n = 0;
+  if (lx1 <= lx0 && rx1 <= rx0) {
+    // No stretchable material named: the band becomes an identity remap, i.e.
+    // the layer renders its authentic 256 columns and contributes nothing to
+    // the margins. This is what a transitional scanline wants.
+    segs[n].srcX0 = 0; segs[n].srcX1 = kPpuXPixels;
+    segs[n].dstX0 = 0; segs[n].dstX1 = kPpuXPixels;
+    n++;
+  } else {
+    if (!(lx0 >= 0 && lx0 < lx1 && lx1 <= rx0 && rx0 < rx1 &&
+          rx1 <= kPpuXPixels)) {
+      PpuClearElasticBandSlot(ppu, slot, layer);
+      return false;
+    }
+    const int L = ppu->extraLeftCur, R = ppu->extraRightCur;
+    if (lx0 > 0) {
+      segs[n].srcX0 = 0;   segs[n].srcX1 = (int16_t)lx0;
+      segs[n].dstX0 = (int16_t)(-L); segs[n].dstX1 = (int16_t)(lx0 - L);
+      n++;
+    }
+    segs[n].srcX0 = (int16_t)lx0; segs[n].srcX1 = (int16_t)lx1;
+    segs[n].dstX0 = (int16_t)(lx0 - L); segs[n].dstX1 = (int16_t)lx1;
+    n++;
+    if (rx0 > lx1) {
+      segs[n].srcX0 = (int16_t)lx1; segs[n].srcX1 = (int16_t)rx0;
+      segs[n].dstX0 = (int16_t)lx1; segs[n].dstX1 = (int16_t)rx0;
+      n++;
+    }
+    segs[n].srcX0 = (int16_t)rx0; segs[n].srcX1 = (int16_t)rx1;
+    segs[n].dstX0 = (int16_t)rx0; segs[n].dstX1 = (int16_t)(rx1 + R);
+    n++;
+    if (rx1 < kPpuXPixels) {
+      segs[n].srcX0 = (int16_t)rx1; segs[n].srcX1 = kPpuXPixels;
+      segs[n].dstX0 = (int16_t)(rx1 + R);
+      segs[n].dstX1 = (int16_t)(kPpuXPixels + R);
+      n++;
+    }
+  }
+  PpuSetWidescreenLayerElasticBandSlot(ppu, slot, layer, y0, y1, segs, n);
+  return ppu->wsElasticNSeg[slot][layer] == n;
+}
+
+bool ppu_checkOverscan(Ppu* ppu) {
+  // called at (0,225)
+  ppu->frameOverscan = PPU_overscan(ppu); // set if we have a overscan-frame
+  return ppu->frameOverscan;
+}
+
+void ppu_handleVblank(Ppu* ppu) {
+  // called either right after ppu_checkOverscan at (0,225), or at (0,240)
+  if(!PPU_forcedBlank(ppu)) {
+    ppu->oamAdr = ppu->oamaddl;
+    ppu->oamInHigh = ppu->oamaddh & 1;
+    ppu->oamSecondWrite = false;
+  }
+  ppu->frameInterlace = PPU_interlace(ppu); // set if we have a interlaced frame
+}
+
+// The columns anything can reach this frame: the 256 hardware ones plus the
+// columns between native x=0 and each physical frame edge. Every read of a
+// priority buffer is bounded by a window edge, and PpuWidescreenLayerExtra
+// never hands out more than the live margin, so nothing outside this span is
+// ever looked at. extraFrameLeft/extraFrameRight are the budget either side
+// unless view anchoring slid the origin, in which case they are what the slide
+// made them -- and they are never smaller than the live margins.
+//
+// Rounded out to whole uint64 stores, because that is how ClearBackdrop
+// writes.
+static inline void PpuActiveSpan(const Ppu *ppu, size_t *begin,
+                                 size_t *end) {
+  size_t left = ppu->extraFrameLeft, right = ppu->extraFrameRight;
+  if (left > kPpuLineBorder)
+    left = kPpuLineBorder;
+  if (right > kPpuLineBorder)
+    right = kPpuLineBorder;
+  size_t b = ((size_t)kPpuLineBorder - left) & ~(size_t)3;
+  size_t e = ((size_t)kPpuLineBorder + kPpuXPixels + right + 3) &
+             ~(size_t)3;
+  if (e > kPpuBufWidth)
+    e = kPpuBufWidth;
+  *begin = b;
+  *end = e;
+}
+
+// Fills the active span only. At the full ultrawide budget that is the whole
+// buffer; below it the rest is never read, and clearing it anyway charges
+// every consumer for a border it did not ask for -- three buffers a line,
+// 224 lines, whether or not widescreen is on at all.
+static inline void ClearBackdrop(const Ppu *ppu, PpuPixelPrioBufs *buf) {
+  size_t begin, end;
+  PpuActiveSpan(ppu, &begin, &end);
+  for (size_t i = begin; i < end; i += 4)
+    *(uint64*)&buf->data[i] = 0x0500050005000500;
+}
+
+// mosaicModulo is sized for the logical 256-wide screen, but widescreen window
+// edges can fall in the border (negative on the left, >=256 on the right).
+// Extend the same mosaic grid periodically there. Clamping the coordinate
+// can make a window's first mosaic span nonpositive and overrun its buffer.
+static inline int PpuMosaicAt(Ppu *ppu, int i) {
+  if ((unsigned)i < (unsigned)kPpuXPixels) return ppu->mosaicModulo[i];
+  int size = PPU_mosaicSize(ppu);
+  int remainder = i % size;
+  if (remainder < 0) remainder += size;
+  return i - remainder;
+}
+
+/* Frame of the last OAM ring snapshot; see the note in ppu_runLine. Debug
+ * instrumentation only -- it never affects rendering. */
+static int s_oam_snap_frame = -1;
+
+/* PPU register write journal -- see ppu.h. */
+#define PPU_WLOG_CAP (1u << 17)
+static PpuWlogEntry s_wlog[PPU_WLOG_CAP];
+static uint32_t s_wlog_head;          /* total entries ever written */
+static int s_wlog_line = kPpuWlogPreRaster;
+static uint32_t s_wlog_line_frame = 0xffffffffu;
+uint8_t g_ppu_wlog_src = kPpuWlogCpu;
+
+void ppu_wlog_note_reg(uint16_t reg, uint8_t val) {
+  if(s_guest_scope)return;
+  const uint32_t frame = (uint32_t)snes_frame_counter;
+  PpuWlogEntry *e = &s_wlog[s_wlog_head++ & (PPU_WLOG_CAP - 1)];
+  e->frame = frame;
+  /* The line cursor belongs to the frame whose raster set it; the first
+   * writes of a new frame's raster (HDMA for line 0) come before any
+   * ppu_runLine of that frame. */
+  e->line = (int16_t)(frame == s_wlog_line_frame ? s_wlog_line : 0);
+  e->reg = reg;
+  e->val = val;
+  e->src = g_ppu_wlog_src;
+}
+
+void ppu_wlog_position(uint32_t *frame, int16_t *line) {
+  const uint32_t f = (uint32_t)snes_frame_counter;
+  if (frame) *frame = f;
+  if (line) *line = (int16_t)(f == s_wlog_line_frame ? s_wlog_line : 0);
+}
+
+static void ppu_wlog_note(uint8_t adr, uint8_t val) {
+  if (adr == 0x04 || adr == 0x18 || adr == 0x19 || adr == 0x22 || adr > 0x33)
+    return;
+  ppu_wlog_note_reg((uint16_t)(0x2100u + adr), val);
+}
+
+int ppu_wlog_collect(uint32_t frame, PpuWlogEntry *out, int cap, int *lost) {
+  const uint32_t n = s_wlog_head < PPU_WLOG_CAP ? s_wlog_head : PPU_WLOG_CAP;
+  const uint32_t first = s_wlog_head - n;
+  int count = 0;
+  if (lost) {
+    /* The oldest surviving entry is already inside the requested window:
+     * part of it may have been evicted. */
+    const PpuWlogEntry *o = &s_wlog[first & (PPU_WLOG_CAP - 1)];
+    *lost = n == PPU_WLOG_CAP &&
+            (o->frame > frame - 1u ||
+             (o->frame == frame - 1u && o->line >= kPpuWlogPreRaster) ||
+             o->frame == frame);
+  }
+  for (uint32_t i = first; i != s_wlog_head && count < cap; i++) {
+    const PpuWlogEntry *e = &s_wlog[i & (PPU_WLOG_CAP - 1)];
+    if (e->frame == frame - 1u && e->line >= kPpuWlogPreRaster) {
+      out[count] = *e;
+      out[count].frame = frame;
+      out[count].line = -1;
+      count++;
+    } else if (e->frame == frame && e->line < kPpuWlogPreRaster) {
+      out[count++] = *e;
+    }
+  }
+  return count;
+}
+
+/* BG modes the optimized line renderer implements. PpuDrawWholeLine knows
+ * modes 0-3 and treats everything else as mode 7, so a mode 4/5/6 screen
+ * (8bpp with offset-per-tile, and the two 512-pixel hi-res modes) came out
+ * as mode-7 garbage (a mode 5 menu with hi-res text over a 4bpp background
+ * showed up as vertical colour stripes). Those modes take the
+ * compatibility renderer's scanline until the optimized one grows them;
+ * it samples the main screen from the odd hi-res column, as it always did
+ * with NewRenderer=0. Regression: tests/ppu/ppu_hires_mode_test.c. */
+static bool PpuOptimizedRendererHandlesMode(uint mode) {
+  return mode <= 3 || mode == 7;
+}
+
+static void PpuUpdateMosaicTable(Ppu *ppu) {
+  if (PPU_mosaicSize(ppu) != ppu->lastMosaicModulo) {
+    int mod = PPU_mosaicSize(ppu);
+    ppu->lastMosaicModulo = mod;
+    for (int i = 0, j = 0; i < countof(ppu->mosaicModulo); i++) {
+      ppu->mosaicModulo[i] = i - j;
+      j = (j + 1 == mod ? 0 : j + 1);
+    }
+  }
+}
+
+static void PpuPrepareMosaic(Ppu *ppu) {
+  PpuUpdateMosaicTable(ppu);
+  ppu->mosaicStartLine = 1;
+}
+
+static void PpuDrawVisibleLine(Ppu *ppu, int line, bool pixels, bool live) {
+  PPU_T0_DECL
+  /* Frame-model and detached callers can start directly on a visible line. */
+  PpuUpdateMosaicTable(ppu);
+  // Cache the brightness computation.
+  if (PPU_brightness(ppu) != ppu->lastBrightnessMult) {
+    uint8_t ppu_brightness = PPU_brightness(ppu);
+    ppu->lastBrightnessMult = ppu_brightness;
+    for (int i = 0; i < 32; i++)
+      ppu->brightnessMultHalf[i * 2] = ppu->brightnessMultHalf[i * 2 + 1] = ppu->brightnessMult[i] =
+      ppu_brightness_level((unsigned)i, ppu_brightness);
+    memset(&ppu->brightnessMult[32], ppu->brightnessMult[31], 31);
+  }
+
+  if (ppu->overlayRenderBuffer[kPpuOverlaySource_Obj])
+    memset(&ppu->overlayBuffers[kPpuOverlaySource_Obj], 0,
+           sizeof(ppu->overlayBuffers[kPpuOverlaySource_Obj]));
+  ppu->lineHasSprites = !PPU_forcedBlank(ppu) && ppu_evaluateSprites(ppu, line - 1);
+
+  if (!pixels) return;
+
+  if ((ppu->renderFlags & kPpuRenderFlags_NewRenderer) &&
+      !(PPU_mode(ppu) == 7 && (PPU_m7extBg(ppu) || PPU_directColor(ppu))) &&
+      PpuOptimizedRendererHandlesMode(PPU_mode(ppu))) {
+    if (live)
+      debug_server_on_ppu_line_drawn(line, 1, ppu->bgmode);
+    PPU_T0; PpuDrawWholeLine(ppu, line); PPU_ACC(g_ppu_sec_line_ms);
+#ifdef SNESRECOMP_INTERP_PROFILE
+    if (!s_detached_line_depth) g_ppu_sec_line_n++;
+#endif
+  } else {
+    if (live)
+      debug_server_on_ppu_line_drawn(line, 0, ppu->bgmode);
+    ppu_draw_whole_line_legacy(ppu, line);
+  }
+  if (ppu->hdFrame && !s_detached_line_depth)
+    SnesHdFrameCaptureLine(ppu->hdFrame, (unsigned)line - 1, ppu,
+                            (unsigned)line, 0, false);
+  if (ppu->hdCapture && live && !s_guest_scope && !s_detached_line_depth)
+    SnesHdCaptureLine(ppu->hdCapture, ppu, (unsigned)line);
+}
+
+void PpuDrawDetachedLine(Ppu *ppu, int line) {
+  if (!ppu || (g_snes && ppu == g_snes->ppu) || line < 0 || line > 240)
+    return;
+  if (line == 0) {
+    PpuPrepareMosaic(ppu);
+    return;
+  }
+  if (!ppu->renderBuffer) return;
+  const bool range_over = ppu->rangeOver, time_over = ppu->timeOver;
+  PpuWidescreenLineEnhancer *enhancer = ppu->widescreenLineEnhancer;
+  void *context = ppu->widescreenLineEnhancerContext;
+  ppu->widescreenLineEnhancer = NULL;
+  ppu->widescreenLineEnhancerContext = NULL;
+  ++s_detached_line_depth;
+  PpuDrawVisibleLine(ppu, line, true, false);
+  --s_detached_line_depth;
+  ppu->widescreenLineEnhancer = enhancer;
+  ppu->widescreenLineEnhancerContext = context;
+  ppu->rangeOver = range_over;
+  ppu->timeOver = time_over;
+}
+
+static void PpuRunLineJob(Ppu* ppu, int line, bool pixels, bool live) {
+  /* Writes from here to the next ppu_runLine land on line + 1; no register
+   * write happens inside a line's render. */
+  if (live) {
+    s_wlog_line = line + 1;
+    s_wlog_line_frame = (uint32_t)snes_frame_counter;
+    /* Per-line HDMA state must be captured here, not at end-of-frame: games can
+     * rewrite windows and scroll registers before every scanline. */
+    debug_server_on_ppu_line(line);
+    /* Snapshot the OAM the scanline renderer is about to consume, once per
+     * frame, on whichever line the host actually starts with.
+     *
+     * This used to sit inside the line == 0 block, which silently disabled it
+     * for every frame-model host: those render the visible field as lines
+     * 1..224 and never pass line 0 at all. The ring therefore stayed empty
+     * forever and oam_render_get answered {"count":0,"snaps":[]} -- "no
+     * sprites recorded" -- for a screen full of sprites. An instrument that
+     * reports nothing is indistinguishable from a subsystem that did nothing,
+     * which is the most expensive way for a probe to fail. */
+    if (s_oam_snap_frame != snes_frame_counter) {
+      s_oam_snap_frame = snes_frame_counter;
+      debug_server_on_oam_render();
+    }
+  }
+  PpuUpdateWidescreenOamHistory(ppu, line);
+  /* Snapshot the OAM the scanline renderer is about to consume, once per
+   * frame, on whichever line the host actually starts with.
+   *
+   * This used to sit inside the line == 0 block, which silently disabled it
+   * for every frame-model host: those render the visible field as lines
+   * 1..224 and never pass line 0 at all. The ring therefore stayed empty
+   * forever and oam_render_get answered {"count":0,"snaps":[]} -- "no
+   * sprites recorded" -- for a screen full of sprites. An instrument that
+   * reports nothing is indistinguishable from a subsystem that did nothing,
+   * which is the most expensive way for a probe to fail. */
+  if (live && s_oam_snap_frame != snes_frame_counter) {
+    s_oam_snap_frame = snes_frame_counter;
+    debug_server_on_oam_render();
+  }
+  if(line == 0) {
+    PpuPrepareMosaic(ppu);
+    // pre-render line
+    // TODO: this now happens halfway into the first line
+    ppu->rangeOver = false;
+    ppu->timeOver = false;
+    ppu->evenFrame = !ppu->evenFrame;
+  } else {
+    PpuDrawVisibleLine(ppu, line, pixels, live);
+  }
+}
+
+void ppu_runLine(Ppu* ppu, int line) {
+  PpuRunLineJob(ppu, line, true, true);
+}
+
+void ppu_runLineState(Ppu* ppu, int line) {
+  PpuRunLineJob(ppu, line, false, true);
+}
+
+void ppu_drawCapturedLine(Ppu* ppu, int line, bool pixels) {
+  PpuRunLineJob(ppu, line, pixels, false);
+}
+
+typedef struct PpuWindows {
+  // Up to five hardware-window spans plus two margin-gap splits.
+  int16 edges[8];
+  uint8 nr;
+  uint8 bits;
+} PpuWindows;
+
+static unsigned PpuWorldReferenceLayer(const Ppu *ppu, int band, uint layer) {
+  unsigned reference = ppu->wsWorldReference[band][layer];
+  return reference >= 1 && reference <= 4 ? reference - 1 : layer;
+}
+
+// A clip does not resample pixels. When the room and native view touch, their
+// union is one interval which the ordinary windowed draw can render directly.
+// Keep the isolated compositor for disjoint rooms, mosaic and source anchors.
+static bool PpuWorldClipBounds(const Ppu *ppu, uint layer, int y,
+                                int *left, int *right) {
+  if (layer >= 5 ||
+      !((ppu->wsWorldClip[0] | ppu->wsWorldClip[1]) & (1u << layer)) ||
+      (layer < 4 && (PPU_mode(ppu) != 1 ||
+       (PPU_mosaicEnabled(ppu, layer) && PPU_mosaicSize(ppu) > 1))))
+    return false;
+  int band = PpuWidescreenLayerWorldBandAt(ppu, layer, y);
+  if (band < 0 || !(ppu->wsWorldClip[band] & (1u << layer)) ||
+      PpuWidescreenLayerElasticBandAt(ppu, layer, y) >= 0)
+    return false;
+  for (uint slot = 0; layer < 4 && slot < kPpuWsAnchorBands; ++slot) {
+    if (y >= ppu->wsAnchorY0[slot][layer] &&
+        y < ppu->wsAnchorY1[slot][layer] &&
+        ppu->wsAnchorLeftEnd[slot][layer] &&
+        ppu->wsAnchorLeftEnd[slot][layer] < ppu->wsAnchorRightStart[slot][layer])
+      return false;
+  }
+  int scroll = ppu->hScroll[PpuWorldReferenceLayer(ppu, band, layer)];
+  int a = ppu->wsWorldLeft[band][layer] - scroll;
+  int b = ppu->wsWorldRight[band][layer] - scroll;
+  if (a > kPpuXPixels || b < 0)
+    return false;
+  *left = IntMin(a, 0);
+  *right = IntMax(b, kPpuXPixels);
+  return true;
+}
+
+static void PpuWindows_ClipWorld(PpuWindows *win, const Ppu *ppu,
+                                 uint layer, int y) {
+  int left, right;
+  if (!PpuWorldClipBounds(ppu, layer, y, &left, &right))
+    return;
+  // Crop after evaluating hardware windows so pinned edges and inverse masks
+  // retain their original meaning. Removing outer spans never adds an edge.
+  uint nr = 0;
+  uint8 bits = 0;
+  for (uint i = 0; i < win->nr; ++i) {
+    int a = IntMax(win->edges[i], left);
+    int b = IntMin(win->edges[i + 1], right);
+    if (a >= b)
+      continue;
+    win->edges[nr] = (int16)a;
+    win->edges[nr + 1] = (int16)b;
+    bits |= (uint8)(((win->bits >> i) & 1u) << nr);
+    ++nr;
+  }
+  win->nr = (uint8)nr;
+  win->bits = bits;
+}
+
+// Per-layer widescreen side margin. BG3 (layer 2) carries the HUD and is
+// clamped to the authentic 256-wide region so a BG3 status bar never tiles into
+// the margins -- EXCEPT on scanlines >= wsBg3WidenY, where the game renders
+// level content on BG3 (e.g. SMW water) that should fill 16:9 like BG1/BG2.
+static void PpuWindows_Clear(PpuWindows *win, Ppu *ppu, uint layer, int y) {
+  win->edges[0] = -PpuWidescreenLayerExtra(ppu, layer, y, ppu->extraLeftCur);
+  win->edges[1] = 256 + PpuWidescreenLayerExtra(ppu, layer, y,
+                                                ppu->extraRightCur);
+  win->nr = 1;
+  win->bits = 0;
+}
+
+static void PpuWindows_CalcWithExtra(PpuWindows *win, Ppu *ppu, uint layer,
+                                     int y, int extra_left, int extra_right) {
+  // Evaluate which spans to render based on the window settings.
+  // There are at most 5 windows.
+  // Algorithm from Snes9x
+  uint32 winflags = GET_WINDOW_FLAGS(ppu, layer);
+  uint nr = 1;
+  int window_right = 256 +
+      PpuWidescreenLayerExtra(ppu, layer, y, extra_right);
+  win->edges[0] = -PpuWidescreenLayerExtra(ppu, layer, y, extra_left);
+  win->edges[1] = window_right;
+  uint i, j;
+  int t;
+  // A hardware edge pinned to 0/255 means "screen edge" in widescreen too.
+  // This is a no-op at authentic width and prevents full-screen color/windows
+  // from classifying otherwise valid side-margin pixels as outside.
+  int w1l = ppu->window1left, w1r = ppu->window1right;
+  int w2l = ppu->window2left, w2r = ppu->window2right;
+  PpuWidescreenAdjustPinnedWindowEdges(win->edges[0], window_right, &w1l,
+                                       &w1r, &w2l, &w2r);
+  if (ppu->wsWindowExpandLayers & (1u << layer)) {
+    if ((ppu->wsWindowExpandWindows & 1u) &&
+        ppu->window1left <= ppu->window1right) {
+      w1l = IntMax(w1l - extra_left, win->edges[0]);
+      w1r = IntMin(w1r + extra_right, window_right - 1);
+    }
+    if ((ppu->wsWindowExpandWindows & 2u) &&
+        ppu->window2left <= ppu->window2right) {
+      w2l = IntMax(w2l - extra_left, win->edges[0]);
+      w2r = IntMin(w2r + extra_right, window_right - 1);
+    }
+  }
+  const int edge_min = win->edges[0];
+  const int edge_max = window_right;
+  int w1_start = IntMax(w1l, edge_min);
+  int w1_end = IntMin(w1r + 1, edge_max);
+  bool w1_ena = (winflags & kWindow1Enabled) && w1l <= w1r && w1_start < w1_end;
+  if (w1_ena) {
+    if (w1_start > edge_min) {
+      win->edges[nr] = (int16)w1_start;
+      win->edges[++nr] = (int16)edge_max;
+    }
+    if (w1_end < edge_max) {
+      win->edges[nr] = (int16)w1_end;
+      win->edges[++nr] = (int16)edge_max;
+    }
+  }
+  int w2_start = IntMax(w2l, edge_min);
+  int w2_end = IntMin(w2r + 1, edge_max);
+  bool w2_ena = (winflags & kWindow2Enabled) && w2l <= w2r && w2_start < w2_end;
+  if (w2_ena) {
+    for (i = 0; i <= nr && (t = w2_start) != win->edges[i]; i++) {
+      if (t < win->edges[i]) {
+        for (j = nr++; j >= i; j--)
+          win->edges[j + 1] = win->edges[j];
+        win->edges[i] = (int16)t;
+        break;
+      }
+    }
+    for (; i <= nr && (t = w2_end) != win->edges[i]; i++) {
+      if (t < win->edges[i]) {
+        for (j = nr++; j >= i; j--)
+          win->edges[j + 1] = win->edges[j];
+        win->edges[i] = (int16)t;
+        break;
+      }
+    }
+  }
+  win->nr = nr;
+  // get a bitmap of how regions map to windows
+  uint8 w1_bits = 0, w2_bits = 0;
+  if (w1_ena) {
+    for (i = 0; win->edges[i] != w1_start; i++);
+    for (j = i; win->edges[j] != w1_end; j++);
+    w1_bits = ((1 << (j - i)) - 1) << i;
+  }
+  if ((winflags & (kWindow1Enabled | kWindow1Inversed)) == (kWindow1Enabled | kWindow1Inversed))
+    w1_bits = ~w1_bits;
+  if (w2_ena) {
+    for (i = 0; win->edges[i] != w2_start; i++);
+    for (j = i; win->edges[j] != w2_end; j++);
+    w2_bits = ((1 << (j - i)) - 1) << i;
+  }
+  if ((winflags & (kWindow2Enabled | kWindow2Inversed)) == (kWindow2Enabled | kWindow2Inversed))
+    w2_bits = ~w2_bits;
+  if ((winflags & (kWindow1Enabled | kWindow2Enabled)) ==
+      (kWindow1Enabled | kWindow2Enabled)) {
+    switch ((ppu->wbgobjlog >> (layer * 2)) & 3) {
+      case 0: win->bits = w1_bits | w2_bits; break;
+      case 1: win->bits = w1_bits & w2_bits; break;
+      case 2: win->bits = w1_bits ^ w2_bits; break;
+      case 3: win->bits = (uint8)~(w1_bits ^ w2_bits); break;
+    }
+  } else {
+    win->bits = w1_bits | w2_bits;
+  }
+  if (!s_detached_line_depth)
+    debug_server_on_ppu_window(y, (int)layer, win->edges, win->nr, win->bits);
+}
+
+static void PpuWindows_Calc(PpuWindows *win, Ppu *ppu, uint layer, int y) {
+  PpuWindows_CalcWithExtra(win, ppu, layer, y,
+                           ppu->extraLeftCur, ppu->extraRightCur);
+}
+
+static void PpuWindowsSplit(PpuWindows *win, int16 *bias, int xpos) {
+  for (uint i = 0; i < win->nr; i++) {
+    if (win->edges[i] < xpos && xpos < win->edges[i + 1]) {
+      for (uint j = win->nr; j >= i + 1; j--)
+        win->edges[j + 1] = win->edges[j];
+      win->edges[i + 1] = (int16)xpos;
+      for (uint j = win->nr - 1; j >= i + 1; j--)
+        bias[j + 1] = bias[j];
+      bias[i + 1] = bias[i];
+      uint8 lo = win->bits & (uint8)((1u << (i + 1)) - 1);
+      uint8 hi = (uint8)((win->bits >> (i + 1)) << (i + 2));
+      win->bits = lo | hi | (uint8)(((win->bits >> i) & 1) << (i + 1));
+      win->nr++;
+      return;
+    }
+  }
+}
+
+static bool PpuApplyLayerAnchorBand(Ppu *ppu, uint layer, uint y,
+                                    PpuWindows *win, int16 *bias) {
+  if (win->nr != 1 || win->bits != 0)
+    return false;
+  // An elastic band already carries the anchoring in its rigid segments, and
+  // it remaps the merge rather than the draw. Letting both act on one line
+  // would shift the source twice.
+  if (PpuWidescreenLayerElasticBandAt(ppu, layer, (int)y) >= 0)
+    return false;
+  int left_end = 0;
+  int right_start = 0;
+  for (uint slot = 0; slot < kPpuWsAnchorBands; slot++) {
+    if (y >= ppu->wsAnchorY0[slot][layer] &&
+        y < ppu->wsAnchorY1[slot][layer]) {
+      left_end = ppu->wsAnchorLeftEnd[slot][layer];
+      right_start = ppu->wsAnchorRightStart[slot][layer];
+      break;
+    }
+  }
+  if (left_end == 0 || left_end >= right_start)
+    return false;
+  const bool full_budget =
+      (ppu->wsHudSplitHeight & 0x80) && ppu->extraLeftRight;
+  const int left_extra =
+      full_budget ? ppu->extraFrameLeft : ppu->extraLeftCur;
+  const int right_extra =
+      full_budget ? ppu->extraFrameRight : ppu->extraRightCur;
+  if (!(left_extra | right_extra))
+    return false;
+  win->nr = 5;
+  win->bits = 0x0a;
+  win->edges[0] = -(int16)left_extra;
+  win->edges[1] = (int16)(left_end - left_extra);
+  win->edges[2] = (int16)left_end;
+  win->edges[3] = (int16)right_start;
+  win->edges[4] = (int16)(right_start + right_extra);
+  win->edges[5] = (int16)(256 + right_extra);
+  bias[0] = (int16)left_extra;
+  bias[4] = -(int16)right_extra;
+  return true;
+}
+
+static int PpuFullBudgetAnchorLayerAt(const Ppu *ppu, uint y) {
+  if (!(ppu->wsHudSplitHeight & 0x80) || !ppu->extraLeftRight)
+    return -1;
+  for (uint layer = 0; layer < 4; layer++) {
+    for (uint slot = 0; slot < kPpuWsAnchorBands; slot++) {
+      if (y >= ppu->wsAnchorY0[slot][layer] &&
+          y < ppu->wsAnchorY1[slot][layer] &&
+          ppu->wsAnchorLeftEnd[slot][layer] &&
+          ppu->wsAnchorLeftEnd[slot][layer] <
+              ppu->wsAnchorRightStart[slot][layer])
+        return (int)layer;
+    }
+  }
+  return -1;
+}
+
+static void PpuApplyMarginGap(Ppu *ppu, uint layer, PpuWindows *win,
+                              int16 *bias) {
+  int gl = ppu->wsMarginGapL[layer], gr = ppu->wsMarginGapR[layer];
+  if (!(gl | gr) || !(ppu->extraLeftCur | ppu->extraRightCur))
+    return;
+  PpuWindowsSplit(win, bias, 0);
+  PpuWindowsSplit(win, bias, 256);
+  for (uint i = 0; i < win->nr; i++) {
+    if (win->edges[i + 1] <= 0)
+      bias[i] = (int16)(bias[i] - gl);
+    else if (win->edges[i] >= 256)
+      bias[i] = (int16)(bias[i] + gr);
+  }
+}
+
+static bool PpuViewportAllows(Ppu *ppu, uint layer, int screen_x,
+                              int source_x) {
+  if (!ppu->widescreenLineEnhancer)
+    return true;
+  if (ppu->wsViewportInsetL[layer] | ppu->wsViewportInsetR[layer])
+    return source_x >= ppu->wsViewportInsetL[layer] &&
+           source_x < kPpuXPixels - ppu->wsViewportInsetR[layer];
+  /* Preserve the pre-policy behavior for existing line-enhancer users:
+   * BG1 is limited to its authentic destination viewport, while other layers
+   * are unaffected. A title must explicitly opt in to a source-space inset. */
+  return layer != 0 || (screen_x >= 0 && screen_x < kPpuXPixels);
+}
+
+// Draw a whole line of a 4bpp background layer into bgBuffers
+static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
+                                   uint y, bool sub, uint layer,
+                                   PpuZbufType zhi, PpuZbufType zlo) {
+#define VIEWPORT_ALLOWED(i) \
+  (!has_viewport_clip || PpuViewportAllows(ppu, layer, \
+      (int)(dstz + (i) - dstbuf->data - kPpuLineBorder), \
+      (int)(dstz + (i) - dstbuf->data - kPpuLineBorder) + \
+          ws_bias[windex]))
+#define DO_PIXEL(i) do { \
+  pixel = (bits >> i) & 1 | (bits >> (7 + i)) & 2 | (bits >> (14 + i)) & 4 | (bits >> (21 + i)) & 8; \
+  if (VIEWPORT_ALLOWED(i) && (bits & (0x01010101 << i)) && z > dstz[i]) dstz[i] = z + pixel; } while (0)
+#define DO_PIXEL_HFLIP(i) do { \
+  pixel = (bits >> (7 - i)) & 1 | (bits >> (14 - i)) & 2 | (bits >> (21 - i)) & 4 | (bits >> (28 - i)) & 8; \
+  if (VIEWPORT_ALLOWED(i) && (bits & (0x80808080 >> i)) && z > dstz[i]) dstz[i] = z + pixel; } while (0)
+#define READ_BITS(ta, tile) (addr = &vram[((ta) + (tile) * 16) & 0x7fff], addr[0] | addr[8] << 16)
+  enum { kPaletteShift = 6 };
+  if (!IS_SCREEN_ENABLED(ppu, sub, layer))
+    return;  // layer is completely hidden
+  PpuWindows win;
+  IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer, y) : PpuWindows_Clear(&win, ppu, layer, y);
+  PpuWindows_ClipWorld(&win, ppu, layer, (int)y);
+  int16 ws_bias[8] = { 0 };
+  if (!PpuApplyLayerAnchorBand(ppu, layer, y, &win, ws_bias))
+    PpuApplyMarginGap(ppu, layer, &win, ws_bias);
+  if (win.nr == 0 || (win.bits & ((1u << win.nr) - 1u)) == ((1u << win.nr) - 1u))
+    return;
+  const uint16 * const vram = PpuRenderVram(ppu);
+  const bool has_viewport_clip =
+      (ppu->widescreenLineEnhancer != NULL) &&
+      (layer == 0 || (ppu->wsViewportInsetL[layer] | ppu->wsViewportInsetR[layer]) != 0);
+  const uint16 hscroll = ppu->hScroll[layer];
+  y += ppu->vScroll[layer];
+  int sc_offs = PPU_bgTilemapAdr(ppu, layer) + (((y >> 3) & 0x1f) << 5);
+  if ((y & 0x100) && PPU_bgTilemapHigher(ppu, layer))
+    sc_offs += PPU_bgTilemapWider(ppu, layer) ? 0x800 : 0x400;
+  const uint16 *tps[2] = {
+    &vram[sc_offs & 0x7fff],
+    &vram[sc_offs + (PPU_bgTilemapWider(ppu, layer) ? 0x400 : 0) & 0x7fff]
+  };
+  int tileadr = PPU_bgTileAdr(ppu, layer), pixel;
+  int tileadr1 = tileadr + 7 - (y & 0x7), tileadr0 = tileadr + (y & 0x7);
+  const uint16 *addr;
+  bool ws_shadow = !s_detached_line_depth && WsShadowLayerActive(layer);
+#define WS_TILE(t, sx) (ws_shadow ? WsShadowTile(layer, (sx), y, hscroll, (uint16_t)(tp - vram), (uint16_t)(t)) : (uint32)(t))
+  for (size_t windex = 0; windex < win.nr; windex++) {
+    if (win.bits & (1 << windex))
+      continue;  // layer is disabled for this window part
+    if (win.edges[windex + 1] <= win.edges[windex])
+      continue;
+    uint x = win.edges[windex] + hscroll + ws_bias[windex];
+    uint w = win.edges[windex + 1] - win.edges[windex];
+    int ws_sx = win.edges[windex];
+    PpuZbufType *dstz = dstbuf->data + win.edges[windex] + kPpuLineBorder;
+    const uint16 *tp = tps[x >> 8 & 1] + ((x >> 3) & 0x1f);
+    const uint16 *tp_last = tps[x >> 8 & 1] + 31;
+    const uint16 *tp_next = tps[(x >> 8 & 1) ^ 1];
+#define NEXT_TP() if (tp != tp_last) tp += 1; else tp = tp_next, tp_next = tp_last - 31, tp_last = tp + 31;
+    // Handle clipped pixels on left side
+    if (x & 7) {
+      int curw = IntMin(8 - (x & 7), w);
+      w -= curw;
+      uint32 tile = WS_TILE(*tp, ws_sx);
+      ws_sx += curw;
+      NEXT_TP();
+      int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
+      PpuZbufType z = ((tile & 0x2000) ? zhi : zlo) + ((tile & 0x1c00) >> kPaletteShift);
+      uint32 bits = READ_BITS(ta, tile & 0x3ff);
+      if (bits) {
+        if (tile & 0x4000) {
+          bits >>= (x & 7), x += curw;
+          do DO_PIXEL(0); while (bits >>= 1, dstz++, --curw);
+        } else {
+          bits <<= (x & 7), x += curw;
+          do DO_PIXEL_HFLIP(0); while (bits <<= 1, dstz++, --curw);
+        }
+      } else {
+        dstz += curw;
+      }
+    }
+    // Handle full tiles in the middle
+    while (w >= 8) {
+      uint32 tile = WS_TILE(*tp, ws_sx);
+      NEXT_TP();
+      PpuZbufType z = ((tile & 0x2000) ? zhi : zlo) + ((tile & 0x1c00) >> kPaletteShift);
+      if (z > dstz[0] || z > dstz[1] || z > dstz[2] || z > dstz[3] ||
+          z > dstz[4] || z > dstz[5] || z > dstz[6] || z > dstz[7]) {
+        int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
+        uint32 bits = READ_BITS(ta, tile & 0x3ff);
+        if (bits) {
+          if (tile & 0x4000) {
+            DO_PIXEL(0); DO_PIXEL(1); DO_PIXEL(2); DO_PIXEL(3);
+            DO_PIXEL(4); DO_PIXEL(5); DO_PIXEL(6); DO_PIXEL(7);
+          } else {
+            DO_PIXEL_HFLIP(0); DO_PIXEL_HFLIP(1); DO_PIXEL_HFLIP(2); DO_PIXEL_HFLIP(3);
+            DO_PIXEL_HFLIP(4); DO_PIXEL_HFLIP(5); DO_PIXEL_HFLIP(6); DO_PIXEL_HFLIP(7);
+          }
+        }
+      }
+      dstz += 8, w -= 8, ws_sx += 8;
+    }
+    // Handle remaining clipped part
+    if (w) {
+      uint32 tile = WS_TILE(*tp, ws_sx);
+      int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
+      PpuZbufType z = ((tile & 0x2000) ? zhi : zlo) + ((tile & 0x1c00) >> kPaletteShift);
+      uint32 bits = READ_BITS(ta, tile & 0x3ff);
+      if (bits) {
+        if (tile & 0x4000) {
+          do DO_PIXEL(0); while (bits >>= 1, dstz++, --w);
+        } else {
+          do DO_PIXEL_HFLIP(0); while (bits <<= 1, dstz++, --w);
+        }
+      }
+    }
+  }
+#undef WS_TILE
+#undef READ_BITS
+#undef DO_PIXEL
+#undef DO_PIXEL_HFLIP
+#undef VIEWPORT_ALLOWED
+}
+
+/* Draw an 8bpp tiled background (mode 3/4 BG1).  The original renderer only
+ * implemented mode 1's 4bpp/2bpp layers and treated every other mode as mode
+ * 7.  Super FX games commonly DMA their planar framebuffer into a mode-3 BG1,
+ * so that fallback interpreted perfectly valid tile data as a mode-7 bitmap.
+ * The default scalar implementation is the reference for 8x8/16x16 tiles.
+ * The build-selected HLE resolves map/character/plane reads once per span
+ * ending at an 8-pixel source boundary. All state is local to this call. */
+static void PpuDrawBackground_8bpp(Ppu *ppu, uint y, bool sub, uint layer,
+                                  PpuZbufType zhi, PpuZbufType zlo) {
+  if (!IS_SCREEN_ENABLED(ppu, sub, layer))
+    return;
+
+  PpuWindows win;
+  IS_SCREEN_WINDOWED(ppu, sub, layer)
+      ? PpuWindows_Calc(&win, ppu, layer, y)
+      : PpuWindows_Clear(&win, ppu, layer, y);
+  if (win.nr == 0 || (win.bits & ((1u << win.nr) - 1u)) == ((1u << win.nr) - 1u))
+    return;
+
+  const uint16 * const vram = PpuRenderVram(ppu);
+  const bool big = PPU_bigTiles(ppu, layer) != 0;
+  const bool tilemap_wider = PPU_bgTilemapWider(ppu, layer) != 0;
+  const bool tilemap_higher = PPU_bgTilemapHigher(ppu, layer) != 0;
+  const unsigned tile_shift = big ? 4 : 3;
+  const unsigned page_shift = tile_shift + 5;
+  const unsigned tile_mask = (1u << tile_shift) - 1u;
+  const int tileadr = PPU_bgTileAdr(ppu, layer);
+  const int mapadr = PPU_bgTilemapAdr(ppu, layer);
+  const int sy = (int)y + ppu->vScroll[layer];
+  const int hscroll = ppu->hScroll[layer];
+  int sc_row = mapadr + (((sy >> tile_shift) & 31) << 5);
+  if (((sy >> page_shift) & 1) && tilemap_higher)
+    sc_row += tilemap_wider ? 0x800 : 0x400;
+
+  for (size_t windex = 0; windex < win.nr; windex++) {
+    if (win.bits & (1 << windex))
+      continue;
+    const int left = win.edges[windex];
+    const int right = win.edges[windex + 1];
+    if (right <= left)
+      continue;
+    PpuZbufType *dstz = ppu->bgBuffers[sub].data + left + kPpuLineBorder;
+
+    for (int screen_x = left; screen_x < right;) {
+      const int sx = screen_x + hscroll;
+      int sc = sc_row;
+      if (((sx >> page_shift) & 1) && tilemap_wider)
+        sc += 0x400;
+      sc += (sx >> tile_shift) & 31;
+
+      uint16 tile = vram[sc & 0x7fff];
+      unsigned px = (unsigned)sx & tile_mask;
+      unsigned py = (unsigned)sy & tile_mask;
+      if (tile & 0x4000) px = tile_mask - px;
+      if (tile & 0x8000) py = tile_mask - py;
+
+      unsigned character = tile & 0x3ff;
+      if (big)
+        character = (character + (px >> 3) + ((py >> 3) << 4)) & 0x3ff;
+      const unsigned row = py & 7;
+      const unsigned bit = 7 - (px & 7);
+      const unsigned addr = (tileadr + character * 32 + row) & 0x7fff;
+      const uint16 p01 = vram[addr];
+      const uint16 p23 = vram[(addr + 8) & 0x7fff];
+      const uint16 p45 = vram[(addr + 16) & 0x7fff];
+      const uint16 p67 = vram[(addr + 24) & 0x7fff];
+#if SNESRECOMP_PPU_8BPP_HLE
+      /* A 16x16 tile can select a different character at its midpoint;
+       * windows and negative widescreen coordinates can clip either end. */
+      unsigned width = 8 - ((unsigned)sx & 7);
+      if (width > (unsigned)(right - screen_x))
+        width = (unsigned)(right - screen_x);
+      const PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+      for (unsigned i = 0; i < width; i++) {
+        const unsigned b = (tile & 0x4000) ? bit + i : bit - i;
+        const unsigned pixel =
+            ((p01 >> b) & 1) | (((p01 >> (b + 8)) & 1) << 1) |
+            (((p23 >> b) & 1) << 2) | (((p23 >> (b + 8)) & 1) << 3) |
+            (((p45 >> b) & 1) << 4) | (((p45 >> (b + 8)) & 1) << 5) |
+            (((p67 >> b) & 1) << 6) | (((p67 >> (b + 8)) & 1) << 7);
+        if (pixel && z > dstz[i])
+          dstz[i] = z + pixel;
+      }
+      screen_x += (int)width;
+      dstz += width;
+#else
+      const unsigned pixel =
+          ((p01 >> bit) & 1) | (((p01 >> (bit + 8)) & 1) << 1) |
+          (((p23 >> bit) & 1) << 2) | (((p23 >> (bit + 8)) & 1) << 3) |
+          (((p45 >> bit) & 1) << 4) | (((p45 >> (bit + 8)) & 1) << 5) |
+          (((p67 >> bit) & 1) << 6) | (((p67 >> (bit + 8)) & 1) << 7);
+      const PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+      if (pixel && z > *dstz)
+        *dstz = z + pixel;
+      screen_x++;
+      dstz++;
+#endif
+    }
+  }
+}
+
+/* Renderer for 16x16-tile backgrounds (BGMODE bits 4-7).
+ * Uses an 8-pixel sub-tile span fast path when mosaic and ws_shadow are inactive,
+ * resolving tilemap, character, bitplane reads, transparency culling, and
+ * occlusion checks once per 8-pixel sub-tile instead of per-pixel. */
+static void PpuDrawBackgroundBig(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y,
+                                 bool sub, uint layer, int bpp,
+                                 PpuZbufType zhi, PpuZbufType zlo,
+                                 bool mosaic) {
+  if (!IS_SCREEN_ENABLED(ppu, sub, layer))
+    return;
+  PpuWindows win;
+  IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer, y)
+                                      : PpuWindows_Clear(&win, ppu, layer, y);
+  PpuWindows_ClipWorld(&win, ppu, layer, (int)y);
+  if (win.nr == 0 || (win.bits & ((1u << win.nr) - 1u)) == ((1u << win.nr) - 1u))
+    return;
+
+  const uint16 * const vram = PpuRenderVram(ppu);
+  const int sy = (int)(mosaic ? ppu->mosaicModulo[y] : y) + ppu->vScroll[layer];
+  const int tileadr = PPU_bgTileAdr(ppu, layer);
+  const int words = (bpp == 4) ? 16 : 8;          /* vram words per 8x8 char */
+  const unsigned pal_shift = (bpp == 4) ? 6 : 8;
+  const bool tilemap_wider = PPU_bgTilemapWider(ppu, layer) != 0;
+  const bool tilemap_higher = PPU_bgTilemapHigher(ppu, layer) != 0;
+  const int hscroll = ppu->hScroll[layer];
+  const bool ws_shadow = !s_detached_line_depth && WsShadowLayerActive((int)layer);
+
+  int sc_row = PPU_bgTilemapAdr(ppu, layer) + (((sy >> 4) & 31) << 5);
+  if (((sy >> 9) & 1) && tilemap_higher)
+    sc_row += tilemap_wider ? 0x800 : 0x400;
+  const unsigned base_py = (unsigned)sy & 15u;
+
+  for (size_t windex = 0; windex < win.nr; windex++) {
+    if (win.bits & (1 << windex))
+      continue;
+    const int left = win.edges[windex];
+    const int right = win.edges[windex + 1];
+    if (right <= left)
+      continue;
+    PpuZbufType *dstz = dstbuf->data + left + kPpuLineBorder;
+
+    if (!mosaic && !ws_shadow) {
+      for (int screen_x = left; screen_x < right;) {
+        const int sx = screen_x + hscroll;
+        int curw = 8 - (sx & 7);
+        if (curw > right - screen_x)
+          curw = right - screen_x;
+
+        int sc = sc_row;
+        if (((sx >> 9) & 1) && tilemap_wider)
+          sc += 0x400;
+        sc += (sx >> 4) & 31;
+        const uint16 tile = vram[sc & 0x7fff];
+        const PpuZbufType z =
+            ((tile & 0x2000) ? zhi : zlo) + ((tile & 0x1c00) >> pal_shift);
+
+        if (curw == 8 &&
+            z <= dstz[0] && z <= dstz[1] && z <= dstz[2] && z <= dstz[3] &&
+            z <= dstz[4] && z <= dstz[5] && z <= dstz[6] && z <= dstz[7]) {
+          screen_x += 8;
+          dstz += 8;
+          continue;
+        }
+
+        const unsigned py = (tile & 0x8000) ? (15u - base_py) : base_py;
+        unsigned sub_x = ((unsigned)sx >> 3) & 1u;
+        if (tile & 0x4000) sub_x ^= 1u;
+        const unsigned character =
+            ((tile & 0x3ffu) + sub_x + ((py >> 3) << 4)) & 0x3ffu;
+        const unsigned addr = (tileadr + character * words + (py & 7u)) & 0x7fffu;
+        uint32 bits = vram[addr];
+        if (bpp == 4)
+          bits |= (uint32)vram[(addr + 8u) & 0x7fffu] << 16;
+
+        if (!bits) {
+          screen_x += curw;
+          dstz += curw;
+          continue;
+        }
+
+        const unsigned start_in_sub = (unsigned)sx & 7u;
+        if (bpp == 4) {
+          typedef struct {
+            uint32_t bits;
+            uint64_t px;
+          } Ppu4bppSliverCache;
+          static Ppu4bppSliverCache s_4bpp_cache[2048];
+          const unsigned cidx = ((addr >> 1) & 0x7F8u) | (addr & 7u);
+          uint64_t px64;
+          if (s_4bpp_cache[cidx].bits == bits) {
+            px64 = s_4bpp_cache[cidx].px;
+          } else {
+            uint64_t d = 0;
+            uint32_t b = bits;
+            for (int k = 0; k < 8; k++, b <<= 1) {
+              uint64_t p = ((b >> 7) & 1u) | ((b >> 14) & 2u) |
+                           ((b >> 21) & 4u) | ((b >> 28) & 8u);
+              d |= p << (k * 8);
+            }
+            px64 = d;
+            s_4bpp_cache[cidx].bits = bits;
+            s_4bpp_cache[cidx].px = px64;
+          }
+#if defined(__AVX2__)
+          if (curw == 8) {
+            __m128i px16 = _mm_cvtepu8_epi16(_mm_cvtsi64_si128((long long)px64));
+            if (tile & 0x4000) {
+              const __m128i v_hflip = _mm_setr_epi8(
+                  14, 15, 12, 13, 10, 11, 8, 9, 6, 7, 4, 5, 2, 3, 0, 1);
+              px16 = _mm_shuffle_epi8(px16, v_hflip);
+            }
+            __m128i nonzero = _mm_cmpgt_epi16(px16, _mm_setzero_si128());
+            __m128i cand = _mm_and_si128(_mm_add_epi16(px16, _mm_set1_epi16((short)z)), nonzero);
+            __m128i old = _mm_loadu_si128((const __m128i *)dstz);
+            _mm_storeu_si128((__m128i *)dstz, _mm_max_epu16(old, cand));
+            screen_x += 8;
+            dstz += 8;
+            continue;
+          }
+#endif
+          const uint8_t *pbytes = (const uint8_t *)&px64;
+          if (tile & 0x4000) {
+            for (int i = 0; i < curw; i++) {
+              unsigned pixel = pbytes[7u - (start_in_sub + (unsigned)i)];
+              if (pixel && z > dstz[i])
+                dstz[i] = z + (PpuZbufType)pixel;
+            }
+          } else {
+            for (int i = 0; i < curw; i++) {
+              unsigned pixel = pbytes[start_in_sub + (unsigned)i];
+              if (pixel && z > dstz[i])
+                dstz[i] = z + (PpuZbufType)pixel;
+            }
+          }
+        } else {
+          if (tile & 0x4000) {
+            uint32 b = bits >> start_in_sub;
+            for (int i = 0; i < curw; i++, b >>= 1) {
+              unsigned pixel = (b & 1u) | ((b >> 7) & 2u);
+              if (pixel && z > dstz[i])
+                dstz[i] = z + (PpuZbufType)pixel;
+            }
+          } else {
+            uint32 b = bits << start_in_sub;
+            for (int i = 0; i < curw; i++, b <<= 1) {
+              unsigned pixel = ((b >> 7) & 1u) | ((b >> 14) & 2u);
+              if (pixel && z > dstz[i])
+                dstz[i] = z + (PpuZbufType)pixel;
+            }
+          }
+        }
+        screen_x += curw;
+        dstz += curw;
+      }
+      continue;
+    }
+
+    for (int screen_x = left; screen_x < right; screen_x++, dstz++) {
+      const int mx = mosaic ? PpuMosaicAt(ppu, screen_x) : screen_x;
+      const int sx = mx + hscroll;
+      int sc = sc_row;
+      if (((sx >> 9) & 1) && tilemap_wider)
+        sc += 0x400;
+      sc += (sx >> 4) & 31;
+      uint16 tile = vram[sc & 0x7fff];
+      unsigned px = (unsigned)sx & 15, py = base_py;
+      /* Margins: world-keyed shadow tile + matching world pixel phase.
+       * Using live hScroll/vScroll for px/py while the tile key used the
+       * NMI-latched world origin produced a persistent ~phase seam. */
+      if (ws_shadow && (screen_x < 0 || screen_x >= 256)) {
+        tile = WsShadowTile((int)layer, screen_x, (uint32_t)sy,
+                            (uint16_t)hscroll,
+                            (uint16_t)(sc & 0x7fff), tile);
+        const int32_t wpx =
+            (int32_t)WsShadowWorldX((int)layer) + screen_x;
+        const int32_t wpy =
+            (int32_t)WsShadowPresentWorldY((int)layer, screen_x) +
+            (int32_t)((sy - WsShadowScrollY((int)layer)) & 0x3ff);
+        if (wpx >= 0)
+          px = (unsigned)wpx & 15;
+        if (wpy >= 0)
+          py = (unsigned)wpy & 15;
+      }
+      if (tile & 0x4000) px = 15 - px;
+      if (tile & 0x8000) py = 15 - py;
+      const unsigned character =
+          ((tile & 0x3ff) + (px >> 3) + ((py >> 3) << 4)) & 0x3ff;
+      const unsigned addr = (tileadr + character * words + (py & 7)) & 0x7fff;
+      const unsigned bit = 7 - (px & 7);
+      const uint16 p01 = vram[addr];
+      unsigned pixel = ((p01 >> bit) & 1) | (((p01 >> (8 + bit)) & 1) << 1);
+      if (bpp == 4) {
+        const uint16 p23 = vram[(addr + 8) & 0x7fff];
+        pixel |= (((p23 >> bit) & 1) << 2) | (((p23 >> (8 + bit)) & 1) << 3);
+      }
+      const PpuZbufType z =
+          ((tile & 0x2000) ? zhi : zlo) + ((tile & 0x1c00) >> pal_shift);
+      if (pixel && z > *dstz)
+        *dstz = z + (PpuZbufType)pixel;
+    }
+  }
+}
+
+static uint16 PpuTilemapWordAddress(Ppu *ppu, uint layer, int tx, int ty) {
+  int addr = PPU_bgTilemapAdr(ppu, layer) + ((ty & 31) << 5) + (tx & 31);
+  if (((ty >> 5) & 1) && PPU_bgTilemapHigher(ppu, layer))
+    addr += PPU_bgTilemapWider(ppu, layer) ? 0x800 : 0x400;
+  if (((tx >> 5) & 1) && PPU_bgTilemapWider(ppu, layer))
+    addr += 0x400;
+  return (uint16)(addr & 0x7fff);
+}
+
+static uint16 PpuReadTilemapEntry(Ppu *ppu, uint layer, int tx, int ty) {
+  return PpuRenderVram(ppu)[PpuTilemapWordAddress(ppu, layer, tx, ty)];
+}
+
+/* Capture a native-width Mode 1 4bpp layer independently of the compositor.
+ * Star Fox temporarily changes its 3D scene from Mode 2 to Mode 1 for flashes
+ * and scripted effects while retaining the same landscape and GSU surface.
+ * The normal wide renderer is intentionally allowed to evaluate tiles beyond
+ * the SNES viewport, but those columns are not reliable source material for
+ * presentation synthesis, so retain only the authentic x=0..255 result. */
+static void PpuCaptureBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer) {
+  uint8_t *capture = NULL;
+  uint8_t *bg1_palette = NULL;
+  if (!sub && ppu->wsMode2CaptureLayer == layer + 1 && y > 0 && y <= 224) {
+    capture = ppu->wsMode2Capture[y - 1];
+    memset(capture, 0, kPpuXPixels);
+  }
+  if (!sub && ppu->wsMode2CaptureLayer && layer == 0 && y > 0 && y <= 224) {
+    bg1_palette = ppu->wsMode2Bg1Palette[y - 1];
+    memset(bg1_palette, 0, kPpuXPixels);
+  }
+  if ((!capture && !bg1_palette) || !IS_SCREEN_ENABLED(ppu, sub, layer))
+    return;
+
+  PpuWindows win;
+  IS_SCREEN_WINDOWED(ppu, sub, layer)
+      ? PpuWindows_Calc(&win, ppu, layer, y)
+      : PpuWindows_Clear(&win, ppu, layer, y);
+
+  const bool big = PPU_bigTiles(ppu, layer) != 0;
+  const unsigned tile_shift = big ? 4 : 3;
+  const unsigned tile_mask = (1u << tile_shift) - 1u;
+  const unsigned coord_mask = big ? 0x3ffu : 0x1ffu;
+  const int tileadr = PPU_bgTileAdr(ppu, layer);
+  const unsigned sy = (ppu->vScroll[layer] + y) & coord_mask;
+
+  for (size_t windex = 0; windex < win.nr; windex++) {
+    if (win.bits & (1 << windex))
+      continue;
+    const int left = IntMax(win.edges[windex], 0);
+    const int right = IntMin(win.edges[windex + 1], kPpuXPixels);
+    for (int screen_x = left; screen_x < right; screen_x++) {
+      const unsigned sx =
+          (ppu->hScroll[layer] + (unsigned)screen_x) & coord_mask;
+      uint16 tile = PpuReadTilemapEntry(
+          ppu, layer, sx >> tile_shift, sy >> tile_shift);
+      unsigned px = sx & tile_mask;
+      unsigned py = sy & tile_mask;
+      if (tile & 0x4000) px = tile_mask - px;
+      if (tile & 0x8000) py = tile_mask - py;
+      unsigned character = tile & 0x3ff;
+      if (big)
+        character =
+            (character + (px >> 3) + ((py >> 3) << 4)) & 0x3ff;
+      const unsigned addr =
+          (tileadr + character * 16 + (py & 7)) & 0x7fff;
+      const uint16 p01 = PpuRenderVram(ppu)[addr];
+      const uint16 p23 = PpuRenderVram(ppu)[(addr + 8) & 0x7fff];
+      const unsigned bit = 7 - (px & 7);
+      const unsigned pixel =
+          ((p01 >> bit) & 1) | (((p01 >> (bit + 8)) & 1) << 1) |
+          (((p23 >> bit) & 1) << 2) | (((p23 >> (bit + 8)) & 1) << 3);
+      const uint8_t palette_base = (uint8_t)((tile & 0x1c00) >> 6);
+      if (capture && pixel)
+        capture[screen_x] = palette_base + (uint8_t)pixel;
+      if (bg1_palette)
+        bg1_palette[screen_x] = palette_base;
+    }
+  }
+}
+
+/* Modes 2/4/6 use BG3's tilemap as per-column scroll overrides for the
+ * displayed layers.  Mode 2 (the Star Fox attract/game perspective screens)
+ * has separate horizontal and vertical rows: BG3VOFS-1 selects the horizontal
+ * row and BG3VOFS+7 the vertical row.  Bit 13 enables BG1, bit 14 enables BG2.
+ * The first visible tile column cannot be offset on hardware. */
+static void PpuDrawBackground_4bpp_opt(Ppu *ppu, uint y, bool sub, uint layer,
+                                      PpuZbufType zhi, PpuZbufType zlo) {
+  uint8_t *capture = NULL;
+  uint8_t *bg1_palette = NULL;
+  if (!sub && ppu->wsMode2CaptureLayer == layer + 1 && y > 0 && y <= 224) {
+    capture = ppu->wsMode2Capture[y - 1];
+    memset(capture, 0, kPpuXPixels);
+  }
+  if (!sub && ppu->wsMode2CaptureLayer && layer == 0 && y > 0 && y <= 224) {
+    bg1_palette = ppu->wsMode2Bg1Palette[y - 1];
+    memset(bg1_palette, 0, kPpuXPixels);
+  }
+  if (!IS_SCREEN_ENABLED(ppu, sub, layer))
+    return;
+
+  PpuWindows win;
+  IS_SCREEN_WINDOWED(ppu, sub, layer)
+      ? PpuWindows_Calc(&win, ppu, layer, y)
+      : PpuWindows_Clear(&win, ppu, layer, y);
+  int16 ws_bias[8] = { 0 };
+  PpuApplyLayerAnchorBand(ppu, layer, y, &win, ws_bias);
+
+  const bool big = PPU_bigTiles(ppu, layer) != 0;
+  const bool opt_big = PPU_bigTiles(ppu, 2) != 0;
+  const unsigned tile_shift = big ? 4 : 3;
+  const unsigned tile_mask = (1u << tile_shift) - 1u;
+  const unsigned coord_mask = big ? 0x3ffu : 0x1ffu;
+  const unsigned opt_shift = opt_big ? 4 : 3;
+  const unsigned opt_coord_mask = opt_big ? 0x3ffu : 0x1ffu;
+  const int tileadr = PPU_bgTileAdr(ppu, layer);
+  const unsigned hscroll = ppu->hScroll[layer];
+  const unsigned vscroll = ppu->vScroll[layer];
+  const unsigned opt_hscroll = ppu->hScroll[2];
+  const unsigned opt_vscroll = ppu->vScroll[2] - 1u;
+  const int opt_hrow = (opt_vscroll & opt_coord_mask) >> opt_shift;
+  const int opt_vrow = ((opt_vscroll + 8) & opt_coord_mask) >> opt_shift;
+  const uint16 enable = (uint16)(0x2000u << layer);
+  const bool ws_shadow = WsShadowLayerActive((int)layer);
+
+  for (size_t windex = 0; windex < win.nr; windex++) {
+    if (win.bits & (1 << windex))
+      continue;
+    const int left = win.edges[windex];
+    const int right = win.edges[windex + 1];
+    const int sample_bias = ws_bias[windex];
+    PpuZbufType *dstz =
+        ppu->bgBuffers[sub].data + left + kPpuLineBorder;
+    /* OPT values apply to a rendered segment, not independently to every
+     * screen pixel.  The selected horizontal offset determines where the
+     * next eight-pixel source-tile boundary lies; only there does the PPU
+     * fetch another BG3 offset-map entry. */
+    for (int screen_x = left; screen_x < right;) {
+      const int source_screen_x = screen_x + sample_bias;
+      unsigned hoffset = hscroll;
+      unsigned voffset = vscroll;
+      if (source_screen_x < 8 - (int)(hscroll & 7)) {
+        /* The SNES cannot apply OPT to the leftmost source-tile column. */
+      } else {
+        const unsigned opt_pos =
+            (opt_hscroll + (unsigned)source_screen_x - 1) & opt_coord_mask;
+        const int opt_x = opt_pos >> opt_shift;
+        const uint16 hcell = PpuReadTilemapEntry(ppu, 2, opt_x, opt_hrow);
+        const uint16 vcell = PpuReadTilemapEntry(ppu, 2, opt_x, opt_vrow);
+        if (hcell & enable)
+          hoffset = (hcell & ~7) | (hscroll & 7);
+        if (vcell & enable)
+          voffset = (uint16)(vcell + 1);
+      }
+
+      const unsigned sx =
+          (hoffset + (unsigned)source_screen_x) & coord_mask;
+      const unsigned sy = (voffset + y) & coord_mask;
+      unsigned width = 8 - (sx & 7);
+      if (width > (unsigned)(right - screen_x))
+        width = right - screen_x;
+
+      const uint16 map_word = PpuTilemapWordAddress(
+          ppu, layer, sx >> tile_shift, sy >> tile_shift);
+      const uint16 real_tile = PpuRenderVram(ppu)[map_word];
+      uint16 shadow_tile = real_tile;
+      if (ws_shadow) {
+        /* Preserve the native segment. Resolve its continuation with the
+         * effective OPT offsets, not the unmodified global scroll. The
+         * segment ends at the next source-tile boundary, so one lookup also
+         * serves a straddling native/margin segment without changing native
+         * pixels or doing a world lookup for every output pixel. */
+        const int margin_x = screen_x < 0 ? screen_x :
+                             screen_x >= 256 ? screen_x : 256;
+        if (screen_x < 0 || screen_x + (int)width > 256) {
+          const unsigned map_height =
+              (PPU_bgTilemapHigher(ppu, layer) ? 64u : 32u) << tile_shift;
+          int vdelta = (voffset - vscroll) & (map_height - 1);
+          if (vdelta >= (int)map_height / 2) vdelta -= map_height;
+          shadow_tile = WsShadowTile(
+              (int)layer, margin_x + sample_bias, vscroll + vdelta + y,
+              (uint16_t)hoffset, map_word, real_tile);
+        }
+      }
+
+      for (unsigned i = 0; i < width; i++, dstz++) {
+        unsigned source_x = (sx + i) & coord_mask;
+        const int output_x = screen_x + (int)i;
+        uint16 tile = output_x < 0 || output_x >= 256 ? shadow_tile : real_tile;
+        unsigned px = source_x & tile_mask;
+        unsigned py = sy & tile_mask;
+        if (tile & 0x4000)
+          px = tile_mask - px;
+        if (tile & 0x8000)
+          py = tile_mask - py;
+
+        unsigned character = tile & 0x3ff;
+        if (big)
+          character =
+              (character + (px >> 3) + ((py >> 3) << 4)) & 0x3ff;
+        const unsigned addr =
+            (tileadr + character * 16 + (py & 7)) & 0x7fff;
+        const uint16 p01 = PpuRenderVram(ppu)[addr];
+        const uint16 p23 = PpuRenderVram(ppu)[(addr + 8) & 0x7fff];
+        const unsigned bit = 7 - (px & 7);
+        const unsigned pixel =
+            ((p01 >> bit) & 1) | (((p01 >> (bit + 8)) & 1) << 1) |
+            (((p23 >> bit) & 1) << 2) |
+            (((p23 >> (bit + 8)) & 1) << 3);
+        const PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+        const uint8_t palette_pixel =
+            pixel ? (uint8_t)(((tile & 0x1c00) >> 6) + pixel) : 0;
+        const int capture_x = screen_x + (int)i;
+        if (capture && capture_x >= 0 && capture_x < kPpuXPixels)
+          capture[capture_x] = palette_pixel;
+        if (bg1_palette && capture_x >= 0 && capture_x < kPpuXPixels)
+          bg1_palette[capture_x] = (uint8_t)((tile & 0x1c00) >> 6);
+        if (palette_pixel && z > *dstz &&
+            PpuViewportAllows(ppu, layer,
+                              screen_x + (int)i,
+                              screen_x + (int)i + sample_bias))
+          *dstz = z + palette_pixel;
+      }
+      screen_x += width;
+    }
+  }
+}
+
+// Draw a whole line of a 2bpp background layer into bgBuffers
+static void PpuDrawBackground_2bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo) {
+#define DO_PIXEL(i) do { \
+  pixel = (bits >> i) & 1 | (bits >> (7 + i)) & 2; \
+  if (pixel && z > dstz[i]) dstz[i] = z + pixel; } while (0)
+#define DO_PIXEL_HFLIP(i) do { \
+  pixel = (bits >> (7 - i)) & 1 | (bits >> (14 - i)) & 2; \
+  if (pixel && z > dstz[i]) dstz[i] = z + pixel; } while (0)
+#define READ_BITS(ta, tile) (addr = &vram[(ta) + (tile) * 8 & 0x7fff], addr[0])
+  enum { kPaletteShift = 8 };
+  if (!IS_SCREEN_ENABLED(ppu, sub, layer))
+    return;  // layer is completely hidden
+  PpuWindows win;
+  IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer, y) : PpuWindows_Clear(&win, ppu, layer, y);
+  PpuWindows_ClipWorld(&win, ppu, layer, (int)y);
+  // Widescreen HUD split (PpuSetWidescreenHudSplit): on HUD scanlines,
+  // replace the single span with five — left chunk re-anchored to the left
+  // border edge, a transparent gap, the centered chunk, a gap, and the
+  // right chunk re-anchored to the right border edge. Those edges are the
+  // PHYSICAL frame edges (extraFrameLeft/Right), which equal the budget
+  // unless view anchoring slid the origin. ws_bias shifts each
+  // drawn span's source x so the chunks keep sampling their authentic
+  // tilemap columns. Normally applied only when the computed window set is
+  // one full drawn span: games (SMW) often enable screen-level window masking
+  // ($212E) with no window selected for the layer. Games opting into
+  // wsHudAlwaysVisible may override a real BG3 window inside this HUD band;
+  // content below the band keeps its authentic window.
+  int16 ws_bias[8] = { 0 };
+  uint8 hud_height = ppu->wsHudSplitHeight & 0x7f;
+  bool hud_always_visible = (ppu->wsHudSplitHeight & 0x80) != 0;
+  if (dstbuf == &ppu->bgBuffers[sub] &&
+      layer == 2 && y < hud_height &&
+      ppu->extraLeftRight &&
+      (hud_always_visible || (win.nr == 1 && win.bits == 0))) {
+    win.nr = 5;
+    win.bits = 0x0A;  // spans 1 and 3 are the gaps
+    win.edges[0] = -(int16)ppu->extraFrameLeft;
+    win.edges[1] = (int16)(ppu->wsHudLeftEnd - ppu->extraFrameLeft);
+    const int center_shift = (int)ppu->extraLeftRight - ppu->extraFrameLeft;
+    win.edges[2] = (int16)(ppu->wsHudLeftEnd + center_shift);
+    win.edges[3] = (int16)(ppu->wsHudRightStart + center_shift);
+    win.edges[4] = (int16)(ppu->wsHudRightStart + ppu->extraFrameRight);
+    win.edges[5] = (int16)(256 + ppu->extraFrameRight);
+    ws_bias[0] = (int16)ppu->extraFrameLeft;
+    ws_bias[2] = (int16)-center_shift;
+    ws_bias[4] = -(int16)ppu->extraFrameRight;
+  } else {
+    PpuApplyMarginGap(ppu, layer, &win, ws_bias);
+  }
+  if (win.nr == 0 || (win.bits & ((1u << win.nr) - 1u)) == ((1u << win.nr) - 1u))
+    return;
+  const uint16 * const vram = PpuRenderVram(ppu);
+  const bool tilemap_wider = PPU_bgTilemapWider(ppu, layer) != 0;
+  const uint16 hscroll = ppu->hScroll[layer];
+  y += ppu->vScroll[layer];
+  int sc_offs = PPU_bgTilemapAdr(ppu, layer) + (((y >> 3) & 0x1f) << 5);
+  if ((y & 0x100) && PPU_bgTilemapHigher(ppu, layer))
+    sc_offs += tilemap_wider ? 0x800 : 0x400;
+  const uint16 *tps[2] = {
+    &vram[sc_offs & 0x7fff],
+    &vram[sc_offs + (tilemap_wider ? 0x400 : 0) & 0x7fff]
+  };
+  int tileadr = PPU_bgTileAdr(ppu, layer), pixel;
+  int tileadr1 = tileadr + 7 - (y & 0x7), tileadr0 = tileadr + (y & 0x7);
+
+  const uint16 *addr;
+  for (size_t windex = 0; windex < win.nr; windex++) {
+    if (win.bits & (1 << windex))
+      continue;  // layer is disabled for this window part
+    if (win.edges[windex + 1] <= win.edges[windex])
+      continue;
+    uint x = win.edges[windex] + hscroll + ws_bias[windex];
+    uint w = win.edges[windex + 1] - win.edges[windex];
+    PpuZbufType *dstz = dstbuf->data + win.edges[windex] + kPpuLineBorder;
+    const uint16 *tp = tps[x >> 8 & 1] + ((x >> 3) & 0x1f);
+    const uint16 *tp_last = tps[x >> 8 & 1] + 31;
+    const uint16 *tp_next = tps[(x >> 8 & 1) ^ 1];
+
+#define NEXT_TP() if (tp != tp_last) tp += 1; else tp = tp_next, tp_next = tp_last - 31, tp_last = tp + 31;
+    // Handle clipped pixels on left side
+    if (x & 7) {
+      int curw = IntMin(8 - (x & 7), w);
+      w -= curw;
+      uint32 tile = *tp;
+      NEXT_TP();
+      int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
+      PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+      uint32 bits = READ_BITS(ta, tile & 0x3ff);
+      if (bits) {
+        z += ((tile & 0x1c00) >> kPaletteShift);
+        if (tile & 0x4000) {
+          bits >>= (x & 7), x += curw;
+          do DO_PIXEL(0); while (bits >>= 1, dstz++, --curw);
+        } else {
+          bits <<= (x & 7), x += curw;
+          do DO_PIXEL_HFLIP(0); while (bits <<= 1, dstz++, --curw);
+        }
+      } else {
+        dstz += curw;
+      }
+    }
+    // Handle full tiles in the middle
+    while (w >= 8) {
+      uint32 tile = *tp;
+      NEXT_TP();
+      int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
+      PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+      if (z > dstz[0] || z > dstz[1] || z > dstz[2] || z > dstz[3] ||
+          z > dstz[4] || z > dstz[5] || z > dstz[6] || z > dstz[7]) {
+        uint32 bits = READ_BITS(ta, tile & 0x3ff);
+        if (bits) {
+          z += ((tile & 0x1c00) >> kPaletteShift);
+          if (tile & 0x4000) {
+            DO_PIXEL(0); DO_PIXEL(1); DO_PIXEL(2); DO_PIXEL(3);
+            DO_PIXEL(4); DO_PIXEL(5); DO_PIXEL(6); DO_PIXEL(7);
+          } else {
+            DO_PIXEL_HFLIP(0); DO_PIXEL_HFLIP(1); DO_PIXEL_HFLIP(2); DO_PIXEL_HFLIP(3);
+            DO_PIXEL_HFLIP(4); DO_PIXEL_HFLIP(5); DO_PIXEL_HFLIP(6); DO_PIXEL_HFLIP(7);
+          }
+        }
+      }
+      dstz += 8, w -= 8;
+    }
+    // Handle remaining clipped part
+    if (w) {
+      uint32 tile = *tp;
+      int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
+      PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+      uint32 bits = READ_BITS(ta, tile & 0x3ff);
+      if (bits) {
+        z += ((tile & 0x1c00) >> kPaletteShift);
+        if (tile & 0x4000) {
+          do DO_PIXEL(0); while (bits >>= 1, dstz++, --w);
+        } else {
+          do DO_PIXEL_HFLIP(0); while (bits <<= 1, dstz++, --w);
+        }
+      }
+    }
+  }
+#undef NEXT_TP
+#undef READ_BITS
+#undef DO_PIXEL
+#undef DO_PIXEL_HFLIP
+}
+
+
+// Draw a whole line of a 4bpp background layer into bgBuffers, with mosaic applied
+static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
+                                          PpuPixelPrioBufs *dstbuf, uint y,
+                                          bool sub, uint layer,
+                                          PpuZbufType zhi, PpuZbufType zlo) {
+#define VIEWPORT_ALLOWED(i) \
+  (!has_viewport_clip || PpuViewportAllows(ppu, layer, \
+      (int)(dstz + (i) - dstbuf->data - kPpuLineBorder), \
+      (int)(dstz + (i) - dstbuf->data - kPpuLineBorder)))
+#define GET_PIXEL() pixel = (bits) & 1 | (bits >> 7) & 2 | (bits >> 14) & 4 | (bits >> 21) & 8
+#define GET_PIXEL_HFLIP() pixel = (bits >> 7) & 1 | (bits >> 14) & 2 | (bits >> 21) & 4 | (bits >> 28) & 8
+#define READ_BITS(ta, tile) (addr = &vram[((ta) + (tile) * 16) & 0x7fff], addr[0] | addr[8] << 16)
+  enum { kPaletteShift = 6 };
+  if (!IS_SCREEN_ENABLED(ppu, sub, layer))
+    return;  // layer is completely hidden
+  PpuWindows win;
+  IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer, y) : PpuWindows_Clear(&win, ppu, layer, y);
+  if (win.nr == 0 || (win.bits & ((1u << win.nr) - 1u)) == ((1u << win.nr) - 1u))
+    return;
+  const uint16 * const vram = PpuRenderVram(ppu);
+  const bool has_viewport_clip =
+      (ppu->widescreenLineEnhancer != NULL) &&
+      (layer == 0 || (ppu->wsViewportInsetL[layer] | ppu->wsViewportInsetR[layer]) != 0);
+  const bool tilemap_wider = PPU_bgTilemapWider(ppu, layer) != 0;
+  const uint16 hscroll = ppu->hScroll[layer];
+  const int mosaic_size = PPU_mosaicSize(ppu);
+  y = ppu->mosaicModulo[y] + ppu->vScroll[layer];
+  int sc_offs = PPU_bgTilemapAdr(ppu, layer) + (((y >> 3) & 0x1f) << 5);
+  if ((y & 0x100) && PPU_bgTilemapHigher(ppu, layer))
+    sc_offs += tilemap_wider ? 0x800 : 0x400;
+  const uint16 *tps[2] = {
+    &vram[sc_offs & 0x7fff],
+    &vram[sc_offs + (tilemap_wider ? 0x400 : 0) & 0x7fff]
+  };
+  int tileadr = PPU_bgTileAdr(ppu, layer), pixel;
+  int tileadr1 = tileadr + 7 - (y & 0x7), tileadr0 = tileadr + (y & 0x7);
+  const uint16 *addr;
+  bool ws_shadow = !s_detached_line_depth && WsShadowLayerActive(layer);
+#define WS_TILE(t, sx) (ws_shadow ? WsShadowTile(layer, (sx), y, hscroll, (uint16_t)(tp - vram), (uint16_t)(t)) : (uint32)(t))
+  for (size_t windex = 0; windex < win.nr; windex++) {
+    if (win.bits & (1 << windex))
+      continue;  // layer is disabled for this window part
+    int sx = win.edges[windex];
+    if (win.edges[windex + 1] <= sx) continue;
+    int ws_sx = sx;
+    PpuZbufType *dstz = dstbuf->data + sx + kPpuLineBorder;
+    PpuZbufType *dstz_end = dstbuf->data + win.edges[windex + 1] + kPpuLineBorder;
+    uint x = sx + hscroll;
+    const uint16 *tp = tps[x >> 8 & 1] + ((x >> 3) & 0x1f);
+    const uint16 *tp_last = tps[x >> 8 & 1] + 31, *tp_next = tps[(x >> 8 & 1) ^ 1];
+    x &= 7;
+    int w = mosaic_size - (sx - PpuMosaicAt(ppu, sx));
+    do {
+      w = IntMin(w, dstz_end - dstz);
+      uint32 tile = WS_TILE(*tp, ws_sx);
+      int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
+      PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+      uint32 bits = READ_BITS(ta, tile & 0x3ff);
+      if (tile & 0x4000) bits >>= x, GET_PIXEL(); else bits <<= x, GET_PIXEL_HFLIP();
+      if (pixel) {
+        pixel += ((tile & 0x1c00) >> kPaletteShift);
+        int i = 0;
+        do {
+          if (VIEWPORT_ALLOWED(i) && z > dstz[i])
+            dstz[i] = pixel + z;
+        } while (++i != w);
+      }
+      dstz += w, x += w, ws_sx += w;
+      for (; x >= 8; x -= 8)
+        tp = (tp != tp_last) ? tp + 1 : tp_next;
+      w = mosaic_size;
+    } while (dstz_end - dstz != 0);
+  }
+#undef WS_TILE
+#undef READ_BITS
+#undef GET_PIXEL
+#undef GET_PIXEL_HFLIP
+#undef VIEWPORT_ALLOWED
+}
+
+// Merge one isolated layer into the live priority buffer, padding only that
+// layer's side margins so transparent pixels never duplicate lower layers or
+// sprites. `repeat` selects cyclic continuation; otherwise reflect the edge.
+static void PpuMergePaddedBackground(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
+                                     const PpuPixelPrioBufs *layerbuf,
+                                     bool repeat, bool full_budget) {
+  PpuZbufType *dst = dstbuf->data;
+  const PpuZbufType *src = layerbuf->data;
+  int left_extra = full_budget ? ppu->extraFrameLeft : ppu->extraLeftCur;
+  int right_extra = full_budget ? ppu->extraFrameRight : ppu->extraRightCur;
+  for (int x = 0; x < kPpuXPixels; x++) {
+    int i = x + kPpuLineBorder;
+    if (src[i] > dst[i]) dst[i] = src[i];
+  }
+  for (int x = -left_extra; x < 0; x++) {
+    int di = x + kPpuLineBorder;
+    int sx = repeat ? kPpuXPixels + x : -x;
+    int si = sx + kPpuLineBorder;
+    if (src[si] > dst[di]) dst[di] = src[si];
+  }
+  for (int x = kPpuXPixels;
+       x < kPpuXPixels + right_extra; x++) {
+    int di = x + kPpuLineBorder;
+    int sx = repeat ? x - kPpuXPixels : kPpuXPixels * 2 - 2 - x;
+    int si = sx + kPpuLineBorder;
+    if (src[si] > dst[di]) dst[di] = src[si];
+  }
+}
+
+// Preserve authored room columns, including genuine margin art. Outside the
+// room, either reflect the layer's own art or omit a bounded object canvas.
+// A canvas can follow another plane's PPU phase without sharing its scroll.
+static void PpuMergeWorldBoundedBackground(Ppu *ppu,
+                                            PpuPixelPrioBufs *dstbuf,
+                                            const PpuPixelPrioBufs *layerbuf,
+                                            int world_left, int world_right,
+                                            int hscroll, bool clip, int strip) {
+  PpuZbufType *dst = dstbuf->data;
+  const PpuZbufType *src = layerbuf->data;
+  const int left_extra = ppu->extraLeftCur;
+  const int right_extra = ppu->extraRightCur;
+  // Screen x of the authored world's left edge, and of the first column past
+  // its right edge, for the scroll THIS line rendered with (P1).
+  const int a = world_left - hscroll;
+  const int b = world_right - hscroll;
+  for (int x = -left_extra; x < kPpuXPixels + right_extra; x++) {
+    int sx = x;
+    if (clip) {
+      // The game may expose a few native edge pixels during a camera shake.
+      // Keep its authentic picture even then; contain only synthetic margins.
+      if ((x < 0 || x >= kPpuXPixels) && (x < a || x >= b))
+        continue;
+    } else if (strip) {
+      // Never change authentic columns, even during an out-of-bounds shake.
+      if (x < 0 || x >= kPpuXPixels) {
+        if (x < a) sx = a + strip - 1 - ((a - x - 1) % strip);
+        else if (x >= b) sx = b - strip + ((x - b) % strip);
+      }
+    } else {
+      if (x < a)
+        sx = 2 * a - 1 - x;
+      else if (x >= b)
+        sx = 2 * b - 1 - x;
+      if (sx < a || sx >= b)
+        continue;  // the reflection lands outside the world as well
+    }
+    if (sx < -left_extra || sx >= kPpuXPixels + right_extra)
+      continue;  // that source column was never rendered this line
+    int di = x + kPpuLineBorder, si = sx + kPpuLineBorder;
+    if (src[si] > dst[di])
+      dst[di] = src[si];
+  }
+}
+
+// Merge one isolated layer into the live priority buffer through an elastic
+// anchor band's piecewise horizontal map: rigid segments copy 1:1 at their
+// shifted destination, elastic segments resample nearest-neighbour so the
+// margin is absorbed by stretchable material only. Only source columns
+// [0,256) -- the picture the game authored -- are ever sampled. Destination
+// columns no segment covers are left alone, so a band can express a clamp.
+// See PpuSetWidescreenLayerElasticBand.
+static void PpuMergeElasticBackground(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
+                                      const PpuPixelPrioBufs *layerbuf,
+                                      const PpuWsElasticSeg *segs, int nseg,
+                                      bool full_budget) {
+  PpuZbufType *dst = dstbuf->data;
+  const PpuZbufType *src = layerbuf->data;
+  const int xlo = full_budget ? -ppu->extraFrameLeft : -ppu->extraLeftCur;
+  const int xhi = kPpuXPixels +
+      (full_budget ? ppu->extraFrameRight : ppu->extraRightCur);
+  for (int i = 0; i < nseg; i++) {
+    const int src0 = segs[i].srcX0, dst0 = segs[i].dstX0;
+    const int sw = segs[i].srcX1 - src0, dw = segs[i].dstX1 - dst0;
+    if (sw <= 0 || dw <= 0)
+      continue;
+    int d0 = dst0 < xlo ? xlo : dst0;
+    int d1 = segs[i].dstX1 > xhi ? xhi : segs[i].dstX1;
+    for (int x = d0; x < d1; x++) {
+      // Nearest neighbour about each destination pixel's CENTRE:
+      // floor(((o + 1/2) * sw) / dw) in integer arithmetic. x >= dst0, so
+      // every operand is non-negative and the division is a plain floor --
+      // deterministic, no rounding mode, identical on every host. Centre
+      // sampling (rather than the cheaper floor(o*sw/dw)) is what makes the
+      // map symmetric under reflection, so a mirror-image pair of gauges
+      // stretches to the same length; it is still exactly 1:1 when sw == dw.
+      int sx = src0 + ((2 * (x - dst0) + 1) * sw) / (2 * dw);
+      if (sx < 0 || sx >= kPpuXPixels)
+        continue;
+      int di = x + kPpuLineBorder, si = sx + kPpuLineBorder;
+      if (src[si] > dst[di])
+        dst[di] = src[si];
+    }
+  }
+}
+
+static void PpuMergeStretchedBackground(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
+                                        const PpuPixelPrioBufs *layerbuf) {
+  PpuZbufType *dst = dstbuf->data;
+  const PpuZbufType *src = layerbuf->data;
+  const int left_extra = ppu->extraFrameLeft;
+  const int right_extra = ppu->extraFrameRight;
+  const int out_width = kPpuXPixels + left_extra + right_extra;
+  if (out_width <= 0)
+    return;
+
+  for (int x = -left_extra; x < kPpuXPixels + right_extra; x++) {
+    int di = x + kPpuLineBorder;
+    int sx = ((x + left_extra) * kPpuXPixels) / out_width;
+    if (sx < 0) sx = 0;
+    if (sx >= kPpuXPixels) sx = kPpuXPixels - 1;
+    int si = sx + kPpuLineBorder;
+    if (src[si] > dst[di]) dst[di] = src[si];
+  }
+}
+
+static void PpuDrawBackground_4bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
+                                          uint y, bool sub,
+                                          uint layer, PpuZbufType zhi,
+                                          PpuZbufType zlo, bool mosaic) {
+  if (!IS_SCREEN_ENABLED(ppu, sub, layer))
+    return;
+  uint8_t padding = ppu->wsLayerMirror | ppu->wsLayerRepeat;
+  bool repeat_band = PpuWidescreenLayerRepeatBandActive(ppu, layer, y);
+  bool stretch_band = PpuWidescreenLayerStretchBandActive(ppu, layer, y);
+  int world_band = PpuWidescreenLayerWorldBandAt(ppu, layer, (int)y);
+  int elastic_band = PpuWidescreenLayerElasticBandAt(ppu, layer, (int)y);
+  int clip_left, clip_right;
+  if (!(padding & (1u << layer)) && !repeat_band && !stretch_band &&
+      ((world_band < 0 && elastic_band < 0) ||
+       PpuWorldClipBounds(ppu, layer, (int)y, &clip_left, &clip_right))) {
+    if (PPU_bigTiles(ppu, layer))
+      PpuDrawBackgroundBig(ppu, dstbuf, y, sub, layer, 4, zhi, zlo, mosaic);
+    else if (mosaic)
+      PpuDrawBackground_4bpp_mosaic(ppu, dstbuf, y, sub,
+                                    layer, zhi, zlo);
+    else
+      PpuDrawBackground_4bpp(ppu, dstbuf, y, sub, layer,
+                             zhi, zlo);
+    return;
+  }
+
+  PpuPixelPrioBufs layerbuf;
+  ClearBackdrop(ppu, &layerbuf);
+  if (PPU_bigTiles(ppu, layer))
+    PpuDrawBackgroundBig(ppu, &layerbuf, y, sub, layer, 4, zhi, zlo, mosaic);
+  else if (mosaic)
+    PpuDrawBackground_4bpp_mosaic(ppu, &layerbuf, y, sub, layer, zhi, zlo);
+  else
+    PpuDrawBackground_4bpp(ppu, &layerbuf, y, sub, layer, zhi, zlo);
+  if (elastic_band >= 0) {
+    // The most specific per-line statement wins: an elastic band describes
+    // this exact scanline's own horizontal layout, where a world band
+    // describes a scrolling plane whose scroll this line does not share.
+    const bool full_hud = (layer == 2) && (ppu->wsHudSplitHeight & 0x80) &&
+                          ppu->extraLeftRight;
+    PpuMergeElasticBackground(ppu, dstbuf, &layerbuf,
+                              ppu->wsElasticSeg[elastic_band][layer],
+                              ppu->wsElasticNSeg[elastic_band][layer],
+                              full_hud);
+  } else if (world_band >= 0) {
+    // A live world band implies the layer widens on this line, so no clamp,
+    // mirror, repeat or stretch policy can be in force at the same time.
+    PpuMergeWorldBoundedBackground(ppu, dstbuf, &layerbuf,
+                                    ppu->wsWorldLeft[world_band][layer],
+                                    ppu->wsWorldRight[world_band][layer],
+                                    ppu->hScroll[PpuWorldReferenceLayer(ppu,world_band,layer)],
+                                    (ppu->wsWorldClip[world_band] & (1u << layer)) != 0,
+                                    ppu->wsWorldRepeat[world_band][layer]);
+  } else if (stretch_band) {
+    PpuMergeStretchedBackground(ppu, dstbuf, &layerbuf);
+  } else {
+    PpuMergePaddedBackground(ppu, dstbuf, &layerbuf,
+                             repeat_band ||
+                             (ppu->wsLayerRepeat & (1u << layer)) != 0,
+                             repeat_band);
+  }
+}
+
+static void PpuDrawBackground_2bpp_mosaic(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
+                                          int y, bool sub, uint layer,
+                                          PpuZbufType zhi, PpuZbufType zlo);
+
+static void PpuDrawBackground_2bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
+                                          uint y, bool sub,
+                                          uint layer, PpuZbufType zhi,
+                                          PpuZbufType zlo, bool mosaic) {
+  if (!IS_SCREEN_ENABLED(ppu, sub, layer))
+    return;
+  uint8_t padding = ppu->wsLayerMirror | ppu->wsLayerRepeat;
+  bool repeat_band = PpuWidescreenLayerRepeatBandActive(ppu, layer, y);
+  bool stretch_band = PpuWidescreenLayerStretchBandActive(ppu, layer, y);
+  int world_band = PpuWidescreenLayerWorldBandAt(ppu, layer, (int)y);
+  int elastic_band = PpuWidescreenLayerElasticBandAt(ppu, layer, (int)y);
+  int clip_left, clip_right;
+  if (!(padding & (1u << layer)) && !repeat_band && !stretch_band &&
+      ((world_band < 0 && elastic_band < 0) ||
+       PpuWorldClipBounds(ppu, layer, (int)y, &clip_left, &clip_right))) {
+    if (PPU_bigTiles(ppu, layer))
+      PpuDrawBackgroundBig(ppu, dstbuf, y, sub, layer, 2, zhi, zlo, mosaic);
+    else if (mosaic)
+      PpuDrawBackground_2bpp_mosaic(ppu, dstbuf, y, sub, layer, zhi, zlo);
+    else
+      PpuDrawBackground_2bpp(ppu, dstbuf, y, sub, layer, zhi, zlo);
+    return;
+  }
+
+  PpuPixelPrioBufs layerbuf;
+  ClearBackdrop(ppu, &layerbuf);
+  if (PPU_bigTiles(ppu, layer))
+    PpuDrawBackgroundBig(ppu, &layerbuf, y, sub, layer, 2, zhi, zlo, mosaic);
+  else if (mosaic)
+    PpuDrawBackground_2bpp_mosaic(ppu, &layerbuf, y, sub, layer, zhi, zlo);
+  else
+    PpuDrawBackground_2bpp(ppu, &layerbuf, y, sub, layer, zhi, zlo);
+  if (elastic_band >= 0) {
+    // The most specific per-line statement wins: an elastic band describes
+    // this exact scanline's own horizontal layout, where a world band
+    // describes a scrolling plane whose scroll this line does not share.
+    const bool full_hud = (layer == 2) && (ppu->wsHudSplitHeight & 0x80) &&
+                          ppu->extraLeftRight;
+    PpuMergeElasticBackground(ppu, dstbuf, &layerbuf,
+                              ppu->wsElasticSeg[elastic_band][layer],
+                              ppu->wsElasticNSeg[elastic_band][layer],
+                              full_hud);
+  } else if (world_band >= 0) {
+    // A live world band implies the layer widens on this line, so no clamp,
+    // mirror, repeat or stretch policy can be in force at the same time.
+    PpuMergeWorldBoundedBackground(ppu, dstbuf, &layerbuf,
+                                    ppu->wsWorldLeft[world_band][layer],
+                                    ppu->wsWorldRight[world_band][layer],
+                                    ppu->hScroll[PpuWorldReferenceLayer(ppu,world_band,layer)],
+                                    (ppu->wsWorldClip[world_band] & (1u << layer)) != 0,
+                                    ppu->wsWorldRepeat[world_band][layer]);
+  } else if (stretch_band) {
+    PpuMergeStretchedBackground(ppu, dstbuf, &layerbuf);
+  } else {
+    PpuMergePaddedBackground(ppu, dstbuf, &layerbuf,
+                             repeat_band ||
+                             (ppu->wsLayerRepeat & (1u << layer)) != 0,
+                             repeat_band);
+  }
+}
+
+// Draw a whole line of a 2bpp background layer into bgBuffers, with mosaic applied
+static void PpuDrawBackground_2bpp_mosaic(Ppu *ppu, PpuPixelPrioBufs *dstbuf, int y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo) {
+#define GET_PIXEL() pixel = (bits) & 1 | (bits >> 7) & 2
+#define GET_PIXEL_HFLIP() pixel = (bits >> 7) & 1 | (bits >> 14) & 2
+#define READ_BITS(ta, tile) (addr = &vram[((ta) + (tile) * 8) & 0x7fff], addr[0])
+  enum { kPaletteShift = 8 };
+  if (!IS_SCREEN_ENABLED(ppu, sub, layer))
+    return;  // layer is completely hidden
+  PpuWindows win;
+  IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer, y) : PpuWindows_Clear(&win, ppu, layer, y);
+  if (win.nr == 0 || (win.bits & ((1u << win.nr) - 1u)) == ((1u << win.nr) - 1u))
+    return;
+  const uint16 * const vram = PpuRenderVram(ppu);
+  const bool tilemap_wider = PPU_bgTilemapWider(ppu, layer) != 0;
+  const uint16 hscroll = ppu->hScroll[layer];
+  const int mosaic_size = PPU_mosaicSize(ppu);
+  y = ppu->mosaicModulo[y] + ppu->vScroll[layer];
+  int sc_offs = PPU_bgTilemapAdr(ppu, layer) + (((y >> 3) & 0x1f) << 5);
+  if ((y & 0x100) && PPU_bgTilemapHigher(ppu, layer))
+    sc_offs += tilemap_wider ? 0x800 : 0x400;
+  const uint16 *tps[2] = {
+    &vram[sc_offs & 0x7fff],
+    &vram[sc_offs + (tilemap_wider ? 0x400 : 0) & 0x7fff]
+  };
+  int tileadr = PPU_bgTileAdr(ppu, layer), pixel;
+  int tileadr1 = tileadr + 7 - (y & 0x7), tileadr0 = tileadr + (y & 0x7);
+  const uint16 *addr;
+  for (size_t windex = 0; windex < win.nr; windex++) {
+    if (win.bits & (1 << windex))
+      continue;  // layer is disabled for this window part
+    int sx = win.edges[windex];
+    if (win.edges[windex + 1] <= sx) continue;
+    PpuZbufType *dstz = dstbuf->data + sx + kPpuLineBorder;
+    PpuZbufType *dstz_end = dstbuf->data + win.edges[windex + 1] + kPpuLineBorder;
+    uint x = sx + hscroll;
+    const uint16 *tp = tps[x >> 8 & 1] + ((x >> 3) & 0x1f);
+    const uint16 *tp_last = tps[x >> 8 & 1] + 31, *tp_next = tps[(x >> 8 & 1) ^ 1];
+    x &= 7;
+    int w = mosaic_size - (sx - PpuMosaicAt(ppu, sx));
+    do {
+      w = IntMin(w, dstz_end - dstz);
+      uint32 tile = *tp;
+      int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
+      PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+      uint32 bits = READ_BITS(ta, tile & 0x3ff);
+      if (tile & 0x4000) bits >>= x, GET_PIXEL(); else bits <<= x, GET_PIXEL_HFLIP();
+      if (pixel) {
+        pixel += ((tile & 0x1c00) >> kPaletteShift);
+        uint i = 0;
+        do {
+          if (z > dstz[i])
+            dstz[i] = pixel + z;
+        } while (++i != w);
+      }
+      dstz += w, x += w;
+      for (; x >= 8; x -= 8)
+        tp = (tp != tp_last) ? tp + 1 : tp_next;
+      w = mosaic_size;
+    } while (dstz_end - dstz != 0);
+  }
+#undef READ_BITS
+#undef GET_PIXEL
+#undef GET_PIXEL_HFLIP
+}
+
+
+// Assumes it's drawn on an empty backdrop
+static void PpuDrawBackground_mode7(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y, bool sub, PpuZbufType z) {
+  int layer = 0;
+  if (!IS_SCREEN_ENABLED(ppu, sub, layer))
+    return;  // layer is completely hidden
+  PpuWindows win;
+  IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer, y) : PpuWindows_Clear(&win, ppu, layer, y);
+  if (win.nr == 0 || (win.bits & ((1u << win.nr) - 1u)) == ((1u << win.nr) - 1u))
+    return;
+
+  const uint16 * const vram = PpuRenderVram(ppu);
+  // expand 13-bit values to signed values
+  int hScroll = ((int16_t)(ppu->m7matrix[6] << 3)) >> 3;
+  int vScroll = ((int16_t)(ppu->m7matrix[7] << 3)) >> 3;
+  int xCenter = ((int16_t)(ppu->m7matrix[4] << 3)) >> 3;
+  int yCenter = ((int16_t)(ppu->m7matrix[5] << 3)) >> 3;
+  int clippedH = hScroll - xCenter;
+  int clippedV = vScroll - yCenter;
+  clippedH = (clippedH & 0x2000) ? (clippedH | ~1023) : (clippedH & 1023);
+  clippedV = (clippedV & 0x2000) ? (clippedV | ~1023) : (clippedV & 1023);
+  uint8 mosaic_enabled = PPU_mosaicEnabled(ppu, 0);
+  if (mosaic_enabled)
+    y = ppu->mosaicModulo[y];
+  uint32 ry = PPU_m7yFlip(ppu) ? 255 - y : y;
+  uint32 m7startX = (ppu->m7matrix[0] * clippedH & ~63) + (ppu->m7matrix[1] * ry & ~63) +
+    (ppu->m7matrix[1] * clippedV & ~63) + (xCenter << 8);
+  uint32 m7startY = (ppu->m7matrix[2] * clippedH & ~63) + (ppu->m7matrix[3] * ry & ~63) +
+    (ppu->m7matrix[3] * clippedV & ~63) + (yCenter << 8);
+  const bool m7x_flip = PPU_m7xFlip(ppu) != 0;
+  const uint32 dx = m7x_flip ? -ppu->m7matrix[0] : ppu->m7matrix[0];
+  const uint32 dy = m7x_flip ? -ppu->m7matrix[2] : ppu->m7matrix[2];
+  const uint32 outside_value = PPU_m7largeField(ppu) ? 0x3ffff : 0xffffffff;
+  const bool char_fill = PPU_m7charFill(ppu) != 0;
+  const int mosaic_size = PPU_mosaicSize(ppu);
+  for (size_t windex = 0; windex < win.nr; windex++) {
+    if (win.bits & (1 << windex))
+      continue;  // layer is disabled for this window part
+    int x = win.edges[windex], x2 = win.edges[windex + 1], tile;
+    if (x2 <= x)
+      continue;
+    PpuZbufType *dstz = dstbuf->data + x + kPpuLineBorder;
+    PpuZbufType *dstz_end = dstbuf->data + x2 + kPpuLineBorder;
+    uint32 rx = m7x_flip ? 255 - x : x;
+    uint32 xpos = m7startX + ppu->m7matrix[0] * rx;
+    uint32 ypos = m7startY + ppu->m7matrix[2] * rx;
+    if (mosaic_enabled) {
+      int w = mosaic_size - (x - PpuMosaicAt(ppu, x));
+      do {
+        w = IntMin(w, dstz_end - dstz);
+        if ((uint32)(xpos | ypos) > outside_value) {
+          if (!char_fill)
+            continue;
+          tile = 0;
+        } else {
+          tile = vram[(ypos >> 11 & 0x7f) * 128 + (xpos >> 11 & 0x7f)] & 0xff;
+        }
+        uint8 pixel = vram[tile * 64 + (ypos >> 8 & 7) * 8 + (xpos >> 8 & 7)] >> 8;
+        if (pixel) {
+          int i = 0;
+          do dstz[i] = pixel + z; while (++i != w);
+        }
+      } while (xpos += dx * w, ypos += dy * w, dstz += w, w = mosaic_size, dstz_end - dstz != 0);
+    } else {
+      do {
+        if ((uint32)(xpos | ypos) > outside_value) {
+          if (!char_fill)
+            continue;
+          tile = 0;
+        } else {
+          tile = vram[(ypos >> 11 & 0x7f) * 128 + (xpos >> 11 & 0x7f)] & 0xff;
+        }
+        uint8 pixel = vram[tile * 64 + (ypos >> 8 & 7) * 8 + (xpos >> 8 & 7)] >> 8;
+        if (pixel)
+          dstz[0] = pixel + z;
+      } while (xpos += dx, ypos += dy, ++dstz != dstz_end);
+    }
+  }
+}
+
+static void PpuDrawSprites(Ppu *ppu, uint y, uint sub, bool clear_backdrop) {
+  int layer = 4;
+  if (!IS_SCREEN_ENABLED(ppu, sub, layer))
+    return;  // layer is completely hidden
+  PpuWindows win;
+  IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer, y) : PpuWindows_Clear(&win, ppu, layer, y);
+  const bool oam_hud_full_width =
+      (ppu->wsHudSplitHeight & 0x80) &&
+      ppu->wsHudOamHeight &&
+      (y >= 224 || y < ppu->wsHudOamHeight) &&
+      (ppu->wsHudOamSlots || ppu->wsHudOamSlots2) &&
+      ppu->extraLeftRight;
+  if (oam_hud_full_width && win.nr == 1 && win.bits == 0) {
+    win.edges[0] = -(int16_t)ppu->extraFrameLeft;
+    win.edges[1] = (int16_t)(256 + ppu->extraFrameRight);
+  }
+  for (size_t windex = 0; windex < win.nr; windex++) {
+    if (win.bits & (1 << windex))
+      continue;  // layer is disabled for this window part
+    int left = win.edges[windex];
+    int width = win.edges[windex + 1] - left;
+    if (width <= 0)
+      continue;
+    PpuZbufType *src = ppu->objBuffer.data + left + kPpuLineBorder;
+    PpuZbufType *dst = ppu->bgBuffers[sub].data + left + kPpuLineBorder;
+    if (clear_backdrop) {
+      memcpy(dst, src, width * sizeof(uint16));
+    } else {
+      do {
+        if (src[0] > dst[0])
+          dst[0] = src[0];
+      } while (src++, dst++, --width);
+    }
+  }
+}
+
+static bool PpuOverlayActiveOnLine(const Ppu *ppu, PpuOverlaySource source,
+                                   int screen_y) {
+  if ((unsigned)source >= kPpuOverlaySource_Count ||
+      !ppu->overlayRenderBuffer[source] ||
+      !ppu->overlayRenderPitch[source])
+    return false;
+  const PpuOverlayCapture *capture = &ppu->overlayCaptures[source];
+  return capture->x1 > capture->x0 && capture->y1 > capture->y0 &&
+         screen_y >= capture->y0 && screen_y < capture->y1;
+}
+
+static uint32 PpuOverlayColor(Ppu *ppu, PpuZbufType pixel) {
+  /* Isolated layer buffers may contain the priority-only backdrop marker.
+   * A zero palette index is still transparent for a captured BG/OBJ plane. */
+  if (!(pixel & 0xff)) return 0;
+  uint32 color = ppu->cgram[pixel & 0xff];
+  return 0xff000000u |
+      (uint32)ppu->brightnessMult[color & 0x1f] << 16 |
+      (uint32)ppu->brightnessMult[(color >> 5) & 0x1f] << 8 |
+      ppu->brightnessMult[(color >> 10) & 0x1f];
+}
+
+static void PpuClearOverlayRenderLine(Ppu *ppu, uint y) {
+  if (y == 0) return;
+  int screen_y = (int)y - 1;
+  for (int source = 0; source < kPpuOverlaySource_Count; source++) {
+    uint8_t *pixels = ppu->overlayRenderBuffer[source];
+    uint32_t pitch = ppu->overlayRenderPitch[source];
+    if (pixels && pitch)
+      memset(pixels + (size_t)screen_y * pitch, 0, pitch);
+  }
+}
+
+static void PpuWriteOverlayRenderLine(Ppu *ppu, PpuOverlaySource source,
+                                      uint y) {
+  if (y == 0) return;
+  int screen_y = (int)y - 1;
+  if (!PpuOverlayActiveOnLine(ppu, source, screen_y))
+    return;
+
+  uint32_t pitch = ppu->overlayRenderPitch[source];
+  int width = (int)(pitch / sizeof(uint32));
+  int texture_extra = IntMax((width - kPpuXPixels) / 2, 0);
+  int screen_min = -texture_extra;
+  int screen_max = width - texture_extra;
+  const PpuOverlayCapture *capture = &ppu->overlayCaptures[source];
+  int x0 = IntMax(capture->x0, screen_min);
+  int x1 = IntMin(capture->x1, screen_max);
+  if (x1 <= x0 || x0 + kPpuLineBorder < 0 ||
+      x1 + kPpuLineBorder > kPpuBufWidth)
+    return;
+
+  uint32 *dst = (uint32 *)(ppu->overlayRenderBuffer[source] +
+                            (size_t)screen_y * pitch);
+  const PpuZbufType *src = ppu->overlayBuffers[source].data;
+  for (int x = x0; x < x1; x++)
+    dst[x + texture_extra] =
+        PpuOverlayColor(ppu, src[x + kPpuLineBorder]);
+}
+
+// Choose the destination priority buffer for a background layer. When the
+// layer's overlay source is active on this line, draw it in isolation into a
+// dedicated buffer (so it can be captured and optionally removed). Otherwise
+// return the normal composition buffer, leaving the draw path byte-identical.
+static PpuPixelPrioBufs *PpuBeginBackgroundOverlay(Ppu *ppu, uint y,
+                                                   bool sub, uint layer) {
+  int screen_y = (int)y - 1;
+  PpuOverlaySource source = (PpuOverlaySource)layer;
+  if (!PpuOverlayActiveOnLine(ppu, source, screen_y))
+    return &ppu->bgBuffers[sub];
+  memset(&ppu->overlayBuffers[source], 0,
+         sizeof(ppu->overlayBuffers[source]));
+  return &ppu->overlayBuffers[source];
+}
+
+// Merge an isolated overlay layer back into the composition buffer (skipping
+// the captured rectangle when RemoveFromGame is set) and export the captured
+// pixels to the bound host surface. A no-op when the layer was drawn straight
+// into bgBuffers (overlay inactive).
+static void PpuFinishBackgroundOverlay(Ppu *ppu, uint y, bool sub,
+                                       uint layer,
+                                       PpuPixelPrioBufs *layerbuf) {
+  PpuOverlaySource source = (PpuOverlaySource)layer;
+  if (layerbuf != &ppu->overlayBuffers[source])
+    return;
+
+  if (!sub)
+    PpuWriteOverlayRenderLine(ppu, source, y);
+
+  const PpuOverlayCapture *capture = &ppu->overlayCaptures[source];
+  PpuZbufType *dst = ppu->bgBuffers[sub].data;
+  const PpuZbufType *src = layerbuf->data;
+  bool remove = (capture->flags & kPpuOverlayFlag_RemoveFromGame) != 0;
+  // Same span as the backdrop clear: outside it dst holds last line's
+  // pixels and nothing reads either buffer there.
+  size_t begin, end;
+  PpuActiveSpan(ppu, &begin, &end);
+  for (size_t i = begin; i < end; i++) {
+    int x = (int)i - kPpuLineBorder;
+    if (remove && x >= capture->x0 && x < capture->x1)
+      continue;
+    if (src[i] > dst[i])
+      dst[i] = src[i];
+  }
+}
+
+// Returns true if every pixel in the active widescreen span of `buf` already
+// has a priority value >= `threshold`, meaning any subsequent layer whose
+// maximum priority is < `threshold` is 100% occluded across the entire scanline.
+static inline bool PpuSpanFullyOccluded(const Ppu *ppu,
+                                        const PpuPixelPrioBufs *buf,
+                                        PpuZbufType threshold) {
+  size_t begin, end;
+  PpuActiveSpan(ppu, &begin, &end);
+  const PpuZbufType *data = buf->data;
+  size_t i = begin;
+#if defined(__AVX2__)
+  const __m256i v_thresh = _mm256_set1_epi16((short)threshold);
+  for (; i + 16 <= end; i += 16) {
+    __m256i v = _mm256_loadu_si256((const __m256i *)(data + i));
+    /* If min(v, v_thresh) != v_thresh, at least one lane is < threshold */
+    __m256i m = _mm256_min_epu16(v, v_thresh);
+    __m256i eq = _mm256_cmpeq_epi16(m, v_thresh);
+    if (_mm256_movemask_epi8(eq) != -1)
+      return false;
+  }
+#endif
+  for (; i < end; i++) {
+    if (data[i] < threshold)
+      return false;
+  }
+  return true;
+}
+
+/* Modes 2 and 3 (and the hardware's 4-6) order the layers
+ *   OBJ3, BG1.hi, OBJ2, BG2.hi, OBJ1, BG1.lo, OBJ0, BG2.lo
+ * -- unlike mode 1, where BG1.hi/BG2.hi both sit above OBJ2 and BG1.lo/BG2.lo
+ * both above OBJ1. With mode 1's bases a priority-1 sprite vanished behind a
+ * low-priority BG1 tile. Sprite levels stay 14/10/6/2; the BG bases slot
+ * between them. */
+enum {
+  kMode23Bg1Hi = 0xc000, kMode23Bg2Hi = 0x8100,
+  kMode23Bg1Lo = 0x4000, kMode23Bg2Lo = 0x1100,
+};
+
+static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
+  PPU_T0_DECL
+  // Top 4 bits contain the prio level, and bottom 4 bits the layer type.
+  // SPRITE_PRIO_TO_PRIO can be used to convert from obj prio to this prio.
+  //  15: BG3 tiles with priority 1 if bit 3 of $2105 is set
+  //  14: Sprites with priority 3 (4 * sprite_prio + 2)
+  //  12: BG1 tiles with priority 1
+  //  11: BG2 tiles with priority 1
+  //  10: Sprites with priority 2 (4 * sprite_prio + 2)
+  //  8: BG1 tiles with priority 0
+  //  7: BG2 tiles with priority 0
+  //  6: Sprites with priority 1 (4 * sprite_prio + 2)
+  //  3: BG3 tiles with priority 1 if bit 3 of $2105 is clear
+  //  2: Sprites with priority 0 (4 * sprite_prio + 2)
+  //  1: BG3 tiles with priority 0
+  //  0: backdrop
+
+  const uint mode = PPU_mode(ppu);
+  if (mode == 0) {
+    /* Mode 0: four 2bpp layers, each with its OWN palette group.
+     *
+     * Priority order, front to back:
+     *   OBJ3, BG1.hi, BG2.hi, OBJ2, BG1.lo, BG2.lo,
+     *   OBJ1, BG3.hi, BG4.hi, OBJ0, BG3.lo, BG4.lo, backdrop
+     * BG1/BG2 reuse mode 1's bases; BG3 keeps its mode-1 band and BG4 sits one
+     * step below it at each priority. */
+    static const PpuZbufType kMode0Hi[4] = { 0xc000, 0xb100, 0x3200, 0x3100 };
+    static const PpuZbufType kMode0Lo[4] = { 0x8000, 0x7100, 0x1200, 0x1100 };
+    bool mosaic_size0 = PPU_mosaicSize(ppu) > 1;
+    uint layer0;
+    if (ppu->lineHasSprites)
+      PpuDrawSprites(ppu, y, sub, true);
+    for (layer0 = 0; layer0 < 4; layer0++) {
+      if (!IS_SCREEN_ENABLED(ppu, sub, layer0))
+        continue;
+      PpuPixelPrioBufs *lb = PpuBeginBackgroundOverlay(ppu, y, sub, layer0);
+      PpuDrawBackground_2bpp_policy(
+          ppu, lb, y, sub, layer0,
+          (PpuZbufType)(kMode0Hi[layer0] + 32u * layer0),
+          (PpuZbufType)(kMode0Lo[layer0] + 32u * layer0),
+          mosaic_size0 && PPU_mosaicEnabled(ppu, layer0));
+      PpuFinishBackgroundOverlay(ppu, y, sub, layer0, lb);
+    }
+  } else if (mode == 1) {
+    if (ppu->lineHasSprites)
+      PpuDrawSprites(ppu, y, sub, true);
+
+    if (ppu->wsMode2CaptureLayer) {
+      PpuCaptureBackground_4bpp(ppu, y, sub, 0);
+      PpuCaptureBackground_4bpp(ppu, y, sub, 1);
+    }
+
+    bool mosaic_size = PPU_mosaicSize(ppu) > 1;
+    if (IS_SCREEN_ENABLED(ppu, sub, 0)) {
+      PpuPixelPrioBufs *layerbuf = PpuBeginBackgroundOverlay(ppu, y, sub, 0);
+      PpuDrawBackground_4bpp_policy(
+          ppu, layerbuf, y, sub, 0, 0xc000, 0x8000,
+          mosaic_size && PPU_mosaicEnabled(ppu, 0));
+      PpuFinishBackgroundOverlay(ppu, y, sub, 0, layerbuf);
+    }
+
+    if (IS_SCREEN_ENABLED(ppu, sub, 1)) {
+      PpuPixelPrioBufs *layerbuf = PpuBeginBackgroundOverlay(ppu, y, sub, 1);
+      // BG2's maximum priority in Mode 1 is 0xb1ff; if BG1+OBJ already cover
+      // the active span at >= 0xc000 and no BG2 overlay capture is active,
+      // skip BG2 completely.
+      if (layerbuf != &ppu->bgBuffers[sub] ||
+          !PpuSpanFullyOccluded(ppu, &ppu->bgBuffers[sub], 0xc000)) {
+        PpuDrawBackground_4bpp_policy(
+            ppu, layerbuf, y, sub, 1, 0xb100, 0x7100,
+            mosaic_size && PPU_mosaicEnabled(ppu, 1));
+        PpuFinishBackgroundOverlay(ppu, y, sub, 1, layerbuf);
+      }
+    }
+
+    if (IS_SCREEN_ENABLED(ppu, sub, 2)) {
+      uint bg3prio = PPU_bg3priority(ppu) ? 0xf200 : 0x3200;
+      if (ppu->semiTransparentDialogBg && !sub && y < 198) {
+        size_t begin, end;
+        PpuActiveSpan(ppu, &begin, &end);
+        memcpy(ppu->underBg3 + begin, ppu->bgBuffers[0].data + begin,
+               (end - begin) * sizeof(PpuZbufType));
+      }
+      PpuPixelPrioBufs *layerbuf = PpuBeginBackgroundOverlay(ppu, y, sub, 2);
+      const bool hud_split_line =
+          (ppu->wsHudSplitHeight & 0x7f) && y < (ppu->wsHudSplitHeight & 0x7f);
+      if (bg3prio == 0xf200 || layerbuf != &ppu->bgBuffers[sub] ||
+          hud_split_line ||
+          !PpuSpanFullyOccluded(ppu, &ppu->bgBuffers[sub], 0x6000)) {
+        PpuDrawBackground_2bpp_policy(
+            ppu, layerbuf, y, sub, 2, bg3prio, 0x1200,
+            mosaic_size && PPU_mosaicEnabled(ppu, 2));
+        PpuFinishBackgroundOverlay(ppu, y, sub, 2, layerbuf);
+      }
+    }
+  } else if (mode == 2) {
+    if (ppu->lineHasSprites)
+      PpuDrawSprites(ppu, y, sub, true);
+    PpuDrawBackground_4bpp_opt(ppu, y, sub, 0, kMode23Bg1Hi, kMode23Bg1Lo);
+    PpuDrawBackground_4bpp_opt(ppu, y, sub, 1, kMode23Bg2Hi, kMode23Bg2Lo);
+  } else if (mode == 3) {
+    if (ppu->lineHasSprites) { PPU_T0; PpuDrawSprites(ppu, y, sub, true); PPU_ACC(g_ppu_sec_spr_ms); }
+    PpuDrawBackground_8bpp(ppu, y, sub, 0, kMode23Bg1Hi, kMode23Bg1Lo);
+    if (IS_SCREEN_ENABLED(ppu, sub, 1) &&
+        !PpuSpanFullyOccluded(ppu, &ppu->bgBuffers[sub], 0xa000)) {
+      if (PPU_bigTiles(ppu, 1))
+        PpuDrawBackgroundBig(ppu, &ppu->bgBuffers[sub], y, sub, 1, 4,
+                             kMode23Bg2Hi, kMode23Bg2Lo, false);
+      else
+        PpuDrawBackground_4bpp(ppu, &ppu->bgBuffers[sub], y, sub, 1,
+                               kMode23Bg2Hi, kMode23Bg2Lo);
+    }
+  } else {
+    // mode 7
+    if (IS_SCREEN_ENABLED(ppu, sub, 0)) {
+      PpuPixelPrioBufs *layerbuf = PpuBeginBackgroundOverlay(ppu, y, sub, 0);
+      PpuDrawBackground_mode7(ppu, layerbuf, y, sub, 0x5000);
+      PpuFinishBackgroundOverlay(ppu, y, sub, 0, layerbuf);
+    }
+    if (ppu->lineHasSprites)
+      PpuDrawSprites(ppu, y, sub, false);
+  }
+}
+
+#if defined(__AVX2__)
+static inline __m256i PpuAvx2ApplyBrightness(__m256i rgb5, __m256i lo_lut, __m256i hi_lut) {
+  __m256i lo = _mm256_shuffle_epi8(lo_lut, rgb5);
+  __m256i hi = _mm256_shuffle_epi8(hi_lut, rgb5);
+  __m256i sel = _mm256_slli_epi16(rgb5, 3);  // move bit 4 (0x10) into bit 7 (0x80)
+  return _mm256_blendv_epi8(lo, hi, sel);
+}
+
+static inline __m256i PpuAvx2GatherRgb5(__m128i px16, const uint16 *cgram, uint32 clip_mask) {
+  if (!clip_mask) return _mm256_setzero_si256();
+  __m256i idx = _mm256_and_si256(_mm256_cvtepu16_epi32(px16), _mm256_set1_epi32(0xff));
+  __m256i col = _mm256_i32gather_epi32((const int *)cgram, idx, 2);
+  __m256i r = _mm256_slli_epi32(_mm256_and_si256(col, _mm256_set1_epi32(0x1f)), 16);
+  __m256i g = _mm256_slli_epi32(_mm256_and_si256(_mm256_srli_epi32(col, 5), _mm256_set1_epi32(0x1f)), 8);
+  __m256i b = _mm256_and_si256(_mm256_srli_epi32(col, 10), _mm256_set1_epi32(0x1f));
+  return _mm256_or_si256(_mm256_or_si256(r, g), b);
+}
+#endif
+
+static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
+  PpuClearOverlayRenderLine(ppu, y);
+  if (PPU_forcedBlank(ppu)) {
+    uint8 *dst = &ppu->renderBuffer[(y - 1) * ppu->renderPitch];
+    // The whole row, so the origin does not matter: the frame is
+    // 256 + 2*extraLeftRight wide however view anchoring places native x=0.
+    size_t n = sizeof(uint32) * (256 + ppu->extraLeftRight * 2);
+    memset(dst, 0, n);
+    return;
+  }
+
+  // Default background is backdrop
+  ClearBackdrop(ppu, &ppu->bgBuffers[0]);
+
+  // Render main screen
+  PpuDrawBackgrounds(ppu, y, false);
+  if (ppu->widescreenLineEnhancer &&
+      (ppu->extraLeftCur || ppu->extraRightCur))
+    ppu->widescreenLineEnhancer(ppu, y, false,
+                                ppu->widescreenLineEnhancerContext);
+
+  if (y >= 1 && y <= 239) {
+    int frame_w_z = 256 + (int)ppu->extraLeftRight * 2;
+    if (frame_w_z > kPpuMaxFrameWidth) frame_w_z = kPpuMaxFrameWidth;
+    int start_idx_z = kPpuLineBorder - (int)ppu->extraFrameLeft;
+    const PpuZbufType *bg0_z = ppu->bgBuffers[0].data + start_idx_z;
+    uint8_t *zrow = ppu->wsMainPrioHi[y - 1];
+    for (int x = 0; x < frame_w_z; x++) {
+      zrow[x] = (uint8_t)(bg0_z[x] >> 12);
+    }
+  }
+
+  // A game may clamp the world at a room boundary while still asking the
+  // split BG3 HUD to occupy the physical framebuffer edges. Composite the
+  // full centering budget on those scanlines; outside the live world span,
+  // only actual BG3 HUD pixels survive and everything else stays black.
+  uint8 hud_height = ppu->wsHudSplitHeight & 0x7f;
+  bool hud_full_width = (ppu->wsHudSplitHeight & 0x80) &&
+                        ppu->extraLeftRight &&
+                        ((hud_height && y < hud_height) ||
+                         PpuWidescreenLayerElasticBandAt(ppu, 2, (int)y) >= 0);
+  bool oam_hud_full_width = (ppu->wsHudSplitHeight & 0x80) &&
+                            ppu->wsHudOamHeight &&
+                            (y >= 224 || y < ppu->wsHudOamHeight) &&
+                            (ppu->wsHudOamSlots || ppu->wsHudOamSlots2) &&
+                            ppu->extraLeftRight;
+  const int anchor_full_layer = PpuFullBudgetAnchorLayerAt(ppu, y);
+  const bool anchor_full_width = anchor_full_layer >= 0;
+  bool any_hud_full_width =
+      hud_full_width || oam_hud_full_width || anchor_full_width;
+
+  // Color window affects the drawing mode in each region. Compute it before
+  // the subscreen pass so we can skip the subscreen entirely if color math is
+  // prevented across all color-window spans or no main-screen pixel needs it.
+  PpuWindows cwin;
+  PpuWindows_Calc(&cwin, ppu, 5, y);
+  bool compose_full_budget = false;
+  if (any_hud_full_width) {
+    PpuWindows_CalcWithExtra(&cwin, ppu, 5, y,
+                             ppu->extraFrameLeft, ppu->extraFrameRight);
+    compose_full_budget = true;
+  } else if (hud_height && y < hud_height && ppu->extraLeftRight &&
+             cwin.nr == 1 && cwin.bits == 0) {
+    cwin.edges[0] = -(int16_t)ppu->extraFrameLeft;
+    cwin.edges[1] = (int16_t)(256 + ppu->extraFrameRight);
+    compose_full_budget = true;
+  } else if (PpuWidescreenLineRepeatBandActive(ppu, y) &&
+             ppu->extraLeftRight && cwin.nr == 1 && cwin.bits == 0) {
+    cwin.edges[0] = -(int16_t)ppu->extraFrameLeft;
+    cwin.edges[1] = (int16_t)(256 + ppu->extraFrameRight);
+    compose_full_budget = true;
+  }
+  static const uint8 kCwBitsMod[8] = {
+    0x00, 0xff, 0xff, 0x00,
+    0xff, 0x00, 0xff, 0x00,
+  };
+  const uint32 clip_mode = PPU_clipMode(ppu);
+  const uint32 prevent_math_mode = PPU_preventMathMode(ppu);
+  uint32 cw_clip_math = ((cwin.bits & kCwBitsMod[clip_mode]) ^ kCwBitsMod[clip_mode + 4]) |
+    ((cwin.bits & kCwBitsMod[prevent_math_mode]) ^ kCwBitsMod[prevent_math_mode + 4]) << 8;
+
+  const uint32 math_enabled_mask = PPU_mathEnabled(ppu);
+  const bool add_subscreen = PPU_addSubscreen(ppu) != 0;
+  const bool subtract_color = PPU_subtractColor(ppu) != 0;
+  const bool half_color = PPU_halfColor(ppu) != 0;
+
+  // Render also the subscreen? Skip if no subscreen layers are enabled, or
+  // color math is prevented across all window regions, or no visible pixel on
+  // the main screen has color math enabled for its layer.
+  bool rendered_subscreen = false;
+  if (prevent_math_mode != 3 && add_subscreen && math_enabled_mask &&
+      ppu->screenEnabled[1] != 0 && (cw_clip_math & 0xff00) != 0) {
+    bool any_main_math = ppu->widescreenLineEnhancer != NULL;
+    if (!any_main_math) {
+      size_t begin, end;
+      PpuActiveSpan(ppu, &begin, &end);
+      const PpuZbufType *bg0 = ppu->bgBuffers[0].data;
+      for (size_t i = begin; i < end; i++) {
+        if (math_enabled_mask & (1u << ((bg0[i] >> 8) & 0xf))) {
+          any_main_math = true;
+          break;
+        }
+      }
+    }
+    if (any_main_math) {
+      ClearBackdrop(ppu, &ppu->bgBuffers[1]);
+      PpuDrawBackgrounds(ppu, y, true);
+      if (ppu->widescreenLineEnhancer &&
+          (ppu->extraLeftCur || ppu->extraRightCur))
+        ppu->widescreenLineEnhancer(ppu, y, true,
+                                    ppu->widescreenLineEnhancerContext);
+      rendered_subscreen = true;
+    }
+  }
+
+  uint32 *dst = (uint32*)&ppu->renderBuffer[(y - 1) * ppu->renderPitch];
+
+  // Frame column of native x is x + extraFrameLeft, and this row starts at the
+  // leftmost column the composition windows will actually visit.
+  dst += compose_full_budget ? 0 : (ppu->extraFrameLeft - ppu->extraLeftCur);
+
+  const uint32 hud_world_left = kPpuLineBorder - ppu->extraLeftCur;
+  const uint32 hud_world_right = kPpuLineBorder + 256 + ppu->extraRightCur;
+
+  // Hoist scanline-invariant pointers and flags out of the inner pixel loops
+  const PpuZbufType * const bg0_data = ppu->bgBuffers[0].data;
+  const PpuZbufType * const bg1_data = ppu->bgBuffers[1].data;
+  const uint16 * const cgram = ppu->cgram;
+  uint8 * const bright_map = ppu->brightnessMult;
+  uint8 * const half_bright_map = ppu->brightnessMultHalf;
+  const bool has_extra_objs = ppu->extraObjectCount != 0;
+  const bool dialog_semi = ppu->semiTransparentDialogBg && y < 198;
+  const bool direct_color = PPU_directColor(ppu) &&
+      (PPU_mode(ppu) == 3 || PPU_mode(ppu) == 4 || PPU_mode(ppu) == 7);
+  const bool fast_cgram = !has_extra_objs && !direct_color;
+  const uint32 fixed_color = ppu->fixedColor;
+  const uint32 fixed_r = fixed_color & 0x1f;
+  const uint32 fixed_g = (fixed_color >> 5) & 0x1f;
+  const uint32 fixed_b = (fixed_color >> 10) & 0x1f;
+
+#if defined(__AVX2__)
+  const __m256i v_bright_lo = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)bright_map));
+  const __m256i v_bright_hi = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(bright_map + 16)));
+  const __m256i v_fixed_rgb5 = _mm256_set1_epi32((int)((fixed_r << 16) | (fixed_g << 8) | fixed_b));
+#endif
+
+  uint32 windex = 0;
+  do {
+    uint32 left = cwin.edges[windex] + kPpuLineBorder, right = cwin.edges[windex + 1] + kPpuLineBorder;
+    if (left >= right)
+      continue;
+    // If clip is set, then zero out the rgb values from the main screen.
+    uint32 clip_color_mask = (cw_clip_math & 1) ? 0x1f : 0;
+    uint32 math_enabled_cur = (cw_clip_math & 0x100) ? math_enabled_mask : 0;
+    if (math_enabled_cur == 0 || (fixed_color == 0 && !half_color && !rendered_subscreen)) {
+      // Math is disabled (or has no effect), so can avoid the per-pixel maths check
+      uint32 i = left;
+      if (!compose_full_budget && !dialog_semi && fast_cgram) {
+        if (clip_color_mask) {
+#if defined(__AVX2__)
+          while (i + 8 <= right) {
+            __m128i px0 = _mm_loadu_si128((const __m128i *)&bg0_data[i]);
+            __m256i rgb5 = PpuAvx2GatherRgb5(px0, cgram, 0x1f);
+            __m256i out = PpuAvx2ApplyBrightness(rgb5, v_bright_lo, v_bright_hi);
+            _mm256_storeu_si256((__m256i *)dst, out);
+            dst += 8;
+            i += 8;
+          }
+#endif
+          for (; i < right; i++, dst++) {
+            uint32 color = cgram[bg0_data[i] & 0xff];
+            dst[0] = (uint32)bright_map[color & 0x1f] << 16 |
+                     (uint32)bright_map[(color >> 5) & 0x1f] << 8 |
+                     bright_map[(color >> 10) & 0x1f];
+          }
+        } else {
+          memset(dst, 0, (right - left) * sizeof(uint32));
+          dst += (right - left);
+        }
+      } else {
+        for (; i < right; i++, dst++) {
+#if defined(__AVX2__)
+          if (!compose_full_budget && fast_cgram && i + 8 <= right) {
+            __m128i px0 = _mm_loadu_si128((const __m128i *)&bg0_data[i]);
+            __m128i dlg_chk = _mm_cmpeq_epi16(_mm_and_si128(px0, _mm_set1_epi16(0x0f1f)), _mm_set1_epi16(0x0203));
+            if (_mm_testz_si128(dlg_chk, dlg_chk)) {
+              __m256i rgb5 = PpuAvx2GatherRgb5(px0, cgram, clip_color_mask);
+              __m256i out = PpuAvx2ApplyBrightness(rgb5, v_bright_lo, v_bright_hi);
+              _mm256_storeu_si256((__m256i *)dst, out);
+              dst += 7;
+              i += 7;
+              continue;
+            }
+          }
+#endif
+          uint16 pixel = bg0_data[i];
+          bool outside_world = i < hud_world_left || i >= hud_world_right;
+          const uint8 main_layer = (pixel >> 8) & 0xf;
+          const bool keep_hud =
+              (hud_full_width && main_layer == 2) ||
+              (anchor_full_width && main_layer == anchor_full_layer) ||
+              (oam_hud_full_width &&
+               (main_layer == 4 || main_layer == 6));
+          if (outside_world && !keep_hud) {
+            dst[0] = 0;
+          } else if (dialog_semi && main_layer == 2 && ((pixel & 0x1c) == 0) && (pixel & 3) == 3) {
+            uint32 color = fast_cgram ? cgram[pixel & 0xff] : PpuPixelColor(ppu, pixel, i);
+            uint32 r_fg = bright_map[color & clip_color_mask];
+            uint32 g_fg = bright_map[(color >> 5) & clip_color_mask];
+            uint32 b_fg = bright_map[(color >> 10) & clip_color_mask];
+
+            uint16 under_px = ppu->underBg3[i];
+            uint32 under_col = fast_cgram ? cgram[under_px & 0xff] : PpuPixelColor(ppu, under_px, i);
+            uint32 r_bg = bright_map[under_col & clip_color_mask];
+            uint32 g_bg = bright_map[(under_col >> 5) & clip_color_mask];
+            uint32 b_bg = bright_map[(under_col >> 10) & clip_color_mask];
+
+            /* Rich semi-transparent royal blue dialog glass: 70% blue glass + 30% scenery */
+            uint32 r_dialog = (r_fg > 20) ? 20 : r_fg;
+            uint32 g_dialog = (g_fg > 45) ? 45 : g_fg;
+            uint32 b_dialog = (b_fg < 130) ? 130 : b_fg;
+
+            uint32 r = (r_dialog * 179 + r_bg * 77) >> 8;
+            uint32 g = (g_dialog * 179 + g_bg * 77) >> 8;
+            uint32 b = (b_dialog * 179 + b_bg * 77) >> 8;
+            dst[0] = (r << 16) | (g << 8) | b;
+          } else {
+            uint32 color = fast_cgram ? cgram[pixel & 0xff] : PpuPixelColor(ppu, pixel, i);
+            dst[0] = (uint32)bright_map[color & clip_color_mask] << 16 |
+              (uint32)bright_map[(color >> 5) & clip_color_mask] << 8 |
+              bright_map[(color >> 10) & clip_color_mask];
+          }
+        }
+      }
+    } else {
+      uint8 * const half_color_map = (half_color && clip_color_mask) ? half_bright_map : bright_map;
+      // Need to check for each pixel whether to use math or not based on the main screen layer.
+      uint32 i = left;
+      for (; i < right; i++, dst++) {
+#if defined(__AVX2__)
+        if (!compose_full_budget && fast_cgram && i + 8 <= right) {
+          __m128i px0 = _mm_loadu_si128((const __m128i *)&bg0_data[i]);
+          bool can_simd = true;
+          if (dialog_semi) {
+            __m128i dlg_chk = _mm_cmpeq_epi16(_mm_and_si128(px0, _mm_set1_epi16(0x0f1f)), _mm_set1_epi16(0x0203));
+            can_simd = _mm_testz_si128(dlg_chk, dlg_chk) != 0;
+          }
+          if (can_simd) {
+            __m256i px0_32 = _mm256_cvtepu16_epi32(px0);
+            __m256i rgb1 = PpuAvx2GatherRgb5(px0, cgram, clip_color_mask);
+            __m256i layer = _mm256_and_si256(_mm256_srli_epi32(px0_32, 8), _mm256_set1_epi32(0xf));
+            __m256i bit = _mm256_sllv_epi32(_mm256_set1_epi32(1), layer);
+            __m256i do_math = _mm256_cmpgt_epi32(_mm256_and_si256(bit, _mm256_set1_epi32((int)math_enabled_cur)), _mm256_setzero_si256());
+
+            __m256i rgb2;
+            __m256i has_sub_px;
+            if (add_subscreen) {
+              if (rendered_subscreen) {
+                __m128i px1 = _mm_loadu_si128((const __m128i *)&bg1_data[i]);
+                __m256i px1_idx = _mm256_and_si256(_mm256_cvtepu16_epi32(px1), _mm256_set1_epi32(0xff));
+                has_sub_px = _mm256_cmpgt_epi32(px1_idx, _mm256_setzero_si256());
+                __m256i sub_rgb5 = PpuAvx2GatherRgb5(px1, cgram, 0x1f);
+                rgb2 = _mm256_blendv_epi8(v_fixed_rgb5, sub_rgb5, has_sub_px);
+              } else {
+                has_sub_px = _mm256_setzero_si256();
+                rgb2 = v_fixed_rgb5;
+              }
+            } else {
+              has_sub_px = _mm256_set1_epi32(-1);
+              rgb2 = v_fixed_rgb5;
+            }
+            rgb2 = _mm256_and_si256(rgb2, do_math);
+
+            __m256i use_half = (half_color && clip_color_mask)
+                                   ? _mm256_and_si256(do_math, has_sub_px)
+                                   : _mm256_setzero_si256();
+
+            __m256i res_rgb5;
+            if (subtract_color) {
+              __m256i diff = _mm256_subs_epu8(rgb1, rgb2);
+              __m256i half_diff = _mm256_avg_epu8(_mm256_subs_epu8(diff, _mm256_set1_epi8(1)), _mm256_setzero_si256());
+              res_rgb5 = _mm256_blendv_epi8(diff, half_diff, use_half);
+            } else {
+              const __m256i bias224 = _mm256_set1_epi8((char)224);
+              __m256i sum_clamped = _mm256_subs_epu8(_mm256_adds_epu8(rgb1, _mm256_adds_epu8(rgb2, bias224)), bias224);
+              __m256i avg_ceil = _mm256_avg_epu8(rgb1, rgb2);
+              __m256i lsb_Fix = _mm256_and_si256(_mm256_xor_si256(rgb1, rgb2), _mm256_set1_epi8(1));
+              __m256i half_sum = _mm256_subs_epu8(avg_ceil, lsb_Fix);
+              res_rgb5 = _mm256_blendv_epi8(sum_clamped, half_sum, use_half);
+            }
+
+            __m256i out = PpuAvx2ApplyBrightness(res_rgb5, v_bright_lo, v_bright_hi);
+            _mm256_storeu_si256((__m256i *)dst, out);
+            dst += 7;
+            i += 7;
+            continue;
+          }
+        }
+#endif
+        uint16 pixel = bg0_data[i];
+        uint8 main_layer = (pixel >> 8) & 0xf;
+        bool outside_world = i < hud_world_left || i >= hud_world_right;
+        const bool keep_hud =
+            (hud_full_width && main_layer == 2) ||
+            (anchor_full_width && main_layer == anchor_full_layer) ||
+            (oam_hud_full_width &&
+             (main_layer == 4 || main_layer == 6));
+        if (outside_world && !keep_hud) {
+          dst[0] = 0;
+        } else if (dialog_semi && main_layer == 2 && ((pixel & 0x1c) == 0) && (pixel & 3) == 3) {
+          uint32 color = fast_cgram ? cgram[pixel & 0xff] : PpuPixelColor(ppu, pixel, i);
+          uint32 r_fg = bright_map[color & clip_color_mask];
+          uint32 g_fg = bright_map[(color >> 5) & clip_color_mask];
+          uint32 b_fg = bright_map[(color >> 10) & clip_color_mask];
+
+          uint16 under_px = ppu->underBg3[i];
+          uint32 under_col = fast_cgram ? cgram[under_px & 0xff] : PpuPixelColor(ppu, under_px, i);
+          uint32 r_bg = bright_map[under_col & clip_color_mask];
+          uint32 g_bg = bright_map[(under_col >> 5) & clip_color_mask];
+          uint32 b_bg = bright_map[(under_col >> 10) & clip_color_mask];
+
+          /* Rich semi-transparent royal blue dialog glass: 70% blue glass + 30% scenery */
+          uint32 r_dialog = (r_fg > 20) ? 20 : r_fg;
+          uint32 g_dialog = (g_fg > 45) ? 45 : g_fg;
+          uint32 b_dialog = (b_fg < 130) ? 130 : b_fg;
+
+          uint32 r = (r_dialog * 179 + r_bg * 77) >> 8;
+          uint32 g = (g_dialog * 179 + g_bg * 77) >> 8;
+          uint32 b = (b_dialog * 179 + b_bg * 77) >> 8;
+          dst[0] = (r << 16) | (g << 8) | b;
+        } else {
+          uint32 color = fast_cgram ? cgram[pixel & 0xff] : PpuPixelColor(ppu, pixel, i);
+          uint32 r = color & clip_color_mask;
+          uint32 g = (color >> 5) & clip_color_mask;
+          uint32 b = (color >> 10) & clip_color_mask;
+          uint8 *color_map = bright_map;
+          if (math_enabled_cur & (1u << main_layer)) {
+            uint32 r2, g2, b2;
+            if (add_subscreen) {
+              uint16 sub_px = rendered_subscreen ? bg1_data[i] : 0;
+              if ((sub_px & 0xff) != 0) {
+                uint32 color2 = fast_cgram ? cgram[sub_px & 0xff] : PpuPixelColor(ppu, sub_px, i);
+                r2 = color2 & 0x1f;
+                g2 = (color2 >> 5) & 0x1f;
+                b2 = (color2 >> 10) & 0x1f;
+                color_map = half_color_map;
+              } else {  // Don't halve if PPU_addSubscreen(ppu) && backdrop
+                r2 = fixed_r;
+                g2 = fixed_g;
+                b2 = fixed_b;
+              }
+            } else {
+              r2 = fixed_r;
+              g2 = fixed_g;
+              b2 = fixed_b;
+              color_map = half_color_map;
+            }
+            if (subtract_color) {
+              r = (r >= r2) ? r - r2 : 0;
+              g = (g >= g2) ? g - g2 : 0;
+              b = (b >= b2) ? b - b2 : 0;
+            } else {
+              r += r2;
+              g += g2;
+              b += b2;
+            }
+          }
+          dst[0] = color_map[b] | (uint32)color_map[g] << 8 | (uint32)color_map[r] << 16;
+        }
+      }
+    }
+  } while (cw_clip_math >>= 1, ++windex < cwin.nr);
+
+  PpuWriteOverlayRenderLine(ppu, kPpuOverlaySource_Obj, y);
+}
+
+struct SnesHdCapture {
+  Ppu *owner;
+  SnesHdFrame *pending, *published;
+  unsigned height, width, last_line, supersample;
+  bool failed;
+};
+SnesHdCapture *SnesHdCaptureCreate(void) { return calloc(1, sizeof(SnesHdCapture)); }
+bool SnesHdCaptureSetSampling(SnesHdCapture *c, unsigned samples) {
+  if (!c || samples < 1 || samples > 4) return false;
+  c->supersample = samples; return true;
+}
+void SnesHdCaptureReset(SnesHdCapture *c) {
+  if (!c) return;
+  SnesHdFrameDestroy(c->pending); SnesHdFrameDestroy(c->published);
+  c->pending = c->published = NULL; c->last_line = 0; c->failed = false;
+}
+static void SnesHdCaptureDetach(SnesHdCapture *c, Ppu *p) {
+  if (c && c->owner == p) { SnesHdCaptureReset(c); c->owner = NULL; }
+}
+bool SnesHdCaptureBind(SnesHdCapture *c, Ppu *p, unsigned height) {
+  if (!c) return false;
+  if (!p) {
+    if (c->owner) c->owner->hdCapture = NULL;
+    c->owner = NULL; c->height = 0; SnesHdCaptureReset(c); return true;
+  }
+  if (!height || height > 240 || (p->hdCapture && p->hdCapture != c)) return false;
+  if (c->owner != p || c->height != height) {
+    if (c->owner) c->owner->hdCapture = NULL;
+    SnesHdCaptureReset(c); c->owner = p; c->height = height;
+  }
+  p->hdCapture = c; return true;
+}
+void SnesHdCaptureDestroy(SnesHdCapture *c) {
+  if (!c) return;
+  if (c->owner) c->owner->hdCapture = NULL;
+  SnesHdCaptureReset(c); free(c);
+}
+const SnesHdFrame *SnesHdCaptureFrame(const SnesHdCapture *c) { return c ? c->published : NULL; }
+static void SnesHdCaptureLine(SnesHdCapture *c, Ppu *p, unsigned line) {
+  if (!c || c->owner != p || !line || line > c->height) return;
+  unsigned width = 256u + p->extraLeftRight * 2u;
+  if (line == 1 || line <= c->last_line || width != c->width) {
+    SnesHdFrameDestroy(c->pending); c->pending = NULL;
+    c->failed = false; c->width = width;
+  }
+  c->last_line = line;
+  if (!p->renderBuffer || width > kSnesHdMaxWidth || p->renderPitch < width * 4) c->failed = true;
+  if (!c->failed && !c->pending && (p->bgmode & 7) == 7 && p->renderBuffer) {
+    c->pending = SnesHdFrameCreate(width, c->height);
+    if (c->pending) SnesHdFrameSetSampling(c->pending, c->supersample ? c->supersample : 1);
+    if (!c->pending) c->failed = true;
+    for (unsigned y = 0; c->pending && y + 1 < line; ++y) {
+      SnesHdLine job = {0}; job.kind = kSnesHdNative;
+      memcpy(job.native, p->renderBuffer + (size_t)y * p->renderPitch, width * 4);
+      if (!SnesHdFrameSetLine(c->pending, y, &job)) c->failed = true;
+    }
+  }
+  if (c->pending && !c->failed && !SnesHdFrameCaptureLine(c->pending, line - 1, p, line, 0, false)) c->failed = true;
+  if (line == c->height) {
+    SnesHdFrameDestroy(c->published); c->published = NULL;
+    if (c->pending && !c->failed && c->pending->source_count && SnesHdFrameSeal(c->pending)) {
+      c->published = c->pending; c->pending = NULL;
+    }
+    SnesHdFrameDestroy(c->pending); c->pending = NULL;
+  }
+}
+
+bool PpuSetHdFrameCapture(Ppu *p, SnesHdFrame *f) {
+  if (!p || (f && (f->sealed || f->failed))) return false;
+  p->hdFrame = f; return true;
+}
+static void PpuHdMarkWindow(uint8_t visibility[kPpuBufWidth],
+                            const PpuWindows *window, uint8_t bit,
+                            bool mark_inside) {
+  for (unsigned span = 0; span < window->nr; ++span) {
+    bool inside = (window->bits & (1u << span)) != 0;
+    if (inside != mark_inside) continue;
+    for (int x = window->edges[span]; x < window->edges[span + 1]; ++x)
+      visibility[x + kPpuLineBorder] |= bit;
+  }
+}
+
+bool SnesHdFrameCaptureLine(SnesHdFrame *f, unsigned y, const Ppu *p,
+                            unsigned line, unsigned crop, bool overlays) {
+  unsigned native_width = p ? 256u + 2u * p->extraLeftRight : 0;
+  if (!f || f->sealed || f->failed || !p || y >= f->height || !line ||
+      line > 240 || !p->renderBuffer || crop > native_width ||
+      f->width > native_width - crop || p->renderPitch < native_width * 4)
+    return false;
+  SnesHdLine *j = &f->lines[y]; memset(j, 0, sizeof(*j));
+  memcpy(j->native, p->renderBuffer + (line - 1) * p->renderPitch + crop * 4,
+           f->width * 4);
+  j->kind = 1;
+  bool affine = PPU_mode(p) == 7 && !PPU_forcedBlank(p) &&
+      !PPU_interlace(p) &&
+      !PPU_pseudoHires(p) &&
+      !(PPU_mosaicEnabled(p, 0) && PPU_mosaicSize(p) > 1) &&
+      !(PPU_m7extBg(p) && PPU_mosaicEnabled(p, 1) && PPU_mosaicSize(p) > 1) &&
+      !p->widescreenLineEnhancer && !(p->wsHudSplitHeight & 0x80);
+  for (unsigned source = 0; affine && source < kPpuOverlaySource_Count; ++source)
+    if (PpuOverlayActiveOnLine(p, (PpuOverlaySource)source, (int)line - 1) &&
+        !(overlays && (source == kPpuOverlaySource_Bg2 ||
+                       source == kPpuOverlaySource_Obj))) affine = false;
+  if (!affine) return true;
+  uint8_t visibility[kPpuBufWidth] = {0}; PpuWindows window;
+  for (unsigned sub = 0; sub < 2; ++sub) {
+    for (unsigned object = 0; object < 2; ++object) {
+      unsigned layer = object ? 4 : 0;
+      if (!IS_SCREEN_ENABLED(p, sub, layer)) continue;
+      if (IS_SCREEN_WINDOWED(p, sub, layer))
+        PpuWindows_Calc(&window, (Ppu *)p, layer, (int)line);
+      else PpuWindows_Clear(&window, (Ppu *)p, layer, (int)line);
+      PpuHdMarkWindow(visibility, &window,
+                       (uint8_t)(1u << (sub + 2 * object)), false);
+    }
+  }
+  PpuWindows_Calc(&window, (Ppu *)p, 5, (int)line);
+  PpuHdMarkWindow(visibility, &window, 16, true);
+  if (PPU_m7extBg(p)) for (unsigned sub = 0; sub < 2; ++sub) {
+    if (!IS_SCREEN_ENABLED(p, sub, 1)) continue;
+    if (IS_SCREEN_WINDOWED(p, sub, 1)) PpuWindows_Calc(&window, (Ppu *)p, 1, (int)line);
+    else PpuWindows_Clear(&window, (Ppu *)p, 1, (int)line);
+    PpuHdMarkWindow(visibility, &window, (uint8_t)(32u << sub), false);
+  }
+  const uint16_t *vram = PpuRenderVram(p); int source;
+  if (!p->renderVram && f->source_count && f->last_vram == vram &&
+      f->last_generation == p->vramWriteCount) source = (int)f->last_source;
+  else source = SnesHdFrameAddPicture(f, vram);
+  if (source < 0) return false;
+  f->last_vram = vram; f->last_generation = p->vramWriteCount;
+  f->last_source = (unsigned)source;
+  SnesMode7HdTransform t = SnesMode7HdMakeTransform(p->m7matrix, p->m7sel, line);
+  j->origin_x = (int32_t)(t.origin_x * 256); j->origin_y = (int32_t)(t.origin_y * 256);
+  j->step_x = (int32_t)(t.step_x * 256); j->step_y = (int32_t)(t.step_y * 256);
+  j->row_x = (int32_t)(t.row_x * 256); j->row_y = (int32_t)(t.row_y * 256);
+  j->screen_left = (int16_t)((int)crop - p->extraFrameLeft);
+  j->active_left = -(int16_t)p->extraLeftCur;
+  j->active_right = 256 + p->extraRightCur;
+  j->control = t.control; j->source = (uint16_t)source;
+  j->fixed_color = p->fixedColor; j->brightness = PPU_brightness(p);
+  j->cgwsel = p->cgwsel; j->cgadsub = p->cgadsub;
+  memcpy(j->palette, p->cgram, sizeof(j->palette));
+  for (unsigned x = 0; x < f->width; ++x) {
+    unsigned i = x + crop + kPpuLineBorder - p->extraFrameLeft;
+    j->visibility[x] = visibility[i];
+    j->object[x] = p->lineHasSprites ? p->objBuffer.data[i] : 0x0500;
+    j->object_color[x] = PpuPixelColor(p, j->object[x], i);
+  }
+  for (unsigned c = 0; c < 8; ++c)
+    j->matrix[c] = c < 4 ? p->m7matrix[c] : SnesMode7HdSign13(p->m7matrix[c]);
+  j->raster_line = (uint16_t)line;
+  j->composition = (PPU_directColor(p) ? 1 : 0) | (PPU_m7extBg(p) ? 2 : 0);
+  j->kind = kSnesHdReconstructed;
+  return true;
+}
+static bool PpuWidescreenHudOamSlot(Ppu *ppu, uint8_t index, uint8_t y) {
+  uint8_t slot = index >> 1;
+  bool hud_y = ppu->wsHudOamHeight &&
+      (y >= 224 || y < ppu->wsHudOamHeight);
+  if (!hud_y)
+    return false;
+  if (ppu->wsHudOamSlots &&
+      slot >= ppu->wsHudOamFirstSlot &&
+      slot < ppu->wsHudOamFirstSlot + ppu->wsHudOamSlots)
+    return true;
+  return ppu->wsHudOamSlots2 &&
+      slot >= ppu->wsHudOamFirstSlot2 &&
+      slot < ppu->wsHudOamFirstSlot2 + ppu->wsHudOamSlots2;
+}
+
+static int PpuAdjustWidescreenHudOamX(Ppu *ppu, uint8_t index, uint8_t y,
+                                      int x) {
+  // Full-budget HUD sprites ride the PHYSICAL frame edges, so they follow the
+  // sliding origin; the rest ride the live world margin, which at a fully
+  // anchored edge IS the frame edge anyway.
+  const bool full_budget = (ppu->wsHudSplitHeight & 0x80) != 0;
+  const int left_extra =
+      full_budget ? ppu->extraFrameLeft : ppu->extraLeftCur;
+  const int right_extra =
+      full_budget ? ppu->extraFrameRight : ppu->extraRightCur;
+  if (PpuWidescreenHudOamSlot(ppu, index, y)) {
+    if (x >= 0 && x < ppu->wsHudLeftEnd)
+      x -= left_extra;
+    else if (x >= ppu->wsHudRightStart && x < 256)
+      x += right_extra;
+    else if (x >= 0 && x < 256)
+      x += (int)ppu->extraLeftRight - ppu->extraFrameLeft;
+  }
+  return x;
+}
+
+/* OAM X is 9 bits, so the reachable span is 512 columns: raw >= 256 +
+ * extraRightCur decodes negative, which puts the deepest reachable left column
+ * at -(256 - extraRightCur). A frame whose LIVE margins total more than 256
+ * therefore needs producer-retained full coordinates for its far-side span.
+ * Full coordinates are used only when explicitly enabled and still agree
+ * with the guest's current nine-bit position; otherwise decode normally. */
+void PpuWsSetOamFullX(Ppu *ppu, unsigned slot, int16_t x) {
+  if (!ppu || slot >= 128) return;
+  ppu->wsOamFullX[slot] = x;
+  ppu->wsOamFullXValid[slot >> 3] |= 1u << (slot & 7);
+}
+
+void PpuWsEnableOamFullX(Ppu *ppu, bool enabled) {
+  if (ppu) ppu->wsOamFullXOn = enabled ? 1 : 0;
+}
+
+static int PpuDecodeOamX(Ppu *ppu, uint8_t index) {
+  int x = ppu->oam[index] & 0xff;
+  x |= ((ppu->highOam[index >> 3] >> (index & 7)) & 1) << 8;
+  unsigned slot = index >> 1;
+  if (ppu->wsOamFullXOn &&
+      (ppu->wsOamFullXValid[slot >> 3] & (1u << (slot & 7))) &&
+      (ppu->wsOamFullX[slot] & 511) == x)
+    return ppu->wsOamFullX[slot];
+  if (x >= 256 + ppu->extraRightCur) {
+    x -= 512;
+  } else if (x >= 256 && ppu->wsOamRightHintStrict) {
+    int slot = index >> 1;
+    if (!(ppu->wsOamRightHint[slot >> 3] & (1u << (slot & 7))))
+      x -= 512;
+  }
+  return x;
+}
+
+static uint32_t PpuOamMotionSignature(Ppu *ppu, uint8_t index) {
+  uint8_t slot = index >> 1;
+  uint32_t high_pair =
+      (ppu->highOam[slot >> 2] >> ((slot & 3) * 2)) & 0x3u;
+  return ((uint32_t)(ppu->oam[index] >> 8)) |
+         ((uint32_t)ppu->oam[index + 1] << 8) |
+         ((high_pair & 0x2u) << 23);
+}
+
+static bool PpuWsOamHistorySeen(Ppu *ppu, uint8_t slot) {
+  return (ppu->wsOamMotionSeen[slot >> 3] & (1u << (slot & 7))) != 0;
+}
+
+static void PpuWsOamHistoryMarkSeen(Ppu *ppu, uint8_t slot) {
+  ppu->wsOamMotionSeen[slot >> 3] |= (uint8_t)(1u << (slot & 7));
+}
+
+/* Once per FRAME, and a repeated line is not a new frame. */
+static void PpuUpdateWidescreenOamHistory(Ppu *ppu, int line) {
+  const int last = ppu->wsOamMotionLastLine;
+  const bool new_frame = last < 0 || line < last || (line == 0 && last != 0);
+  ppu->wsOamMotionLastLine = (int16_t)line;
+  if (!new_frame)
+    return;
+  for (uint8_t slot = 0; slot < 128; slot++) {
+    uint8_t index = (uint8_t)(slot * 2);
+    int16_t x = (int16_t)PpuDecodeOamX(ppu, index);
+    uint32_t sig = PpuOamMotionSignature(ppu, index);
+    if (PpuWsOamHistorySeen(ppu, slot) &&
+        sig == ppu->wsOamMotionSig[slot]) {
+      const int dx = x - ppu->wsOamMotionX[slot];
+      if (dx != 0 && dx > -32 && dx < 32) {
+        ppu->wsOamMotionGrace[slot] = kPpuWsOamMovingGraceFrames;
+      } else if (ppu->wsOamMotionGrace[slot]) {
+        ppu->wsOamMotionGrace[slot]--;
+      }
+    } else {
+      ppu->wsOamMotionGrace[slot] = 0;
+      PpuWsOamHistoryMarkSeen(ppu, slot);
+    }
+    ppu->wsOamMotionX[slot] = x;
+    ppu->wsOamMotionSig[slot] = sig;
+  }
+}
+
+static bool PpuWidescreenOamLeftHintAllows(Ppu *ppu, uint8_t index, int x,
+                                           int sprite_size,
+                                           int left_extra) {
+  if (!ppu->wsOamLeftHintStrict || x >= 0 || x + sprite_size > 0 ||
+      x + sprite_size <= -left_extra)
+    return true;
+  int slot = index >> 1;
+  if (ppu->wsOamLeftHint[slot >> 3] & (1u << (slot & 7)))
+    return true;
+  return ppu->wsOamMotionGraceOn && ppu->wsOamMotionGrace[slot] != 0;
+}
+
+void PpuSetExtraObjects(Ppu *ppu,const PpuExtraObject *objects,size_t count) {
+  ppu->extraObjects=objects;ppu->extraObjectCount=objects?count:0;
+}
+
+bool PpuComposeExtraObjects(const PpuExtraObject *objects,size_t count,
+    int y,int x0,size_t width,unsigned first_slot,
+    uint16_t *depth,uint16_t *colors,uint64_t *order) {
+  bool added=false;
+  for(size_t i=0;i<count;++i) {
+    const PpuExtraObject *o=&objects[i];
+    int64_t row=(int64_t)y-o->y, left=(int64_t)o->x-x0;
+    if(!o->pixels || !o->order || o->priority>3 || o->oamSlot>127 ||
+       o->stride<o->width || row<0 || row>=o->height) continue;
+    int64_t begin=left<0?0:left, end=left+o->width;
+    if(end>(int64_t)width)end=(int64_t)width;
+    uint64_t rank=((uint64_t)((o->oamSlot-first_slot)&127)<<32)|o->order;
+    uint16_t z=(uint16_t)(SPRITE_PRIO_TO_PRIO(o->priority,!o->math)<<8);
+    /* Preserve the legacy renderer's palette-based OBJ math classification. */
+    z|=o->math?0xc0:0x80;
+    for(int64_t x=begin;x<end;++x) {
+      uint16_t color=o->pixels[(size_t)row*o->stride+(size_t)(x-left)];
+      if(!(color&0x8000) || rank>=order[x])continue;
+      depth[x]=z;colors[x]=color;order[x]=rank;added=true;
+    }
+  }
+  return added;
+}
+
+static bool ppu_evaluateSprites(Ppu* ppu, int line) {
+  if(ppu->extraObjectCount) {
+    memset(ppu->objectColors,0,sizeof(ppu->objectColors));
+    memset(ppu->objectOrder,0xff,sizeof(ppu->objectOrder));
+  }
+  static const uint8 spriteSizes[8][2] = {
+    {8, 16}, {8, 32}, {8, 64}, {16, 32},
+    {16, 64}, {32, 64}, {16, 32}, {16, 32}
+  };
+
+  // Hoist scanline-invariant sprite state
+  const uint16 * const vram = PpuRenderVram(ppu);
+  const uint8 * const size_table = spriteSizes[PPU_objSize(ppu)];
+  const bool obj_interlace = PPU_objInterlace(ppu) != 0;
+  const bool no_sprite_limits = (ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits) != 0;
+  const bool full_budget_flag = (ppu->wsHudSplitHeight & 0x80) != 0;
+  const int obj_adr1 = PPU_objTileAdr1(ppu);
+  const int obj_adr2 = PPU_objTileAdr2(ppu);
+  const bool overlay_obj_active = PpuOverlayActiveOnLine(ppu, kPpuOverlaySource_Obj, line);
+  const PpuOverlayCapture * const obj_capture = &ppu->overlayCaptures[kPpuOverlaySource_Obj];
+
+  static int ws_edge_clip_on = -1;
+  if (ws_edge_clip_on < 0) {
+    const char *e = getenv("SNESRECOMP_WS_OBJ_EDGE_CLIP");
+    ws_edge_clip_on = (e && *e) ? (*e != '0') : 1;
+  }
+
+  uint8_t index = PPU_objPriority(ppu) ? (ppu->oamaddl & 0xfe) : 0;
+  unsigned first_slot=index>>1;
+  int spritesFound = 0;
+  int tilesFound = 0;
+  int nativeSpritesFound = 0;
+  int nativeTilesFound = 0;
+  const bool extra_view = ppu->extraLeftRight != 0;
+  int world_clip_left, world_clip_right;
+  const bool world_clip = PpuWorldClipBounds(
+      ppu, 4, line, &world_clip_left, &world_clip_right);
+  uint8_t foundSprites[128];
+
+  // Range evaluation walks OAM forward, but tile fetching walks the accepted
+  // sprites backward. This is observable when the 34-sliver limit is reached.
+  for(int i = 0; i < 128; i++) {
+    uint8_t y = ppu->oam[index] >> 8;
+    uint8_t row = line - y;
+    int spriteSize = size_table[(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
+    int spriteHeight = obj_interlace ? spriteSize >> 1 : spriteSize;
+    if(row < spriteHeight) {
+      int x = PpuDecodeOamX(ppu, index);
+      const bool native_sprite = x + spriteSize > 0 && x < 256;
+      const bool hud_slot = PpuWidescreenHudOamSlot(ppu, index, y);
+      const int left_extra =
+          (hud_slot && full_budget_flag) ? ppu->extraFrameLeft : ppu->extraLeftCur;
+      const int right_extra =
+          (hud_slot && full_budget_flag) ? ppu->extraFrameRight : ppu->extraRightCur;
+      if (PpuWidescreenOamLeftHintAllows(ppu, index, x, spriteSize,
+                                          left_extra)) {
+        x = PpuAdjustWidescreenHudOamX(ppu, index, y, x);
+        if(x + spriteSize > -left_extra) {
+          /* Margin residency must not evict an authentic native sprite or
+           * leak widened range-over flags into the guest. Count before HUD
+           * relocation so moving the HUD does not free its native quota. */
+          if(native_sprite && ++nativeSpritesFound > 32 && !no_sprite_limits) {
+            ppu->rangeOver = true;
+            if (!extra_view) break;
+          } else if (x < 256 + right_extra) {
+            // Only admit sprites that actually overlap the active widescreen
+            // viewport [-left_extra, 256 + right_extra).
+            foundSprites[spritesFound++] = index;
+          }
+        }
+      }
+    }
+    index += 2;
+  }
+
+  if (spritesFound == 0 && !ppu->extraObjectCount)
+    return false;
+
+  // Lazily clear objBuffer only when sprites or extra objects exist on this scanline
+  ClearBackdrop(ppu, &ppu->objBuffer);
+
+  for(int i = spritesFound; i > 0; i--) {
+    index = foundSprites[i - 1];
+    const int slot = index >> 1;
+    if (ppu->wsOamSuppressMask[(index >> 4) & 15] & (1u << (slot & 7)))
+      continue;
+    const uint8_t sprite_y = ppu->oam[index] >> 8;
+    uint8_t row = line - sprite_y;
+    int spriteSize = size_table[(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
+    int x = PpuDecodeOamX(ppu, index);
+    const int native_x = x;
+    const bool hud_slot = PpuWidescreenHudOamSlot(ppu, index, sprite_y);
+    const bool full_budget_hud = hud_slot && full_budget_flag;
+    const int left_extra =
+        full_budget_hud ? ppu->extraFrameLeft : ppu->extraLeftCur;
+    const int right_extra =
+        full_budget_hud ? ppu->extraFrameRight : ppu->extraRightCur;
+    x = PpuAdjustWidescreenHudOamX(ppu, index, sprite_y, x);
+    if(obj_interlace) row = row * 2 + (ppu->evenFrame ? 0 : 1);
+    int oam1 = ppu->oam[index + 1];
+    int objAdr = (oam1 & 0x100) ? obj_adr2 : obj_adr1;
+    if(oam1 & 0x8000) row = spriteSize - 1 - row;
+    int paletteBase = 0x80 + 16 * ((oam1 & 0xe00) >> 9);
+    int prio = SPRITE_PRIO_TO_PRIO((oam1 & 0x3000) >> 12, (oam1 & 0x800) == 0);
+    PpuZbufType z = paletteBase + (prio << 8);
+
+    const bool ws_clip_left =
+        ws_edge_clip_on && ppu->wsOamLeftHintStrict &&
+        !(ppu->wsOamLeftHint[slot >> 3] & (1u << (slot & 7))) &&
+        !(ppu->wsOamMotionGraceOn && ppu->wsOamMotionGrace[slot]);
+    const bool capture_slot = overlay_obj_active && obj_capture->oamCount &&
+        slot >= obj_capture->oamFirst &&
+        slot < obj_capture->oamFirst + obj_capture->oamCount;
+    const bool obj_remove = capture_slot &&
+        (obj_capture->flags & kPpuOverlayFlag_RemoveFromGame) != 0;
+
+    int spr_clip_left = ws_clip_left ? 0 : -left_extra;
+    int spr_clip_right = 256 + right_extra;
+    if (world_clip && !hud_slot) {
+      spr_clip_left = IntMax(spr_clip_left, world_clip_left);
+      spr_clip_right = IntMin(spr_clip_right, world_clip_right);
+    }
+
+    for(int col = 0; col < spriteSize; col += 8) {
+      if(col + x <= -8 - left_extra ||
+         col + x >= 256 + right_extra)
+        continue;
+      /* The original 34-sliver fetch budget covers the native view.
+       * Additional margin columns render in OAM order without taking
+       * that budget from native columns. Genuine native overflow still
+       * drops later native fetches, including within a large sprite. */
+      const bool native_tile = col + native_x > -8 && col + native_x < 256;
+      if(native_tile && ++nativeTilesFound > 34 && !no_sprite_limits) {
+        ppu->timeOver = true;
+        if (!extra_view) break;
+        continue;
+      }
+      tilesFound++;
+      if (col + x + 8 <= spr_clip_left || col + x >= spr_clip_right)
+        continue;
+      int usedCol = oam1 & 0x4000 ? spriteSize - 1 - col : col;
+      int usedTile = ((((oam1 & 0xff) >> 4) + (row >> 3)) << 4) |
+                     (((oam1 & 0xf) + (usedCol >> 3)) & 0xf);
+      const uint16 *addr = &vram[(objAdr + usedTile * 16 + (row & 0x7)) & 0x7fff];
+      uint32 plane = addr[0] | addr[8] << 16;
+      if (!plane)
+        continue;
+      int px_left = IntMax(spr_clip_left - (col + x), 0);
+      int px_right = IntMin(spr_clip_right - (col + x), 8);
+      if (px_left >= px_right)
+        continue;
+      PpuZbufType *dst = ppu->objBuffer.data + col + x + px_left + kPpuLineBorder;
+
+      for (int px = px_left; px < px_right; px++, dst++) {
+        int shift = oam1 & 0x4000 ? px : 7 - px;
+        uint32 bits = plane >> shift;
+        int pixel = (bits >> 0) & 1 | (bits >> 7) & 2 |
+                    (bits >> 14) & 4 | (bits >> 21) & 8;
+        if (pixel == 0) continue;
+        if (capture_slot) {
+          int screen_x = col + x + px;
+          if (screen_x >= obj_capture->x0 && screen_x < obj_capture->x1) {
+            PpuZbufType *overlay =
+                &ppu->overlayBuffers[kPpuOverlaySource_Obj]
+                     .data[dst - ppu->objBuffer.data];
+            *overlay = z + pixel;
+            if (obj_remove) continue;
+          }
+        }
+        // Lower OAM indices are processed later and overwrite higher ones.
+        dst[0] = z + pixel;
+        if(ppu->extraObjectCount)
+          ppu->objectOrder[dst-ppu->objBuffer.data]=(uint64_t)((slot-first_slot)&127)<<32;
+      }
+    }
+    if (!extra_view && nativeTilesFound > 34 && !no_sprite_limits)
+      break;
+  }
+  bool extra=ppu->extraObjectCount && PpuComposeExtraObjects(
+      ppu->extraObjects,ppu->extraObjectCount,line,-kPpuLineBorder,
+      kPpuBufWidth,first_slot,ppu->objBuffer.data,ppu->objectColors,ppu->objectOrder);
+  return tilesFound != 0 || extra;
+}
+
+static uint16_t ppu_getVramRemap(Ppu* ppu) {
+  uint16_t adr = ppu->vramPointer;
+  switch(ppu->vramRemapMode) {
+    case 0: return adr;
+    case 1: return (adr & 0xff00) | ((adr & 0xe0) >> 5) | ((adr & 0x1f) << 3);
+    case 2: return (adr & 0xfe00) | ((adr & 0x1c0) >> 6) | ((adr & 0x3f) << 3);
+    case 3: return (adr & 0xfc00) | ((adr & 0x380) >> 7) | ((adr & 0x7f) << 3);
+  }
+  return adr;
+}
+
+uint8_t ppu_read(Ppu* ppu, uint8_t adr) {
+  switch(adr) {
+  case 0x34:
+  case 0x35:
+  case 0x36: {
+    int result = ppu->m7matrix[0] * (ppu->m7matrix[1] >> 8);
+    return (result >> (8 * (adr - 0x34))) & 0xff;
+  }
+    case 0x37: {
+      /* SLHV latches the live beam. LLE advances Snes::hPos/vPos from the
+       * shared master-clock timeline; hard-coding a convenient scanline made
+       * games waiting for any other line loop forever. */
+      ppu->hCount = g_snes->hPos / 4;
+      ppu->vCount = g_snes->vPos;
+      ppu->hCountSecond = false;
+      ppu->vCountSecond = false;
+      ppu->countersLatched = true;
+      return 0;
+    }
+    case 0x38: {
+      uint8_t ret = 0;
+      if(ppu->oamInHigh) {
+        ret = ppu->highOam[((ppu->oamAdr & 0xf) << 1) | ppu->oamSecondWrite];
+        if(ppu->oamSecondWrite) {
+          ppu->oamAdr++;
+          if(ppu->oamAdr == 0) ppu->oamInHigh = false;
+        }
+      } else {
+        if(!ppu->oamSecondWrite) {
+          ret = ppu->oam[ppu->oamAdr] & 0xff;
+        } else {
+          ret = ppu->oam[ppu->oamAdr++] >> 8;
+          if(ppu->oamAdr == 0) ppu->oamInHigh = true;
+        }
+      }
+      ppu->oamSecondWrite = !ppu->oamSecondWrite;
+      return ret;
+    }
+    case 0x39: {
+      uint16_t val = ppu->vramReadBuffer;
+      if(!ppu->vramIncrementOnHigh) {
+        ppu->vramReadBuffer = ppu->vram[ppu_getVramRemap(ppu) & 0x7fff];
+        ppu->vramPointer += ppu->vramIncrement;
+      }
+      return val & 0xff;
+    }
+    case 0x3a: {
+      uint16_t val = ppu->vramReadBuffer;
+      if(ppu->vramIncrementOnHigh) {
+        ppu->vramReadBuffer = ppu->vram[ppu_getVramRemap(ppu) & 0x7fff];
+        ppu->vramPointer += ppu->vramIncrement;
+      }
+      return val >> 8;
+    }
+    case 0x3b: {
+      uint8_t ret = 0;
+      if(!ppu->cgramSecondWrite) {
+        ret = ppu->cgram[ppu->cgramPointer] & 0xff;
+      } else {
+        ret = ((ppu->cgram[ppu->cgramPointer++] >> 8) & 0x7f);
+      }
+      ppu->cgramSecondWrite = !ppu->cgramSecondWrite;
+      return ret;
+    }
+    case 0x3c: {
+      uint8_t val = 0;
+      if(ppu->hCountSecond) {
+        val = ((ppu->hCount >> 8) & 1);
+      } else {
+        val = ppu->hCount & 0xff;
+      }
+      ppu->hCountSecond = !ppu->hCountSecond;
+      return val;
+    }
+    case 0x3d: {
+      uint8_t val = 0;
+      if(ppu->vCountSecond) {
+        val = ((ppu->vCount >> 8) & 1);
+      } else {
+        val = ppu->vCount & 0xff;
+      }
+      ppu->vCountSecond = !ppu->vCountSecond;
+      return val;
+    }
+    case 0x3e: {
+      uint8_t val = 0x1; // ppu1 version (4 bit)
+      val |= ppu->rangeOver << 6;
+      val |= ppu->timeOver << 7;
+      return val;
+    }
+    case 0x3f: {
+      uint8_t val = 0x3; // ppu2 version (4 bit), bit 4: ntsc/pal
+      val |= ppu->countersLatched << 6;
+      val |= ppu->evenFrame << 7;
+      ppu->countersLatched = false; // TODO: only when ppulatch is set
+      ppu->hCountSecond = false;
+      ppu->vCountSecond = false;
+      return val;
+    }
+    default: {
+      assert(0);
+      return 0;
+    }
+  }
+}
+
+/* ── raster journal ────────────────────────────────────────────────────────
+ * Per-line replay of mid-field PPU writes, for frame-model hosts.
+ *
+ * Such a host runs the frame's CPU work first and renders all 224 lines
+ * afterwards, so the PPU register file at render time is the LAST-written
+ * state. A raster-split game turns these registers into per-line waveforms.
+ * Gundam Wing's IRQ chain (lines 21/23/71/72/215) writes INIDISP, BG1
+ * scroll, TM, TMW and CGADSUB per band; Doom's (lines 23/199) writes INIDISP
+ * and the window edges ($2126/$2127) that frame its 3D view. Rendering the
+ * whole frame with the final state drew both black.
+ *
+ * Same defect class the HDMA engine solved (dma_initHdma/dma_doHdma): record
+ * during CPU time, replay per line at render time.
+ *
+ * Fields, not host frames. The journal is cut by the BEAM: when it reaches
+ * V=225 the field it was recording is complete, its register state at that
+ * instant is the next field's baseline, and recording continues into a new
+ * journal (ppu_rasterFieldBoundary, called from the beam walk). A host frame
+ * may legitimately straddle that point -- Doom's bottom split DMAs the GSU
+ * frame from line 199 through vblank into the next field's top border, so its
+ * CPU half ends well past V=225 -- and when it was cut at the host's frame
+ * start instead, the writes made after the crossing were filed under the
+ * field that had just ended, at lines it had already drawn.
+ *
+ * Every display register is journaled: $2100-$2133 except the data ports and
+ * their address registers (VRAM $2115-$2119, CGRAM $2121/$2122, OAMDATA
+ * $2104), which are uploads rather than per-line display state, plus HDMAEN
+ * ($420C), which is handed back to the host because HDMA lives in the DMA
+ * unit. The set used to be the five registers one title's handlers wrote;
+ * the next title wrote a sixth and drew black.
+ *
+ * Writes the render walk makes itself (its HDMA, and this replay) are not
+ * journaled: they are the field being reconstructed, not new history. HDMA
+ * the beam performs during the CPU half (a host that leaves beam HDMA on) is
+ * history and is journaled.
+ *
+ * Host contract:
+ *   ppu_rasterBegin(ppu)            arm (idempotent; hosts call it per frame)
+ *   ppu_rasterRenderBegin(ppu)      before the render loop: restore the last
+ *                                   completed field's baseline
+ *   ppu_rasterApplyLine(ppu, line)  in the render loop, before ppu_runLine
+ *   ppu_rasterRenderEnd(ppu)        after it: reapply the writes made since
+ *                                   the field ended, so the guest resumes
+ *                                   with the register file it last wrote */
+int g_ppu_scanout_latch_bypass = 0;
+
+static PpuVramWriteLogHook s_vram_write_log_hook;
+
+void ppu_set_vram_write_log_hook(PpuVramWriteLogHook hook) {
+  s_vram_write_log_hook = hook;
+}
+
+#define PPU_RASTER_MAX 4096
+/* key: beam position within the field, monotonic from its start at V=225
+ * (0) through vblank (36 = V=261) and the visible lines (37 = V=0 ...). */
+typedef struct { uint16_t key; uint16_t reg; uint8_t val; } PpuRasterEntry;
+typedef struct {
+  uint8_t regs[PPU_SAVESTATE_REGS_SIZE];   /* inidisp..cgwsel at field start */
+  uint8_t scrollPrev, scrollPrev2, m7prev;
+  uint8_t hdmaen;
+  int count;
+  uint32_t dropped;
+  PpuRasterEntry e[PPU_RASTER_MAX];
+} PpuRasterField;
+static PpuRasterField s_field[2];
+static int s_raster_cur;             /* recording; the other is completed */
+static int s_raster_armed;
+static int s_raster_have_completed;
+static int s_raster_rendering;
+static const PpuRasterField *s_raster_render;
+static int s_raster_next;
+static uint8_t s_raster_hdmaen;
+static int s_raster_hdmaen_pending;
+static struct {
+  uint8_t oamAdr, oamInHigh, oamSecondWrite, oamBuffer;
+} s_raster_port;
+
+/* Only the machine's PPU journals: the debug server and a few tools run
+ * ppu_write on scratch copies. */
+static Ppu *raster_machine_ppu(void) {
+  return g_snes ? g_snes->ppu : NULL;
+}
+
+static uint16_t raster_key(uint16_t line) {
+  return (uint16_t)(line >= 225 ? line - 225 : line + (262 - 225));
+}
+
+static int raster_reg_journaled(uint16_t reg) {
+  if (reg == 0x420C)
+    return 1;
+  if (reg < 0x2100 || reg > 0x2133)
+    return 0;
+  switch (reg) {
+    case 0x2104:                                       /* OAMDATA */
+    case 0x2115: case 0x2116: case 0x2117:             /* VRAM port */
+    case 0x2118: case 0x2119:
+    case 0x2121: case 0x2122:                          /* CGRAM port */
+      return 0;
+    default:
+      return 1;
+  }
+}
+
+static void raster_snapshot(PpuRasterField *f, const Ppu *ppu) {
+  memcpy(f->regs, &ppu->inidisp, PPU_SAVESTATE_REGS_SIZE);
+  f->scrollPrev = ppu->scrollPrev;
+  f->scrollPrev2 = ppu->scrollPrev2;
+  f->m7prev = ppu->m7prev;
+  f->hdmaen = g_snesrecomp_last_hdmaen;
+  f->count = 0;
+  f->dropped = 0;
+}
+
+void ppu_rasterBegin(Ppu *ppu) {
+  if(s_guest_scope)return;
+  /* A host that renders has finished with the previous field's replay. */
+  s_raster_rendering = 0;
+  if (s_raster_armed)
+    return;
+  s_raster_armed = 1;
+  s_raster_cur = 0;
+  s_raster_have_completed = 0;
+  raster_snapshot(&s_field[0], ppu);
+}
+
+void ppu_rasterFieldBoundary(void) {
+  if(s_guest_scope)return;
+  Ppu *ppu = raster_machine_ppu();
+  if (!s_raster_armed || !ppu)
+    return;
+  s_raster_rendering = 0;
+  s_raster_cur ^= 1;
+  s_raster_have_completed = 1;
+  raster_snapshot(&s_field[s_raster_cur], ppu);
+}
+
+void ppu_rasterReset(void) {
+  if(s_guest_scope)return;
+  s_raster_armed = 0;
+  s_raster_have_completed = 0;
+  s_raster_rendering = 0;
+  s_raster_render = NULL;
+  s_raster_hdmaen_pending = 0;
+}
+
+void ppu_rasterRecord(uint16_t reg, uint16_t line, uint8_t val) {
+  if(s_guest_scope)return;
+  PpuRasterField *f;
+  if (!s_raster_armed || s_raster_rendering || !raster_reg_journaled(reg))
+    return;
+  if (g_ppu_wlog_src == kPpuWlogReplay)
+    return;
+  f = &s_field[s_raster_cur];
+  if (f->count >= PPU_RASTER_MAX) {
+    f->dropped++;
+    return;
+  }
+  f->e[f->count].key = raster_key(line);
+  f->e[f->count].reg = reg;
+  f->e[f->count].val = val;
+  f->count++;
+}
+
+int ppu_rasterTakeHdmaen(uint8_t *out) {
+  if (!s_raster_hdmaen_pending) return 0;
+  s_raster_hdmaen_pending = 0;
+  *out = s_raster_hdmaen;
+  return 1;
+}
+
+/* Restore the baseline of the last completed field. Called BEFORE the render
+ * loop -- i.e. before dma_initHdma and the first dma_doHdma -- never inside
+ * line 1: HDMA writes the same registers per line, and a restore after line
+ * 1's HDMA write would stomp it. */
+void ppu_rasterRenderBegin(Ppu *ppu) {
+  const PpuRasterField *f;
+  if (!s_raster_armed) return;
+  /* Before any field has completed (the first frame), the recording one is
+   * all there is. */
+  f = s_raster_have_completed ? &s_field[s_raster_cur ^ 1]
+                              : &s_field[s_raster_cur];
+  s_raster_port.oamAdr = ppu->oamAdr;
+  s_raster_port.oamInHigh = ppu->oamInHigh;
+  s_raster_port.oamSecondWrite = ppu->oamSecondWrite;
+  s_raster_port.oamBuffer = ppu->oamBuffer;
+  memcpy(&ppu->inidisp, f->regs, PPU_SAVESTATE_REGS_SIZE);
+  ppu->scrollPrev = f->scrollPrev;
+  ppu->scrollPrev2 = f->scrollPrev2;
+  ppu->m7prev = f->m7prev;
+  s_raster_render = f;
+  s_raster_next = 0;
+  s_raster_hdmaen_pending = 0;
+  s_raster_rendering = 1;
+}
+
+static void raster_replay(Ppu *ppu, uint16_t reg, uint8_t val) {
+  const uint8_t saved_src = g_ppu_wlog_src;
+  g_ppu_wlog_src = kPpuWlogReplay;
+  ppu_write(ppu, (uint8_t)(reg & 0xFF), val);
+  g_ppu_wlog_src = saved_src;
+}
+
+void ppu_rasterApplyLine(Ppu *ppu, int line) {
+  const PpuRasterField *f = s_raster_render;
+  uint16_t limit;
+  if (!s_raster_armed || !f || line < 0) return;
+  limit = raster_key((uint16_t)line);
+  /* Entries are in beam order within a field, so a moving cursor is enough.
+   * A write at line L lands mid-line on hardware; whole-line granularity
+   * applies it from the line the host names on. Replaying through ppu_write
+   * keeps the write-twice latch semantics: the latches were restored to the
+   * field's start, and handlers write the two bytes in pairs. */
+  while (s_raster_next < f->count && f->e[s_raster_next].key <= limit) {
+    const uint16_t reg = f->e[s_raster_next].reg;
+    const uint8_t val = f->e[s_raster_next].val;
+    if (reg == 0x420C) {
+      /* Not ours to apply — HDMA lives in the DMA unit and enabling a channel
+       * mid-frame also has to (re)start its table. Hand it to the host, which
+       * owns the render loop and calls dma_initHdma/dma_doHdma. */
+      s_raster_hdmaen = val;
+      s_raster_hdmaen_pending = 1;
+    } else {
+      raster_replay(ppu, reg, val);
+    }
+    s_raster_next++;
+  }
+}
+
+/* The render reconstructed the completed field. Writes the guest has made
+ * since that field ended -- a CPU half that ran past V=225 -- are still in
+ * the recording journal: put them back, so the guest resumes with the
+ * register file it last wrote. The OAM port is the guest's, not display
+ * state: an OAMADD replay must not move it. */
+void ppu_rasterRenderEnd(Ppu *ppu) {
+  const PpuRasterField *f;
+  int i;
+  if (!s_raster_armed || !s_raster_rendering) return;
+  s_raster_rendering = 0;
+  if (s_raster_have_completed) {
+    f = &s_field[s_raster_cur];
+    for (i = 0; i < f->count; i++)
+      if (f->e[i].reg != 0x420C)
+        raster_replay(ppu, f->e[i].reg, f->e[i].val);
+  }
+  ppu->oamAdr = s_raster_port.oamAdr;
+  ppu->oamInHigh = s_raster_port.oamInHigh;
+  ppu->oamSecondWrite = s_raster_port.oamSecondWrite;
+  ppu->oamBuffer = s_raster_port.oamBuffer;
+}
+
+typedef struct {
+  uint32_t magic, size, current, armed, completed;
+  PpuRasterField field[2];
+} PpuRasterState;
+#define PPU_RASTER_STATE_MAGIC 0x31524a50u /* PJR1 */
+
+size_t ppu_rasterStateSize(void) { return sizeof(PpuRasterState); }
+
+bool ppu_rasterStateValid(const void *data, size_t size) {
+  if (!data || size != sizeof(PpuRasterState)) return false;
+  PpuRasterState state;
+  memcpy(&state, data, sizeof state);
+  if (state.magic != PPU_RASTER_STATE_MAGIC || state.size != sizeof state ||
+      state.current > 1 || state.armed > 1 || state.completed > 1) return false;
+  for (unsigned f = 0; f < 2; ++f) {
+    const PpuRasterField *field = &state.field[f];
+    if (field->count < 0 || field->count > PPU_RASTER_MAX) return false;
+    for (int i = 0; i < field->count; ++i)
+      if (field->e[i].key >= 262 || !raster_reg_journaled(field->e[i].reg))
+        return false;
+  }
+  return true;
+}
+
+bool ppu_rasterStateSave(SaveLoadInfo *sli) {
+  if (s_raster_rendering) return false;
+  PpuRasterState state = {0};
+  state.magic = PPU_RASTER_STATE_MAGIC;
+  state.size = sizeof state;
+  state.current = s_raster_armed ? s_raster_cur : 0;
+  state.armed = s_raster_armed;
+  state.completed = s_raster_armed ? s_raster_have_completed : 0;
+  if (s_raster_armed) for (unsigned f = 0; f < 2; ++f) {
+    if (!s_raster_have_completed && f != (unsigned)s_raster_cur) continue;
+    state.field[f] = s_field[f];
+    /* Unused entries belong to discarded fields, not this snapshot. */
+    memset(state.field[f].e + state.field[f].count, 0,
+           (PPU_RASTER_MAX - state.field[f].count) * sizeof(PpuRasterEntry));
+  }
+  sli->func(sli, &state, sizeof state);
+  return true;
+}
+
+bool ppu_rasterStateLoad(SaveLoadInfo *sli) {
+  PpuRasterState state;
+  sli->func(sli, &state, sizeof state);
+  if (!ppu_rasterStateValid(&state, sizeof state)) return false;
+  memcpy(s_field, state.field, sizeof s_field);
+  s_raster_cur = state.current;
+  s_raster_armed = state.armed;
+  s_raster_have_completed = state.completed;
+  s_raster_rendering = s_raster_next = s_raster_hdmaen_pending = 0;
+  s_raster_render = NULL;
+  return true;
+}
+
+/* Snapshot of the journal as the renderer will consume it, for the debug
+ * server. The journal is the difference between "what the game wrote" and
+ * "what got drawn", so when a frame looks wrong this is the only place the two
+ * can be compared. Lines are beam lines (225..261 = the vblank before the
+ * field's line 0). */
+static int raster_dump_field(char *out, int cap, const char *name,
+                             const PpuRasterField *f) {
+  int pos = 0;
+  int i;
+#define RJ_OFF(field) (offsetof(Ppu, field) - offsetof(Ppu, inidisp))
+  uint16_t bg1h, bg1v;
+  memcpy(&bg1h, f->regs + RJ_OFF(hScroll), sizeof(bg1h));
+  memcpy(&bg1v, f->regs + RJ_OFF(vScroll), sizeof(bg1v));
+  pos += snprintf(out + pos, cap - pos,
+                  "\"%s\":{\"count\":%d,\"dropped\":%u,"
+                  "\"base\":{\"inidisp\":\"0x%02X\",\"tm\":\"0x%02X\","
+                  "\"tmw\":\"0x%02X\",\"cgadsub\":\"0x%02X\","
+                  "\"bg1h\":%u,\"bg1v\":%u},\"entries\":[",
+                  name, f->count, (unsigned)f->dropped,
+                  f->regs[RJ_OFF(inidisp)], f->regs[RJ_OFF(screenEnabled)],
+                  f->regs[RJ_OFF(screenWindowed)], f->regs[RJ_OFF(cgadsub)],
+                  (unsigned)bg1h, (unsigned)bg1v);
+#undef RJ_OFF
+  for (i = 0; i < f->count && pos < cap - 64; i++) {
+    const unsigned key = f->e[i].key;
+    const unsigned line = key < (262 - 225) ? key + 225 : key - (262 - 225);
+    pos += snprintf(out + pos, cap - pos,
+                    "%s{\"l\":%u,\"r\":\"0x%04X\",\"v\":\"0x%02X\"}",
+                    i ? "," : "", line, f->e[i].reg, f->e[i].val);
+  }
+  pos += snprintf(out + pos, cap - pos, "]}");
+  return pos;
+}
+
+int ppu_rasterDebugDump(char *out, int cap) {
+  int pos = snprintf(out, cap, "{\"armed\":%d,\"have_completed\":%d,",
+                     s_raster_armed, s_raster_have_completed);
+  /* Raw entries are ~45 bytes each; a field near the cap would not fit. */
+  int half = (cap - pos - 8) / 2;
+  if (half < 128) return pos;
+  pos += raster_dump_field(out + pos, half, "completed",
+                           &s_field[s_raster_cur ^ 1]);
+  pos += snprintf(out + pos, cap - pos, ",");
+  pos += raster_dump_field(out + pos, cap - pos - 2, "recording",
+                           &s_field[s_raster_cur]);
+  pos += snprintf(out + pos, cap - pos, "}");
+  return pos;
+}
+
+void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
+  ppu_wlog_note(adr, val);
+  /* Every path into the PPU -- CPU stores, DMA, beam HDMA -- is history the
+   * raster journal must see; recording here rather than in one caller is
+   * what makes that true. */
+  if (ppu == raster_machine_ppu())
+    ppu_rasterRecord((uint16_t)(0x2100u | adr), g_snes->vPos, val);
+//  if (adr != 24 && adr != 25)
+//    printf("ppu_write(%d, %d)\n", adr, val);
+  switch(adr) {
+    case INIDISP & 0xff:
+      ppu->inidisp = val;
+      break;
+    case OBSEL & 0xff:
+      ppu->obsel = val;
+      break;
+    case OAMADDL & 0xff:
+      ppu->oamaddl = val;
+      ppu->oamAdr = val;
+      ppu->oamInHigh = ppu->oamaddh & 1;
+      ppu->oamSecondWrite = false;
+      break;
+    case OAMADDH & 0xff:
+      ppu->oamaddh = val;
+      ppu->oamInHigh = val & 1;
+      ppu->oamAdr = ppu->oamaddl;
+      ppu->oamSecondWrite = false;
+      break;
+    case 0x04: {
+      if(ppu->oamInHigh) {
+        int hidx = ((ppu->oamAdr & 0xf) << 1) | ppu->oamSecondWrite;
+        ppu->highOam[hidx] = val;
+        ppu->oamWriteCount++;
+        debug_server_on_oam_write(1, (uint16_t)hidx, (uint16_t)val);
+        if(ppu->oamSecondWrite) {
+          ppu->oamAdr++;
+          if(ppu->oamAdr == 0) ppu->oamInHigh = false;
+        }
+      } else {
+        if(!ppu->oamSecondWrite) {
+          ppu->oamBuffer = val;
+        } else {
+          uint16_t widx = ppu->oamAdr;
+          uint16_t word = (uint16_t)((val << 8) | ppu->oamBuffer);
+          if (!(widx & 1)) {
+            unsigned slot = widx >> 1;
+            ppu->wsOamFullXValid[slot >> 3] &= ~(1u << (slot & 7));
+          }
+          ppu->oam[ppu->oamAdr++] = word;
+          ppu->oamWriteCount++;
+          debug_server_on_oam_write(0, widx, word);
+          if(ppu->oamAdr == 0) ppu->oamInHigh = true;
+        }
+      }
+      ppu->oamSecondWrite = !ppu->oamSecondWrite;
+      break;
+    }
+    case BGMODE & 0xff:
+      assert((val & 0xf0) == 0);
+      ppu->bgmode = val;
+      break;
+    case MOSAIC & 0xff:
+      ppu->mosaic = val;
+      ppu->mosaicStartLine = 0;// ppu->snes->vPos;
+      break;
+    case BG1SC & 0xff:
+    case BG2SC & 0xff:
+    case BG3SC & 0xff:
+    case BG4SC & 0xff:
+      ppu->bgXsc[adr - 7] = val;
+      break;
+    case BG12NBA & 0xff:
+      ppu->bgTileAdr = ppu->bgTileAdr & 0xff00 | val;
+      break;
+    case BG34NBA & 0xff:
+      ppu->bgTileAdr = ppu->bgTileAdr & 0xff | val << 8;
+      break;
+    case 0x0d: {
+      ppu->m7matrix[6] = ((val << 8) | ppu->m7prev) & 0x1fff;
+      ppu->m7prev = val;
+      // fallthrough to normal layer BG-HOFS
+    }
+    case 0x0f:
+    case 0x11:
+    case 0x13: {
+      ppu->hScroll[(adr - 0xd) / 2] = ((val << 8) | (ppu->scrollPrev & 0xf8) | (ppu->scrollPrev2 & 0x7)) & 0x3ff;
+      ppu->scrollPrev = val;
+      ppu->scrollPrev2 = val;
+      break;
+    }
+    case 0x0e: {
+      ppu->m7matrix[7] = ((val << 8) | ppu->m7prev) & 0x1fff;
+      ppu->m7prev = val;
+      // fallthrough to normal layer BG-VOFS
+    }
+    case 0x10:
+    case 0x12:
+    case 0x14: {
+      ppu->vScroll[(adr - 0xe) / 2] = ((val << 8) | ppu->scrollPrev) & 0x3ff;
+      ppu->scrollPrev = val;
+      break;
+    }
+    case 0x15: {
+      if((val & 3) == 0) {
+        ppu->vramIncrement = 1;
+      } else if((val & 3) == 1) {
+        ppu->vramIncrement = 32;
+      } else {
+        ppu->vramIncrement = 128;
+      }
+      ppu->vramRemapMode = (val & 0xc) >> 2;
+      ppu->vramIncrementOnHigh = val & 0x80;
+      break;
+    }
+    case 0x16: {
+      ppu->vramPointer = (ppu->vramPointer & 0xff00) | val;
+      ppu->vramReadBuffer = ppu->vram[ppu_getVramRemap(ppu) & 0x7fff];
+      break;
+    }
+    case 0x17: {
+      ppu->vramPointer = (ppu->vramPointer & 0x00ff) | (val << 8);
+      ppu->vramReadBuffer = ppu->vram[ppu_getVramRemap(ppu) & 0x7fff];
+      break;
+    }
+    case 0x18: {
+      // TODO: vram access during rendering (also cgram and oam)
+      uint16_t vramAdr = ppu_getVramRemap(ppu);
+      ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0xff00) | val;
+      ppu->vramWriteCount++;
+      // $2118 == low byte of word; byte_addr = word << 1.
+      debug_server_on_vram_write(((uint32_t)(vramAdr & 0x7fff) << 1), val);
+      if (s_vram_write_log_hook)
+        s_vram_write_log_hook(((uint32_t)(vramAdr & 0x7fff) << 1), val);
+#if SNESRECOMP_ENABLE_MODS
+      snes_text_xlate_on_vram_write_c((uint16_t)(vramAdr & 0x7fff));
+#endif
+      WsShadowOnVramWrite((uint16_t)(vramAdr & 0x7fff),
+                          ppu->vram[vramAdr & 0x7fff]);
+      if(!ppu->vramIncrementOnHigh) ppu->vramPointer += ppu->vramIncrement;
+      break;
+    }
+    case 0x19: {
+      uint16_t vramAdr = ppu_getVramRemap(ppu);
+      ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0x00ff) | (val << 8);
+      ppu->vramWriteCount++;
+      // $2119 == high byte of word; byte_addr = (word << 1) + 1.
+      debug_server_on_vram_write(((uint32_t)(vramAdr & 0x7fff) << 1) + 1, val);
+      if (s_vram_write_log_hook)
+        s_vram_write_log_hook(((uint32_t)(vramAdr & 0x7fff) << 1) + 1, val);
+#if SNESRECOMP_ENABLE_MODS
+      snes_text_xlate_on_vram_write_c((uint16_t)(vramAdr & 0x7fff));
+#endif
+      WsShadowOnVramWrite((uint16_t)(vramAdr & 0x7fff),
+                          ppu->vram[vramAdr & 0x7fff]);
+      if(ppu->vramIncrementOnHigh) ppu->vramPointer += ppu->vramIncrement;
+      break;
+    }
+    case M7SEL & 0xff:
+      ppu->m7sel = val;
+      break;
+    case 0x1b:
+    case 0x1c:
+    case 0x1d:
+    case 0x1e:
+      ppu->m7matrix[adr - 0x1b] = (val << 8) | ppu->m7prev;
+      ppu->m7prev = val;
+      break;
+    case 0x1f:
+    case 0x20:
+      ppu->m7matrix[adr - 0x1b] = ((val << 8) | ppu->m7prev) & 0x1fff;
+      ppu->m7prev = val;
+      break;
+    case 0x21:
+      ppu->cgramPointer = val;
+      ppu->cgramSecondWrite = false;
+      break;
+    case 0x22:
+      if(!ppu->cgramSecondWrite) {
+        ppu->cgramBuffer = val;
+      } else {
+        ppu->cgram[ppu->cgramPointer++] = (val << 8) | ppu->cgramBuffer;
+      }
+      ppu->cgramSecondWrite = !ppu->cgramSecondWrite;
+      break;
+    case 0x23:
+      ppu->windowsel = (ppu->windowsel & ~0xff) | val;
+      break;
+    case 0x24:
+      ppu->windowsel = (ppu->windowsel & ~0xff00) | (val << 8);
+      break;
+    case 0x25:
+      ppu->windowsel = (ppu->windowsel & ~0xff0000) | (val << 16);
+      break;
+    case 0x26:
+      ppu->window1left = val;
+      break;
+    case 0x27:
+      ppu->window1right = val;
+      break;
+    case 0x28:
+      ppu->window2left = val;
+      break;
+    case 0x29:
+      ppu->window2right = val;
+      break;
+    case WBGLOG & 0xff:
+      ppu->wbgobjlog = ppu->wbgobjlog & 0xff00 | val;
+      break;
+    case WOBJLOG & 0xff:
+      ppu->wbgobjlog = ppu->wbgobjlog & 0xff | val << 8;
+      break;
+    case TM & 0xff:
+      ppu->screenEnabled[0] = val;
+      break;
+    case TS & 0xff:
+      ppu->screenEnabled[1] = val;
+      break;
+    case TMW & 0xff:
+      ppu->screenWindowed[0] = val;
+      break;
+    case TSW & 0xff:
+      ppu->screenWindowed[1] = val;
+      break;
+    case CGWSEL & 0xff:
+      ppu->cgwsel = val;
+      break;
+    case CGADSUB & 0xff:
+      ppu->cgadsub = val;
+      break;
+    case COLDATA & 0xff:
+      if (val & 0x80) ppu->fixedColor = (ppu->fixedColor & ~(0x1f << 10)) | (val & 0x1f) << 10; // blue
+      if (val & 0x40) ppu->fixedColor = (ppu->fixedColor & ~(0x1f <<  5)) | (val & 0x1f) << 5;  // green
+      if (val & 0x20) ppu->fixedColor = (ppu->fixedColor & ~(0x1f <<  0)) | (val & 0x1f) << 0;  // red
+      break;
+    case SETINI & 0xff:
+      ppu->setini = val;
+      break;
+    default:
+      break;
+  }
+}

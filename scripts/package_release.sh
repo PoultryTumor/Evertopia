@@ -62,9 +62,9 @@ exec bash "$IMPL" \
   --runtime-dir mods \
   --build-dir "$BUILD_DIR" \
   --artifact "$PLATFORM" \
-  --exe-name SecretOfEvermoreSNESRecomp \
-  --zip-prefix secretofevermore \
-  --display-name "Secret of Evermore" \
+  --exe-name Evertopia \
+  --zip-prefix evertopia \
+  --display-name "Evertopia" \
   --rom-hint "$ROM_FILE" \
   --rom-sha256 "$ROM_SHA256" \
   --rom-crc32 "$ROM_CRC32" \

@@ -1,0 +1,94 @@
+name: Build Windows Setup Pack
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing GitHub Release tag to attach the Windows zip to (e.g. v0.8.0)'
+        type: string
+        default: 'v0.8.0'
+      embed_toolchain:
+        description: 'Embed portable cmake-clang-v1 Windows toolchain (~200 MB, zero installs for players)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  windows-x64:
+    name: windows-x64
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Assert no generated C in tree
+        run: |
+          set -euo pipefail
+          if compgen -G 'src/gen/*.c' >/dev/null || [[ -f recomp/funcs.h ]]; then
+            echo "::error::src/gen/*.c or recomp/funcs.h is present in the checkout."
+            exit 1
+          fi
+
+      - name: Cache toolchain pack
+        uses: actions/cache@v4
+        with:
+          path: .cache/toolchain-pack
+          key: cmake-clang-v1-windows-x64-latest
+
+      - name: Fetch Windows toolchain pack
+        run: |
+          set -euo pipefail
+          bash snesrecomp/tools/ci/fetch_toolchain.sh --artifact windows-x64
+
+      - name: Configure and build Windows Setup Host
+        run: |
+          set -euo pipefail
+          source "${TOOLCHAIN_DIR}/env.sh"
+          VER="$(tr -d '[:space:]' < VERSION)"
+          echo "Building Evertopia ${VER} Setup Host for windows-x64..."
+          echo "cmake: $(command -v cmake) ($(cmake --version | head -n1))"
+          echo "cc:    ${CC:-$(command -v cc)}"
+          cmake -S . -B build-ci -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSNESRECOMP_SETUP_HOST=ON \
+            -DSNESRECOMP_CRC32_IMPL=SLICE8 \
+            -DSNESRECOMP_ENABLE_TRACE=OFF \
+            -DSNESRECOMP_BUILD_VERSION="${VER}"
+          cmake --build build-ci -j4 --target SecretOfEvermoreSNESRecomp
+          ls -lh build-ci/Evertopia.exe
+
+      - name: Package Windows Setup Pack
+        run: |
+          set -euo pipefail
+          source "${TOOLCHAIN_DIR}/env.sh"
+          ARGS=()
+          if [[ "${{ inputs.embed_toolchain }}" != "false" ]]; then
+            ARGS+=(--embed-toolchain)
+          fi
+          bash scripts/package_release.sh build-ci windows-x64 "${ARGS[@]+"${ARGS[@]}"}"
+          ls -lh dist/
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: evertopia-windows-x64
+          path: dist/evertopia-*-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Attach Windows zip to GitHub Release
+        if: inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "${TAG}" dist/evertopia-*-windows-x64.zip --clobber
