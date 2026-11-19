@@ -28,6 +28,7 @@
 #include "host_main.h"
 #include "game_rtl.h"
 #include "slide_menu.h"
+#include "spc_jukebox.h"
 #include "asset_cache.h"
 #include "coop_2p.h"
 #include "snesrecomp_rom_identity.h"  /* generated from rom_identity.txt */
@@ -323,5 +324,19 @@ int main(int argc, char **argv)
             break;
         }
     }
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--export-spc") == 0) {
+#ifdef _WIN32
+            _putenv("SOE_EXPORT_ALL_SPC=1");
+#else
+            setenv("SOE_EXPORT_ALL_SPC", "1", 1);
+#endif
+            argv[i] = (char *)"--no-launcher";
+            break;
+        }
+    }
+#ifdef RECOMP_LAUNCHER
+    SoeRegisterLauncherSpcJukebox();
+#endif
     return snesrecomp_desktop_main(&kGameHost, argc, argv);
 }

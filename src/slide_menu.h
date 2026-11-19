@@ -79,6 +79,7 @@ int SoeWindowBaseHeight(void);
 bool SoeExportCurrentMap(const char *out_path);
 int SoeExportAllMaps(void);
 int SoeExportAllMusic(void);
+int SoeExportAllSpc(void);
 
 #ifdef __cplusplus
 }

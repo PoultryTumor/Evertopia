@@ -6,13 +6,20 @@ A native PC static recompilation port of **Secret of Evermore** (SNES, USA), bui
 
 ---
 
-<img width="2560" height="1440" alt="Screenshot from 2026-11-18 00-39-09" src="https://github.com/user-attachments/assets/409ad5b3-8b0f-42a9-8ade-b74cc839ee71" /><img width="2560" height="1440" alt="Screenshot from 2026-11-18 00-42-56" src="https://github.com/user-attachments/assets/63b45fe4-e63e-4d1e-a9ad-8ec9fd34680f" />
-<img width="2560" height="1440" alt="Screenshot from 2026-11-18 00-41-33" src="https://github.com/user-attachments/assets/0398ae72-850e-4d28-90aa-acc446172ffb" />
-<img width="2560" height="1440" alt="Screenshot from 2026-11-18 00-32-38" src="https://github.com/user-attachments/assets/d02daaa0-336d-4145-836b-9aafc9b04a40" />
-<img width="1280" height="720" alt="Screenshot from 2026-11-15 06-31-43" src="https://github.com/user-attachments/assets/1f580559-ed46-4238-a2bf-7c2bf86a77e4" />
-<img width="2560" height="1440" alt="Screenshot from 2026-11-13 05-20-49" src="https://github.com/user-attachments/assets/78c5bb1b-94ca-40f7-b7ac-463211e8a3e9" />
+## What's New
 
+### v0.8.0
+- **Map Exporter Fix (Large & Complex Maps):** Fixed garbled PNG exports on large/complex maps (including Great Pyramid Exterior, Gomi's Tower, Jungle South of Fire Eyes' Village, Oglin Caves, Swamp Maze, and Map 113) by waiting for `$7F` decompression, VRAM tileset streaming, CGRAM BG palettes, and screen unblanking to settle before capture, plus SNES-accurate 10-bit tile / 32K-word VRAM wrapping.
+- **Multi-Chamber Widescreen Clamping:** Fixed widescreen and ultrawide room-edge clamping on multi-chamber maps that separate rooms with solid flat dark-void BG2 tiles (e.g. Map 60 — Volcano Two Pots Room), eliminating dark void strips past chamber walls.
+- **Parallax Layer Widescreen Clamping:** Fixed widescreen and ultrawide boundary clamping on parallax-scrolling maps (e.g. Map 56 — Prehistoria Jungle South of Fire Eyes' Village) by probing the active world-camera layer so overhead BG1 foliage/vines no longer expose black void underneath.
 
+### v0.6.1
+- **Launcher SPC Ripper & Jukebox:** Added an SPC ripper and interactive Jukebox player directly in the Evertopia launcher alongside bug fixes.
+
+### v0.6.0
+- **Initial Linux Setup Pack Release:** Native `snesrecomp` PC port with true 16:9 / 21:9 widescreen, extended Mode 4 stone-mosaic menus, CRT/Bloom shaders, custom glass dialog themes, save-state & rewind browsers, and per-map pillarbox editor.
+
+---
 
 ## What This Is
 
@@ -36,17 +43,31 @@ Only the standard **USA** release of *Secret of Evermore* is accepted (verified 
 
 ## What's Added Over Vanilla SNES
 
-### Features
-- **Widescreen & Targeting:** Full widescreen support with adjusted widescreen targeting.
-- **Automatic Pillarboxing:** Smart 4:3 sidebars for maps and sequences that require original framing.
-- **One-Click Asset Extractor:** Export full map PNGs, soundtrack MP3s, and SFX WAV files with a single click.
-- **3 Save Slots:** Instant save and load states on demand.
-- **9 Custom Glass Themes:** Translucent glass styling that carries seamlessly across both in-game dialog boxes and the program's menus and windows.
-- **Debug Menu:** Packed with warps, toggles, and all the testing tools.
-- **Visual Shaders:** Configurable CRT and Bloom display settings.
-- **Subpixel Smoothness:** Subpixel map scrolling and sprite movement.
-- **Overhauled Ring Menu:** Widened ring-menu screens with enhanced usability.
-- **In-Game Jukebox:** Built-in music player to cue up tracks anytime.
+### Widescreen & Visual Upgrades
+- **True Widescreen (`16:9` & `21:9` Ultrawide, plus `4:3`):**
+  - Streams BG1/BG2 room tilemaps directly from WRAM `$7F` for native `342×224` (`16:9`) and `426×224` (`21:9`) output.
+  - Expands enemy/object culling and alchemy targeting bounds across the widened view.
+  - Dynamically clamps room borders cleanly and wraps horizontal 48-tile intro/title backdrops (`Map 17` & `Map 97`) seamlessly without right-edge black bars.
+- **Smart HUD Repositioning:**
+  - Shifts the bottom Boy/Dog status bars and portraits cleanly into the widescreen margins (`Move Left Margin`) or keeps `Original 4:3 Center`.
+  - Automatically detects single-character segments (e.g., Nobilia splits and solo areas) so lone HUD bars and portraits remain cleanly centered.
+- **Extended Mode 4 Stone-Mosaic Menus:**
+  - Widens **Save Select / Load / Name Entry** and all six Ring Menu submenus (**Level**, **Stat.**, **Act.**, **Edit.**, **Edit.**, **Alchemy**) with seamless stone tiling and a subtle black-to-transparent outer edge vignette, decoupled from `Map 97`'s Title Screen pillarbox setting.
+- **Per-Map Pillarbox Editor (`Pillarbox Edit Mode`):**
+  - Off by default at launch so gameplay stays clean. Enable **`Pillarbox Edit Mode`** in the **Debug Tools** overlay (`RT` / `F2` / `` ` ``) to unhide the upper-right **`Map X: [0/1]`** badge, dropdown picker (`[0] 4:3 Pillar` / `[1] Widescreen`), and `0`/`1` quick-toggle keys. Your toggle state saves to `video_config.json`, and per-map changes persist to `map_pillarbox.json`.
+- **Per-Line Sprite Limits Removed:**
+  - Removes the SNES 32-sprite-per-scanline flicker cap by default (toggleable back to `Standard SNES (32)`).
+- **Lock Framerate to 60 FPS:**
+  - Enabled by default under **Video** settings (locks real-time pacing to the SNES NTSC rate; toggleable to `Unlocked`).
+
+### Programmatic Glass Themes & Post-Processing
+- **Dialog & Menu Glass Themes (`dialog_config.json`):**
+  - Choose between **8 translucent Glass themes** (*Omnitopia Blue*, *Volcano Orange*, *Swamp Green*, *Nobilia Gold*, *Ebon Keep Purple*, *Crustacea Teal*, *Colosseum Red*, *Ivor Tower Slate*) or **Original (SNES)**.
+  - Includes configurable drop shadows (`Subtle`, `Medium`, `Off`). Both the slide-out **Settings** drawer and floating **Debug** window follow the active theme, and in-game **Window Prefs** previews themes live.
+- **CRT Emulation (`crt_config.json`):**
+  - Dedicated **CRT** tab with presets (*Off*, *Just Scanlines*, *Fine 1px*, *Deep*, *Subtle*, *Classic*, *Solid Retro*, *Trinitron*, *Custom*) plus individual controls for scanline density, opacity, beam thickness, phosphor masks, luminance boost, and vignette.
+- **Bloom / Glow (`bloom_config.json`):**
+  - Dedicated **Bloom** tab with curated presets (*Default*, *Subtle*, *Soft Focus*, *Warm Sun*, *Mystic Cyan*, *Neon*, *Intense*, *Off*) plus intensity, threshold, spread radius, blend mode (*Screen*, *Additive*, *Soft Light*), and color tint.
 
 ### Vanilla Bug Fixes & Quality of Life (Enabled by Default)
 Toggleable individually in the **Game** tab:
@@ -54,6 +75,8 @@ Toggleable individually in the **Game** tab:
 - **Atlas / Defend Stat Underflow Fix**
 - **Dog Level 39+ Progression Fix** (fixes Dog EXP curve past Lv 39 up to 99)
 - **Boundary Softlock Prevention**
+- **Toaster Dog Audio Loop Guard:** Prevents infinite/stuck `SFX $0048` sound loops when using the Toaster Dog form.
+- **Exit to Desktop:** At the bottom of the **Game** tab (highlighted in red) to explicitly flush all config files and battery SRAM before exiting.
 
 ### Launcher & Tools
 - **ROM Details Panel:** Displays ROM Title, Header status (`Headered 512B SMC` vs `Unheadered`), Country/Region, ROM Mapping (`HiROM`/`LoROM`, `FastROM`/`SlowROM`), ROM/SRAM size, and Revision/Checksum right below **Browse For ROM**.
@@ -111,6 +134,8 @@ Once **Skip launcher on boot** is checked, future launches boot straight into th
 ---
 
 ## Building from Source
+
+Install OpenGL development headers if not already present (e.g. `sudo dnf install libglvnd-devel mesa-libGL-devel` on Fedora/Nobara, or `sudo apt install libgl-dev` on Debian/Ubuntu), then:
 
 ```sh
 git submodule update --init --recursive

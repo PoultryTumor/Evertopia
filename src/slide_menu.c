@@ -4987,10 +4987,10 @@ bool SoeExportCurrentMap(const char *out_path)
                     for (int qx = 0; qx < 2; qx++) {
                         int eff_qx = hf ? (1 - qx) : qx;
                         int eff_qy = vf ? (1 - qy) : qy;
-                        uint16_t tile = (uint16_t)(base_tile + eff_qx + eff_qy * 16);
+                        uint16_t tile = (uint16_t)((base_tile + eff_qx + eff_qy * 16) & 0x03FFu);
 
-                        /* Each 4bpp tile is 16 words (32 bytes) */
-                        uint32_t tile_addr = char_base + (uint32_t)tile * 16u;
+                        /* Each 4bpp tile is 16 words (32 bytes); wrap within 32K-word VRAM */
+                        uint32_t tile_addr = (char_base + (uint32_t)tile * 16u) & 0x7FFFu;
                         if (tile_addr + 16u > 0x8000u) continue;
 
                         int ox = cell_px + qx * 8;
@@ -5035,6 +5035,42 @@ bool SoeExportCurrentMap(const char *out_path)
     fprintf(stderr, "[Map Export] Successfully exported map (%ux%u -> %dx%d px) to %s\n",
             (unsigned)width, (unsigned)height, img_w, img_h, out_path);
     return true;
+}
+
+/*
+ * Wait until a warped-to map finishes decompressing WRAM $7F, streaming VRAM
+ * tilesets, populating CGRAM BG palettes, and unblanking at full brightness.
+ * Large/complex maps (e.g. Great Pyramid Exterior, Oglin Caves, Gomi's Tower,
+ * Swamp Maze) can take 140-200+ frames to finish loading; capping at 120 frames
+ * previously exported them mid-load with stale/partial VRAM tiles.
+ */
+static void SoeWaitForMapReady(uint16_t target_map)
+{
+    int ready_frames = 0;
+    for (int f = 0; f < 400; f++) {
+        WatchdogFrameStart();
+        GameRunOneFrame();
+        if (f >= 60 && GetLoadedMapId() == target_map &&
+            g_snes && g_snes->ppu &&
+            !PPU_forcedBlank(g_snes->ppu) &&
+            PPU_brightness(g_snes->ppu) >= 15) {
+            uint8_t w = g_ram[0x08EE];
+            uint8_t h = g_ram[0x08F0];
+            uint16_t stride = (uint16_t)(g_ram[0x0F46] | (g_ram[0x0F47] << 8));
+            int non_zero = 0;
+            for (int ci = 16; ci < 128; ci++) {
+                if (g_snes->ppu->cgram[ci] != 0) non_zero++;
+            }
+            if (w > 0 && h > 0 && stride == (uint16_t)w * 2u && non_zero >= 8) {
+                ready_frames++;
+                if (ready_frames >= 2) break;
+            } else {
+                ready_frames = 0;
+            }
+        } else {
+            ready_frames = 0;
+        }
+    }
 }
 
 /*
@@ -5103,18 +5139,7 @@ int SoeExportAllMaps(void)
         DebugExecuteWarpEx(m, true);
 
         /* Advance simulation frames until target map is loaded, faded in, and BG palettes populated */
-        for (int f = 0; f < 120; f++) {
-            WatchdogFrameStart();
-            GameRunOneFrame();
-            if (f >= 60 && GetLoadedMapId() == m &&
-                g_snes && g_snes->ppu && PPU_brightness(g_snes->ppu) >= 15) {
-                int non_zero = 0;
-                for (int ci = 16; ci < 128; ci++) {
-                    if (g_snes->ppu->cgram[ci] != 0) non_zero++;
-                }
-                if (non_zero >= 8) break;
-            }
-        }
+        SoeWaitForMapReady(m);
 
         uint16_t loaded_id = GetLoadedMapId();
         if (base_snap && base_size == 0 && loaded_id != 0 && loaded_id != 97) {
@@ -5346,6 +5371,200 @@ int SoeExportAllMusic(void)
     s_debug_toast_timer = 240;
     return exported;
 #endif
+}
+
+typedef struct {
+    SaveLoadInfo base;
+    uint8_t *buf;
+    size_t pos;
+    size_t cap;
+    bool saving;
+} SoeApuMemStream;
+
+static void SoeApuMemFunc(SaveLoadInfo *info, void *data, size_t data_size)
+{
+    SoeApuMemStream *st = (SoeApuMemStream *)info;
+    if (st->pos + data_size > st->cap) return;
+    if (st->saving) {
+        memcpy(st->buf + st->pos, data, data_size);
+    } else {
+        memcpy(data, st->buf + st->pos, data_size);
+    }
+    st->pos += data_size;
+}
+
+int SoeExportAllSpc(void)
+{
+    WatchdogSetEnabled(0);
+    soe_mkdir("Extract");
+    soe_mkdir("Extract/SPC");
+    FILE *init_pf = fopen("Extract/SPC/progress.txt", "w");
+    if (init_pf) { fprintf(init_pf, "0 1 0\n"); fclose(init_pf); }
+
+    extern int snes_frame_counter;
+    if (snes_frame_counter < 50) {
+        for (int boot_f = 0; boot_f < 900; boot_f++) {
+            WatchdogFrameStart();
+            GameRunOneFrame();
+        }
+        if (snes_frame_counter <= 20) snes_frame_counter = 21;
+    }
+    g_ram[0x0B29] = 0x03;
+
+    BuildJukeboxSongList();
+    int total = s_jukebox_song_count;
+    if (total <= 0 || !g_snes || !g_snes->apu || !g_snes->apu->dsp || !g_snes->apu->spc) {
+        WatchdogSetEnabled(1);
+        return 0;
+    }
+
+    uint8_t *spc_buf = (uint8_t *)malloc(66048u);
+    uint8_t *clean_apu_buf = (uint8_t *)malloc(128u * 1024u);
+    if (!spc_buf || !clean_apu_buf) {
+        free(spc_buf);
+        free(clean_apu_buf);
+        WatchdogSetEnabled(1);
+        return 0;
+    }
+
+    /* Save clean post-boot APU & audio driver WRAM state so an IPL-halted track cannot poison later tracks. */
+    uint8_t clean_dp[12];
+    uint8_t clean_0e47[16];
+    memcpy(clean_dp, &g_ram[0x009A], sizeof(clean_dp));
+    memcpy(clean_0e47, &g_ram[0x0E47], sizeof(clean_0e47));
+    {
+        SoeApuMemStream st;
+        memset(&st, 0, sizeof(st));
+        st.base.func = SoeApuMemFunc;
+        st.buf = clean_apu_buf;
+        st.cap = 128u * 1024u;
+        st.saving = true;
+        apu_saveload(g_snes->apu, &st.base);
+    }
+
+    int exported = 0;
+    for (int idx = 0; idx < total; idx++) {
+        uint8_t song_id = s_jukebox_songs[idx];
+
+        if (g_snes->apu->spc->pc >= 0xFFC0u) {
+            memcpy(&g_ram[0x009A], clean_dp, sizeof(clean_dp));
+            memcpy(&g_ram[0x0E47], clean_0e47, sizeof(clean_0e47));
+            SoeApuMemStream st;
+            memset(&st, 0, sizeof(st));
+            st.base.func = SoeApuMemFunc;
+            st.buf = clean_apu_buf;
+            st.cap = 128u * 1024u;
+            st.saving = false;
+            apu_saveload(g_snes->apu, &st.base);
+            apu_clearPortQueue(g_snes->apu);
+        }
+
+        /* Queue the song and let the engine upload BRR samples/sequence and start playback. */
+        s_pending_jukebox_song = (int)song_id;
+        for (int f = 0; f < 600 && s_pending_jukebox_song >= 0; f++) {
+            WatchdogFrameStart();
+            GameRunOneFrame();
+        }
+        s_pending_jukebox_song = -1;
+
+        /* Tick a few frames so the SPC700 driver enters its active playback loop. */
+        Dsp *dsp = g_snes->apu->dsp;
+        for (int f = 0; f < 30; f++) {
+            WatchdogFrameStart();
+            GameRunOneFrame();
+            dsp->sampleRead = dsp->sampleWrite;
+        }
+
+        RtlApuLock();
+        Apu *apu = g_snes->apu;
+        Spc *spc = apu->spc;
+        memset(spc_buf, 0, 66048u);
+
+        /* 256-byte SPC700 header + ID666 metadata */
+        static const char kSpcMagic[33] = "SNES-SPC700 Sound File Data v0.30";
+        memcpy(spc_buf + 0x00, kSpcMagic, 33);
+        spc_buf[0x21] = 0x1A;
+        spc_buf[0x22] = 0x1A;
+        spc_buf[0x23] = 0x1A; /* ID666 tag present */
+        spc_buf[0x24] = 30;   /* Version 0.30 */
+        spc_buf[0x25] = (uint8_t)(spc->pc & 0xFFu);
+        spc_buf[0x26] = (uint8_t)((spc->pc >> 8) & 0xFFu);
+        spc_buf[0x27] = spc->a;
+        spc_buf[0x28] = spc->x;
+        spc_buf[0x29] = spc->y;
+        spc_buf[0x2A] = (uint8_t)(
+            (spc->n ? 0x80u : 0u) |
+            (spc->v ? 0x40u : 0u) |
+            (spc->p ? 0x20u : 0u) |
+            (spc->b ? 0x10u : 0u) |
+            (spc->h ? 0x08u : 0u) |
+            (spc->i ? 0x04u : 0u) |
+            (spc->z ? 0x02u : 0u) |
+            (spc->c ? 0x01u : 0u));
+        spc_buf[0x2B] = spc->sp;
+
+        char title[33];
+        snprintf(title, sizeof(title), "Track %02d (ID $%02X)", idx + 1, (unsigned)song_id);
+        size_t tlen = strlen(title);
+        if (tlen > 32) tlen = 32;
+        memcpy(spc_buf + 0x2E, title, tlen);
+
+        const char *game_title = "Secret of Evermore";
+        memcpy(spc_buf + 0x4E, game_title, strlen(game_title));
+
+        const char *dumper = "Evertopia";
+        memcpy(spc_buf + 0x6E, dumper, strlen(dumper));
+
+        memcpy(spc_buf + 0xA9, "120", 3);
+        memcpy(spc_buf + 0xAC, "5000", 4);
+
+        const char *artist = "Jeremy Soule";
+        memcpy(spc_buf + 0xB1, artist, strlen(artist));
+
+        /* 64 KB ARAM dump */
+        memcpy(spc_buf + 0x0100, apu->ram, 0x10000u);
+        spc_buf[0x0100 + 0xF1] = (uint8_t)(
+            (apu->romReadable ? 0x80u : 0u) |
+            (apu->timer[0].enabled ? 0x01u : 0u) |
+            (apu->timer[1].enabled ? 0x02u : 0u) |
+            (apu->timer[2].enabled ? 0x04u : 0u));
+        spc_buf[0x0100 + 0xF2] = apu->dspAdr;
+        for (int p = 0; p < 4; p++) {
+            spc_buf[0x0100 + 0xF4 + p] = apu->inPorts[p];
+        }
+        spc_buf[0x0100 + 0xF8] = apu->inPorts[4];
+        spc_buf[0x0100 + 0xF9] = apu->inPorts[5];
+        for (int t = 0; t < 3; t++) {
+            spc_buf[0x0100 + 0xFA + t] = apu->timer[t].target;
+        }
+
+        /* 128 DSP registers */
+        memcpy(spc_buf + 0x10100, apu->dsp->ram, 0x80u);
+        RtlApuUnlock();
+
+        char path[128];
+        snprintf(path, sizeof(path), "Extract/SPC/Track %02d (ID $%02X).spc",
+                 idx + 1, (unsigned)song_id);
+        FILE *sf = fopen(path, "wb");
+        if (sf) {
+            if (fwrite(spc_buf, 1, 66048u, sf) == 66048u) {
+                exported++;
+            }
+            fclose(sf);
+        }
+
+        fprintf(stderr, "[SPC_PROGRESS] %d / %d (Song %u)\n", idx + 1, total, (unsigned)song_id);
+        fflush(stderr);
+        FILE *pf = fopen("Extract/SPC/progress.txt", "w");
+        if (pf) { fprintf(pf, "%d %d %u\n", idx + 1, total, (unsigned)song_id); fclose(pf); }
+    }
+
+    free(spc_buf);
+    free(clean_apu_buf);
+    WatchdogSetEnabled(1);
+    snprintf(s_debug_toast, sizeof(s_debug_toast), "Exported %d tracks to ./Extract/SPC/!", exported);
+    s_debug_toast_timer = 240;
+    return exported;
 }
 
 static void SoeWriteWavHeader(FILE *f, uint32_t sample_rate, uint16_t channels, uint32_t num_frames)
@@ -8062,6 +8281,7 @@ static inline bool IsNobiliaDesertMap(uint16_t map_id)
  * with the surrounding flat gray/semi-black block so widescreen scrolling never
  * exposes an empty black cutout:
  *   - Map 13  ($000D, Ebon Keep interior, 41x61): tx=0..21, ty=0..27 -> (22, 0)
+ *   - Map 45  ($002D, Hall of Collosia Mad Monk Room, 105x96): tx=68..104, ty=0..31 -> (68, 32)
  *   - Map 110 ($006E, Ivor Tower exterior, 38x61): tx=19..37, ty=0..27 -> (19, 28)
  */
 static void SoePatchMapVoidTilemaps(uint16_t room_id, uint8_t width, uint8_t height)
@@ -8074,8 +8294,9 @@ static void SoePatchMapVoidTilemaps(uint16_t room_id, uint8_t width, uint8_t hei
     } VoidPatchDef;
 
     static const VoidPatchDef kPatches[] = {
-        { 0x000Du, 41u, 61u,  0u, 22u, 0u, 28u, 22u,  0u },
-        { 0x006Eu, 38u, 61u, 19u, 38u, 0u, 28u, 19u, 28u },
+        { 0x000Du,  41u, 61u,  0u,  22u, 0u, 28u, 22u,  0u },
+        { 0x002Du, 105u, 96u, 68u, 105u, 0u, 32u, 68u, 32u },
+        { 0x006Eu,  38u, 61u, 19u,  38u, 0u, 28u, 19u, 28u },
     };
 
     const VoidPatchDef *p = NULL;
@@ -8099,11 +8320,14 @@ static void SoePatchMapVoidTilemaps(uint16_t room_id, uint8_t width, uint8_t hei
 
     uint16_t gray_bg1 = (uint16_t)(g_ram[0x10000u + gray_ptr] |
                                    (g_ram[0x10000u + gray_ptr + 1u] << 8));
+    uint16_t gray_bg2 = (uint16_t)(g_ram[0x10000u + gray_ptr + 2u] |
+                                   (g_ram[0x10000u + gray_ptr + 3u] << 8));
     uint16_t check_bg1 = (uint16_t)(g_ram[0x10000u + check_ptr] |
                                     (g_ram[0x10000u + check_ptr + 1u] << 8));
     uint16_t check_bg2 = (uint16_t)(g_ram[0x10000u + check_ptr + 2u] |
                                     (g_ram[0x10000u + check_ptr + 3u] << 8));
-    if (gray_bg1 == 0xA800u || check_bg1 != 0xA800u || check_bg2 != 0xA800u) return;
+    if ((gray_bg1 == 0xA800u && gray_bg2 == 0xA800u) ||
+        check_bg1 != 0xA800u || check_bg2 != 0xA800u) return;
 
     uint8_t lo = (uint8_t)(gray_ptr & 0xFFu);
     uint8_t hi = (uint8_t)((gray_ptr >> 8) & 0xFFu);
@@ -8636,29 +8860,108 @@ static int16_t SoeGetEffectivePpuVScroll(const Ppu *ppu)
     return SoeGetEffectivePpuCamScroll(ppu, true);
 }
 
-static bool SoeRoomColHasContent(uint8_t width, uint8_t height, int tx, int ty0, int ty1)
+static bool SoeIsTileUniformVoid(const Ppu *ppu, int layer, uint16_t word, bool allow_dark_solid)
+{
+    if (word == 0xA800u) return true;
+    if (!ppu) return false;
+
+    uint32_t char_base = (uint32_t)PPU_bgTileAdr(ppu, (uint)layer);
+    uint16_t base_tile = word & 0x03FFu;
+    const uint16_t *vram = ppu->vram;
+
+    uint16_t ref01 = 0, ref23 = 0;
+    for (int qy = 0; qy < 2; qy++) {
+        for (int qx = 0; qx < 2; qx++) {
+            uint16_t tile = (uint16_t)((base_tile + qx + qy * 16) & 0x03FFu);
+            uint32_t tile_addr = (char_base + (uint32_t)tile * 16u) & 0x7FFFu;
+            if (tile_addr + 16u > 0x8000u) return false;
+
+            uint16_t q01 = vram[tile_addr + 0];
+            uint16_t q23 = vram[tile_addr + 8];
+            if (qx == 0 && qy == 0) {
+                uint8_t b0 = (uint8_t)(q01 & 0xFFu);
+                uint8_t b1 = (uint8_t)(q01 >> 8);
+                uint8_t b2 = (uint8_t)(q23 & 0xFFu);
+                uint8_t b3 = (uint8_t)(q23 >> 8);
+                if ((b0 != 0x00u && b0 != 0xFFu) ||
+                    (b1 != 0x00u && b1 != 0xFFu) ||
+                    (b2 != 0x00u && b2 != 0xFFu) ||
+                    (b3 != 0x00u && b3 != 0xFFu)) {
+                    return false;
+                }
+                ref01 = q01;
+                ref23 = q23;
+            } else if (q01 != ref01 || q23 != ref23) {
+                return false;
+            }
+
+            for (int py = 1; py < 8; py++) {
+                if (vram[tile_addr + py] != ref01 || vram[tile_addr + 8 + py] != ref23) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    uint8_t c = (uint8_t)(((ref01 & 1u) ? 1u : 0u) |
+                          ((ref01 & 0x0100u) ? 2u : 0u) |
+                          ((ref23 & 1u) ? 4u : 0u) |
+                          ((ref23 & 0x0100u) ? 8u : 0u));
+    if (c == 0) {
+        if (!allow_dark_solid) return true;
+        uint16_t bg_rgb = ppu->cgram[0];
+        return ((bg_rgb & 0x1Fu) <= 4u &&
+                ((bg_rgb >> 5) & 0x1Fu) <= 4u &&
+                ((bg_rgb >> 10) & 0x1Fu) <= 4u);
+    }
+    if (!allow_dark_solid) return false;
+
+    uint16_t pbase = (uint16_t)(((word >> 10) & 7u) * 16u);
+    uint16_t rgb15 = ppu->cgram[pbase + c];
+    return ((rgb15 & 0x1Fu) <= 4u &&
+            ((rgb15 >> 5) & 0x1Fu) <= 4u &&
+            ((rgb15 >> 10) & 0x1Fu) <= 4u);
+}
+
+static bool SoeRoomColHasContent(uint8_t width, uint8_t height, int tx, int ty0, int ty1, uint8_t layer_mask)
 {
     if (tx < 0 || tx >= (int)width) return false;
     if (ty0 < 0) ty0 = 0;
     if (ty1 >= (int)height) ty1 = (int)height - 1;
+    const Ppu *ppu = (g_snes && g_snes->ppu) ? g_snes->ppu : NULL;
+    bool bg2_only = (layer_mask == 0x02u);
+    bool dark_backdrop = true;
+    if (bg2_only && ppu) {
+        uint16_t bg_rgb = ppu->cgram[0];
+        dark_backdrop = ((bg_rgb & 0x1Fu) <= 4u &&
+                         ((bg_rgb >> 5) & 0x1Fu) <= 4u &&
+                         ((bg_rgb >> 10) & 0x1Fu) <= 4u);
+    }
     for (int ty = ty0; ty <= ty1; ty++) {
         uint32_t idx = ((uint32_t)ty * width + (uint32_t)tx) * 2u;
         if (idx + 2u > 0x10000u) continue;
         uint16_t ptr = (uint16_t)(g_ram[0x10000u + idx] |
                                   (g_ram[0x10000u + idx + 1u] << 8));
         if ((uint32_t)ptr + 4u > 0x10000u) continue;
-        uint16_t bg1 = (uint16_t)(g_ram[0x10000u + ptr] |
-                                  (g_ram[0x10000u + ptr + 1u] << 8));
-        uint16_t bg2 = (uint16_t)(g_ram[0x10000u + ptr + 2u] |
-                                  (g_ram[0x10000u + ptr + 3u] << 8));
-        if (bg1 != 0xA800u || bg2 != 0xA800u) return true;
+        if (layer_mask & 0x01u) {
+            uint16_t bg1 = (uint16_t)(g_ram[0x10000u + ptr] |
+                                      (g_ram[0x10000u + ptr + 1u] << 8));
+            if (!SoeIsTileUniformVoid(ppu, 0, bg1, false)) return true;
+        }
+        if (layer_mask & 0x02u) {
+            uint16_t bg2 = (uint16_t)(g_ram[0x10000u + ptr + 2u] |
+                                      (g_ram[0x10000u + ptr + 3u] << 8));
+            if (bg2 == 0xA800u && bg2_only && !dark_backdrop) return true;
+            if (!SoeIsTileUniformVoid(ppu, 1, bg2, true)) return true;
+        }
     }
     return false;
 }
 
 static void SoeComputeRoomContentBoundsX(uint8_t width, uint8_t height,
                                          int16_t hscroll_cam, int16_t vscroll_cam,
-                                         int span, int *out_left_px, int *out_right_px)
+                                         int span, uint8_t layer_mask,
+                                         int *out_left_px, int *out_right_px)
 {
     *out_left_px = 0;
     *out_right_px = (int)width * 16;
@@ -8677,14 +8980,14 @@ static void SoeComputeRoomContentBoundsX(uint8_t width, uint8_t height,
 
     int seed_l = -1, seed_r = -1;
     for (int tx = view_l; tx <= view_r; tx++) {
-        if (SoeRoomColHasContent(width, height, tx, ty0, ty1)) {
+        if (SoeRoomColHasContent(width, height, tx, ty0, ty1, layer_mask)) {
             seed_l = tx;
             break;
         }
     }
     if (seed_l < 0) return;
     for (int tx = view_r; tx >= view_l; tx--) {
-        if (SoeRoomColHasContent(width, height, tx, ty0, ty1)) {
+        if (SoeRoomColHasContent(width, height, tx, ty0, ty1, layer_mask)) {
             seed_r = tx;
             break;
         }
@@ -8696,9 +8999,9 @@ static void SoeComputeRoomContentBoundsX(uint8_t width, uint8_t height,
     int stop_l = seed_l - max_probe;
     if (stop_l < 0) stop_l = 0;
     for (int tx = seed_l - 1; tx >= stop_l; tx--) {
-        if (SoeRoomColHasContent(width, height, tx, ty0, ty1)) {
+        if (SoeRoomColHasContent(width, height, tx, ty0, ty1, layer_mask)) {
             content_l = tx;
-        } else if (tx - 1 >= 0 && SoeRoomColHasContent(width, height, tx - 1, ty0, ty1)) {
+        } else if (tx - 1 >= 0 && SoeRoomColHasContent(width, height, tx - 1, ty0, ty1, layer_mask)) {
             content_l = tx;
         } else {
             *out_left_px = content_l * 16;
@@ -8710,9 +9013,9 @@ static void SoeComputeRoomContentBoundsX(uint8_t width, uint8_t height,
     int stop_r = seed_r + max_probe;
     if (stop_r >= (int)width) stop_r = (int)width - 1;
     for (int tx = seed_r + 1; tx <= stop_r; tx++) {
-        if (SoeRoomColHasContent(width, height, tx, ty0, ty1)) {
+        if (SoeRoomColHasContent(width, height, tx, ty0, ty1, layer_mask)) {
             content_r = tx;
-        } else if (tx + 1 < (int)width && SoeRoomColHasContent(width, height, tx + 1, ty0, ty1)) {
+        } else if (tx + 1 < (int)width && SoeRoomColHasContent(width, height, tx + 1, ty0, ty1, layer_mask)) {
             content_r = tx;
         } else {
             *out_right_px = (content_r + 1) * 16;
@@ -8738,9 +9041,19 @@ static void SoeComputeAnchoredWidescreenMargins(int extra, int16_t hscroll_cam, 
         stride_bytes == (uint16_t)room_w_tiles * 2u) {
         int eff_left_px = 0;
         int eff_right_px = (int)room_w_tiles * 16;
+        uint8_t layer_mask = 0x03u;
+        int16_t h1 = (int16_t)(uint16_t)(g_ram[0x010Eu] | (g_ram[0x010Fu] << 8));
+        int16_t h2 = (int16_t)(uint16_t)(g_ram[0x0112u] | (g_ram[0x0113u] << 8));
+        int16_t v1 = (int16_t)(uint16_t)(g_ram[0x0110u] | (g_ram[0x0111u] << 8));
+        int16_t v2 = (int16_t)(uint16_t)(g_ram[0x0114u] | (g_ram[0x0115u] << 8));
+        if (h1 != h2 || v1 != v2) {
+            const Ppu *ppu = (g_snes && g_snes->ppu) ? g_snes->ppu : NULL;
+            int cam_layer = SoeGetWorldCamScrollLayer(ppu, false);
+            layer_mask = (cam_layer == 1) ? 0x02u : 0x01u;
+        }
         SoePatchMapVoidTilemaps(room_id, room_w_tiles, room_h_tiles);
         SoeComputeRoomContentBoundsX(room_w_tiles, room_h_tiles, hscroll_cam, vscroll_cam,
-                                     span, &eff_left_px, &eff_right_px);
+                                     span, layer_mask, &eff_left_px, &eff_right_px);
         int eff_room_px_w = eff_right_px - eff_left_px;
         if (eff_room_px_w < 256) eff_room_px_w = 256;
 
@@ -9142,6 +9455,7 @@ void SoeBeginSimFrame(unsigned number)
     static const char *s_cli_export_maps_env = NULL;
     static const char *s_cli_export_music_env = NULL;
     static const char *s_cli_export_sfx_env = NULL;
+    static const char *s_cli_export_spc_env = NULL;
     if (!s_env_cached) {
         s_env_cached = true;
         s_open_menu_env = getenv("SOE_OPEN_MENU_TEST");
@@ -9151,6 +9465,7 @@ void SoeBeginSimFrame(unsigned number)
         s_cli_export_maps_env = getenv("SOE_EXPORT_ALL_MAPS");
         s_cli_export_music_env = getenv("SOE_EXPORT_ALL_MUSIC");
         s_cli_export_sfx_env = getenv("SOE_EXPORT_ALL_SFX");
+        s_cli_export_spc_env = getenv("SOE_EXPORT_ALL_SPC");
     }
     if (in_gameplay) {
         s_gameplay_frames++;
@@ -9224,12 +9539,8 @@ void SoeBeginSimFrame(unsigned number)
             g_ram[0x0A33] = 100; g_ram[0x0A35] = 100;
             g_ram[0x0A7D] = 100; g_ram[0x0A7F] = 100;
         }
-        g_ram[0x0B29] = 0x03;
         DebugExecuteWarpEx(m, true);
-        for (int f = 0; f < 30; f++) {
-            WatchdogFrameStart();
-            GameRunOneFrame();
-        }
+        SoeWaitForMapReady(m);
         uint16_t loaded = GetLoadedMapId();
         char path[128];
         snprintf(path, sizeof(path), "Extract/MAPS/map_%03u.png", (unsigned)m);
@@ -9261,6 +9572,18 @@ void SoeBeginSimFrame(unsigned number)
             fprintf(stderr, "[SFX Exporter] CLI --export-sfx requested...\n");
             int count = SoeExportAllSfx();
             fprintf(stderr, "[SFX Exporter] Complete: %d sound effects exported to ./Extract/SFX/\n", count);
+            exit(0);
+        }
+    }
+
+    if (s_cli_export_spc_env) {
+        if (g_window) {
+            SDL_HideWindow(g_window);
+        }
+        if (number == 10) {
+            fprintf(stderr, "[SPC Exporter] CLI --export-spc requested...\n");
+            int count = SoeExportAllSpc();
+            fprintf(stderr, "[SPC Exporter] Complete: %d tracks exported to ./Extract/SPC/\n", count);
             exit(0);
         }
     }

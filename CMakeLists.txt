@@ -34,8 +34,6 @@ endif()
 # Must precede the include: runner.cmake reads it to add the loader sources.
 set(SNESRECOMP_ENABLE_MODS ON CACHE BOOL
     "Mod package loader + trusted plugins (required for every title)" FORCE)
-add_library(OpenGL::GL INTERFACE IMPORTED)
-target_link_libraries(OpenGL::GL INTERFACE "/usr/lib/x86_64-linux-gnu/libGL.so.1")
 include(${SNESRECOMP_ROOT}/runner/runner.cmake)
 
 add_executable(SecretOfEvermoreSNESRecomp
@@ -47,13 +45,12 @@ add_executable(SecretOfEvermoreSNESRecomp
     src/slide_menu.c
     src/asset_cache.c
     src/coop_2p.c
+    src/spc_jukebox.c
 )
 set_target_properties(SecretOfEvermoreSNESRecomp PROPERTIES OUTPUT_NAME "Evertopia")
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
     target_compile_options(SecretOfEvermoreSNESRecomp PRIVATE -mavx2)
 endif()
-target_link_directories(SecretOfEvermoreSNESRecomp PRIVATE "/home/james/Desktop/TestFolder/deps/sysroot/usr/lib/x86_64-linux-gnu")
-target_link_libraries(SecretOfEvermoreSNESRecomp PRIVATE "/usr/lib/x86_64-linux-gnu/libGL.so.1")
 
 # ROM identity. rom_identity.txt is the one place the digests live: the build
 # turns it into snesrecomp_rom_identity.h (SNESRECOMP_ROM_EXPECTED_SHA256 and
