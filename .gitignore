@@ -25,3 +25,10 @@
 /input.ini
 
 .DS_Store
+
+# Android build artifacts & local signing keystore
+/android/.gradle/
+/android/app/build/
+/android/app/src/main/jniLibs/
+/android/app/*.keystore
+*.apk

@@ -393,7 +393,7 @@ enum {
 
 /* ── State Storage & Defaults ─────────────────────────────────────────────── */
 
-/* Defaults: 21:9 Ultrawide, 8:7 Pixel Aspect, 4x Scale, CRT Off, Bloom Off, Omnitopia Dialog, Bug fixes ON */
+/* Defaults: 21:9 Ultrawide, 8:7 Pixel Aspect, 4x Scale, CRT Off, Bloom Default, Ivor Tower Dialog, Sprite Interp Off, Bug fixes ON, Cheats OFF */
 static SoeWidescreenMode s_ws_mode = SOE_WS_21_9;
 static SoeHudPositionMode s_hud_mode = SOE_HUD_MOVE_LEFT;
 static int s_crt_mode = 0;
@@ -414,7 +414,7 @@ static char s_menu_toast[64] = {0};
 static int s_menu_toast_timer = 0;
 static bool s_pillarbox_enabled = true; /* Slideout toggle: Pillarboxes on/off */
 static bool s_lock_60fps = false;       /* Slideout toggle: false = High-Hz Subpixel Scroll (Auto Display Hz) */
-static bool s_interpolate_sprites = true; /* Slideout toggle: Subpixel sprite interpolation */
+static bool s_interpolate_sprites = false; /* Slideout toggle: Subpixel sprite interpolation */
 static bool s_enhanced_ring_menu = true;  /* Slideout toggle: Enhanced Ring Menu (smooth OAM + texel cache) */
 
 /* Enhanced Ring Menu opening curve: ~30% slower approach (~13 frames) than before
@@ -495,7 +495,7 @@ static void SoeInstallEnhancedRingMenuHooks(void)
 static bool s_eliminate_lag_frames = true; /* Slideout toggle: Fast CPU/DMA to eliminate SNES lag frames */
 static double s_active_pres_hz = 60.098811862;
 extern void snes_beam_frame_driver_set_fast_cpu(bool enabled);
-static SoeDialogTheme s_dialog_theme = DIALOG_THEME_OMNITOPIA;
+static SoeDialogTheme s_dialog_theme = DIALOG_THEME_IVOR_TOWER;
 static bool s_solid_dialog_bg = true;   /* Kept synced with s_dialog_theme != DIALOG_THEME_ORIGINAL */
 static bool s_dialog_capture_active = false;
 static int s_dialog_capture_h = 192;
@@ -562,10 +562,10 @@ static uint16_t s_warp_map_id = 0;
 static uint16_t s_warp_target_map = 0;
 static int s_warp_monitor_frames = 0;
 static int s_post_warp_walk_timer = 0;
-static bool s_walk_walls_active = true;
-static bool s_inf_hp_active = true;
+static bool s_walk_walls_active = false;
+static bool s_inf_hp_active = false;
 static bool s_inf_stamina_active = false;
-static bool s_one_hit_ko_active = true;
+static bool s_one_hit_ko_active = false;
 static uint16_t s_orig_boy_atk = 0;
 static uint16_t s_orig_dog_atk = 0;
 
@@ -2110,7 +2110,7 @@ static void SoeSaveDialogConfig(void)
 
 static void SoeLoadDialogConfig(void)
 {
-    s_dialog_theme = DIALOG_THEME_OMNITOPIA;
+    s_dialog_theme = DIALOG_THEME_IVOR_TOWER;
     s_solid_dialog_bg = true;
 
     const char *path = GetDialogConfigFilePath();
@@ -2187,7 +2187,7 @@ static void SoeLoadVideoConfig(void)
     s_hud_mode = SOE_HUD_MOVE_LEFT;
     s_pillarbox_enabled = true;
     s_lock_60fps = false;
-    s_interpolate_sprites = true;
+    s_interpolate_sprites = false;
     s_enhanced_ring_menu = true;
     s_eliminate_lag_frames = true;
     snes_beam_frame_driver_set_fast_cpu(true);
@@ -6667,21 +6667,27 @@ static void SoeResetVideoToDefault(bool show_toast)
     s_hud_mode = SOE_HUD_MOVE_LEFT;
     s_pillarbox_enabled = true;
     s_lock_60fps = false;
-    s_interpolate_sprites = true;
+    s_interpolate_sprites = false;
     s_enhanced_ring_menu = true;
     s_eliminate_lag_frames = true;
     snes_beam_frame_driver_set_fast_cpu(true);
     g_config.disable_frame_delay = false;
     SoeApplyWidescreenMode(SOE_WS_21_9);
-    s_dialog_theme = DIALOG_THEME_OMNITOPIA;
+    s_dialog_theme = DIALOG_THEME_IVOR_TOWER;
     s_solid_dialog_bg = true;
     SoeSaveDialogConfig();
     g_config.display_aspect = kSnesDisplayAspect_SquarePixels8x7; /* 8:7 Square */
     g_config.no_sprite_limits = true;
     snesrecomp_set_window_scale(4);
+#ifdef __ANDROID__
     if (g_config.fullscreen != 1) {
         snesrecomp_set_fullscreen(1);
     }
+#else
+    if (g_config.fullscreen != 0) {
+        snesrecomp_set_fullscreen(0);
+    }
+#endif
     snesrecomp_set_vsync(1);
     snesrecomp_set_triple_buffering(1);
     g_config.enable_audio = true;
@@ -6704,10 +6710,10 @@ static void SoeResetAllToDefault(void)
     s_fix_atlas_underflow = true;
     s_fix_dog_leveling = true;
     s_fix_softlocks = true;
-    s_inf_hp_active = true;
+    s_inf_hp_active = false;
     s_inf_stamina_active = false;
-    s_one_hit_ko_active = true;
-    s_walk_walls_active = true;
+    s_one_hit_ko_active = false;
+    s_walk_walls_active = false;
     s_jukebox_lock_song = true;
     SoeResetVideoToDefault(false);
     SoeApplyDefaultBloomSettings();

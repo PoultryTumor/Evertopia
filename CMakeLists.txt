@@ -36,7 +36,7 @@ set(SNESRECOMP_ENABLE_MODS ON CACHE BOOL
     "Mod package loader + trusted plugins (required for every title)" FORCE)
 include(${SNESRECOMP_ROOT}/runner/runner.cmake)
 
-add_executable(SecretOfEvermoreSNESRecomp
+set(_SOE_SOURCES
     ${SNESRECOMP_RUNNER_SOURCES}
     src/main.c
     src/host_contract.c
@@ -47,7 +47,14 @@ add_executable(SecretOfEvermoreSNESRecomp
     src/coop_2p.c
     src/spc_jukebox.c
 )
-set_target_properties(SecretOfEvermoreSNESRecomp PROPERTIES OUTPUT_NAME "Evertopia")
+if(ANDROID)
+    add_library(SecretOfEvermoreSNESRecomp SHARED ${_SOE_SOURCES} android/stb_image_android.c)
+    set_target_properties(SecretOfEvermoreSNESRecomp PROPERTIES OUTPUT_NAME "main")
+    target_link_options(SecretOfEvermoreSNESRecomp PRIVATE -Wl,-z,max-page-size=16384)
+else()
+    add_executable(SecretOfEvermoreSNESRecomp ${_SOE_SOURCES})
+    set_target_properties(SecretOfEvermoreSNESRecomp PROPERTIES OUTPUT_NAME "Evertopia")
+endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
     target_compile_options(SecretOfEvermoreSNESRecomp PRIVATE -mavx2)
 endif()
@@ -98,6 +105,19 @@ target_compile_definitions(SecretOfEvermoreSNESRecomp PRIVATE
     SNES_GAME_VERSION="${SNESRECOMP_BUILD_VERSION}"
     SNES_GAME_TITLE="Secret of Evermore"
 )
+if(ANDROID AND NOT TARGET SDL3::SDL3 AND DEFINED SNESRECOMP_SDL3_SOURCE_DIR AND EXISTS "${SNESRECOMP_SDL3_SOURCE_DIR}/CMakeLists.txt")
+    # SDLActivity loads libSDL3.so then libmain.so; build SDL3 shared on Android.
+    set(SDL_SHARED ON CACHE BOOL "" FORCE)
+    set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+    set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+    set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+    set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${SNESRECOMP_SDL3_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/sdl3-android" EXCLUDE_FROM_ALL)
+    if(TARGET SDL3::SDL3-shared)
+        target_link_options(SDL3-shared PRIVATE -Wl,-z,max-page-size=16384)
+    endif()
+endif()
 snesrecomp_target_sdl(SecretOfEvermoreSNESRecomp)
 
 # The desktop host: launcher flow, ROM resolution, config.ini + [KeyMap],
@@ -107,10 +127,12 @@ snesrecomp_target_sdl(SecretOfEvermoreSNESRecomp)
 # hooks; the host is the framework's and improves on a submodule pull.
 # Add TIER2 once this port reads the interpreter-gap manifest after each run.
 snesrecomp_target_desktop_host(SecretOfEvermoreSNESRecomp)
-# rom.cfg (the ROM the wizard set this project up from; git-ignored) is
-# staged beside the executable when none is there yet, so the first launch
-# opens on that dump rather than asking for one.
-snesrecomp_target_rom_cache(SecretOfEvermoreSNESRecomp)
+if(NOT ANDROID)
+    # rom.cfg (the ROM the wizard set this project up from; git-ignored) is
+    # staged beside the executable when none is there yet, so the first launch
+    # opens on that dump rather than asking for one.
+    snesrecomp_target_rom_cache(SecretOfEvermoreSNESRecomp)
+endif()
 
 # Shared Dear ImGui pre-boot launcher (ROM picker, verification, display /
 # audio / input settings). Self-contained: it brings its own ImGui, GL link and
@@ -129,16 +151,22 @@ include(${RECOMP_UI_ROOT}/recomp_ui.cmake)
 recomp_target_launcher_ui(SecretOfEvermoreSNESRecomp CONSOLE snes
     BOXART "${CMAKE_SOURCE_DIR}/launcher_assets/img/boxart.tga")
 
-# Generate & rebuild from inside the launcher: pick ROM -> recompile locally
-# -> cmake --build -> relaunch. The implementation is the framework's; this
-# project contributes no configuration (snesrecomp_codegen_host_autowire in
-# src/main.c). recomp-ui/src is on the include path because the host speaks
-# RecompLauncherCGameInfo.
-target_sources(SecretOfEvermoreSNESRecomp PRIVATE
-    ${SNESRECOMP_ROOT}/host/snesrecomp_codegen_host.c)
-target_include_directories(SecretOfEvermoreSNESRecomp PRIVATE
-    ${SNESRECOMP_ROOT}/host
-    ${RECOMP_UI_ROOT}/src)
+if(NOT ANDROID)
+    # Generate & rebuild from inside the launcher: pick ROM -> recompile locally
+    # -> cmake --build -> relaunch. The implementation is the framework's; this
+    # project contributes no configuration (snesrecomp_codegen_host_autowire in
+    # src/main.c). recomp-ui/src is on the include path because the host speaks
+    # RecompLauncherCGameInfo.
+    target_sources(SecretOfEvermoreSNESRecomp PRIVATE
+        ${SNESRECOMP_ROOT}/host/snesrecomp_codegen_host.c)
+    target_include_directories(SecretOfEvermoreSNESRecomp PRIVATE
+        ${SNESRECOMP_ROOT}/host
+        ${RECOMP_UI_ROOT}/src)
+else()
+    target_include_directories(SecretOfEvermoreSNESRecomp PRIVATE
+        ${RECOMP_UI_ROOT}/src
+        ${SNESRECOMP_ROOT}/third_party)
+endif()
 
 # Netplay is not built into this target.
 # No multitap: two seats, one controller per port.

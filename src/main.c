@@ -45,10 +45,6 @@
 #define SDL_MAIN_HANDLED 1
 #endif
 #include "desktop/sdl_compat.h"
-#ifdef __ANDROID__
-/* SDLActivity loads libmain.so and dlsyms its SDL_main. */
-#define main SDL_main
-#endif
 
 #ifndef SNES_GAME_VERSION
 #define SNES_GAME_VERSION "dev"
@@ -76,7 +72,11 @@ static const char kSoeDefaultConfigIni[] =
     "WindowSize = Auto\n"
     "\n"
     "# Fullscreen mode (0=windowed, 1=desktop fullscreen, 2=fullscreen)\n"
+#ifdef __ANDROID__
     "Fullscreen = 1\n"
+#else
+    "Fullscreen = 0\n"
+#endif
     "\n"
     "# Window scale (1=100%, 2=200%, 3=300%, etc.)\n"
     "WindowScale = 4\n"
@@ -94,7 +94,7 @@ static const char kSoeDefaultConfigIni[] =
     "Mode7Scale = 8\n"
     "Mode7Supersample = 1\n"
     "DisplayAspect = 8:7\n"
-#ifdef __linux__
+#if defined(__linux__) && !defined(__ANDROID__)
     "OutputMethod = OpenGL\n"
     "LinearFiltering = 0\n"
     "Shader = \n"
@@ -102,6 +102,15 @@ static const char kSoeDefaultConfigIni[] =
     "FrameBlend = 0\n"
     "VSync = 1\n"
     "Renderer = opengl\n"
+    "TripleBuffering = 1\n"
+#elif defined(__ANDROID__)
+    "OutputMethod = SDL\n"
+    "LinearFiltering = 0\n"
+    "Shader = \n"
+    "Widescreen = 1\n"
+    "FrameBlend = 0\n"
+    "VSync = 1\n"
+    "Renderer = auto\n"
     "TripleBuffering = 1\n"
 #else
     "OutputMethod = SDL\n"
@@ -152,7 +161,7 @@ static const char kSoeDefaultConfigIni[] =
     "# controllers (Xbox, PlayStation, Switch Pro, etc.) auto-detect\n"
     "# when plugged in. Set to false to force keyboard-only.\n"
     "EnableGamepad1 = true\n"
-    "EnableGamepad2 = true\n"
+    "EnableGamepad2 = false\n"
     "\n"
     "# Default Xbox-layout mapping. Order matches kKeys_Controls:\n"
     "#   Up, Down, Left, Right, Select, Start, A, B, X, Y, L, R\n"
@@ -178,7 +187,11 @@ static void SoeConfigureLauncher(struct RecompLauncherCGameInfo *gi)
     memset(&s_default_settings, 0, sizeof(s_default_settings));
     s_default_settings.output_method = 0;    /* SDL */
     s_default_settings.window_scale  = 4;    /* 4x Native */
+#ifdef __ANDROID__
     s_default_settings.fullscreen    = 1;    /* Native Fullscreen */
+#else
+    s_default_settings.fullscreen    = 0;    /* Windowed */
+#endif
     s_default_settings.ignore_aspect = 0;
     s_default_settings.linear_filter = 0;    /* Sharp nearest pixels */
     s_default_settings.widescreen    = 1;
@@ -186,7 +199,7 @@ static void SoeConfigureLauncher(struct RecompLauncherCGameInfo *gi)
     s_default_settings.audio_freq    = 48000;
     s_default_settings.volume        = 20;
     s_default_settings.player_src[0] = 2;    /* Player 1: Gamepad */
-    s_default_settings.player_src[1] = 2;    /* Player 2: Gamepad */
+    s_default_settings.player_src[1] = 0;    /* Player 2: Disabled */
     for (int i = 0; i < RECOMP_LAUNCHER_MAX_PLAYERS; i++) {
         s_default_settings.deadzone[i] = 10; /* 10% (3277 / 32767) */
     }
@@ -194,7 +207,7 @@ static void SoeConfigureLauncher(struct RecompLauncherCGameInfo *gi)
     s_default_settings.aspect_index  = kSnesDisplayAspect_SquarePixels8x7; /* 8:7 */
     s_default_settings.vsync         = RECOMP_LAUNCHER_VSYNC_ON;
     s_default_settings.renderer      = 0;
-#ifdef __linux__
+#if defined(__linux__) && !defined(__ANDROID__)
     s_default_settings.output_method = 2;    /* OpenGL */
     if (gi->renderer_labels && gi->num_renderers > 0) {
         for (int i = 0; i < gi->num_renderers; i++) {
@@ -205,6 +218,10 @@ static void SoeConfigureLauncher(struct RecompLauncherCGameInfo *gi)
         }
     }
     snprintf(s_default_settings.renderer_id, sizeof(s_default_settings.renderer_id), "opengl");
+#elif defined(__ANDROID__)
+    s_default_settings.output_method = 0;    /* SDL (GLES2/Vulkan) */
+    s_default_settings.renderer      = 0;    /* Auto */
+    snprintf(s_default_settings.renderer_id, sizeof(s_default_settings.renderer_id), "auto");
 #else
     if (gi->renderer_labels && gi->num_renderers > 0) {
         for (int i = 0; i < gi->num_renderers; i++) {
@@ -287,9 +304,17 @@ static const SnesDesktopHostGame kGameHost = {
 
 #ifndef __ANDROID__
 #undef main   /* desktop: keep plain main() even if SDL_main.h remapped it */
-#endif
 int main(int argc, char **argv)
+#else
+__attribute__((visibility("default"))) int SDL_main(int argc, char **argv)
+#endif
 {
+#ifdef __ANDROID__
+    /* Prevent Android Back button / controller B-as-Back from killing the app. */
+    SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
+    /* Allow controllers to work cleanly even when USB/Bluetooth devices attach. */
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+#endif
     /* Check for --export-maps argument */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--export-maps") == 0) {

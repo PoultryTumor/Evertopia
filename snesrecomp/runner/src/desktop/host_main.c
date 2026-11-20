@@ -3867,7 +3867,11 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
   /* All relative I/O (config.ini, rom.cfg, saves/, last_run_report.json)
    * lands in the app's external files dir, which is adb-pushable. */
   {
+#if SNESRECOMP_SDL3
+    const char *storage = SDL_GetAndroidExternalStoragePath();
+#else
     const char *storage = SDL_AndroidGetExternalStoragePath();
+#endif
     if (storage) chdir(storage);
   }
 #endif

@@ -17027,7 +17027,11 @@ std::string asset(const char* rel) {
     if (is_absolute_path(path)) return path;
 
 #if defined(__ANDROID__)
+#if defined(LNG_SDL3)
+    const char* base = SDL_GetAndroidInternalStoragePath();
+#else
     const char* base = SDL_AndroidGetInternalStoragePath();
+#endif
 #else
     const char* base = SDL_GetBasePath();
 #endif
