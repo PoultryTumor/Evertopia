@@ -50,6 +50,12 @@ jobs:
         run: |
           set -euo pipefail
           bash snesrecomp/tools/ci/fetch_toolchain.sh --artifact windows-x64
+          if [[ -f "${TOOLCHAIN_DIR}/env.bat" ]]; then
+            echo "=== toolchain/env.bat (raw) ==="
+            cat -A "${TOOLCHAIN_DIR}/env.bat"
+            # Normalize to Windows CRLF so cmd.exe never mis-seeks lines.
+            python3 -c 'import pathlib, sys; p = pathlib.Path(sys.argv[1]); data = p.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"); p.write_bytes(data)' "${TOOLCHAIN_DIR}/env.bat"
+          fi
 
       - name: Configure and build Windows Setup Host
         run: |
