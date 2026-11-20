@@ -249,9 +249,10 @@ static void SoeConfigureLauncher(struct RecompLauncherCGameInfo *gi)
 static void SoeAfterSnesInit(void)
 {
     SoeInitUiSfx();
-    SoeAssetCacheInit();
 #ifdef __ANDROID__
-    SoeAndroidEnsureMapsExtracted();
+    SoeAndroidFirstBootExtract(SoeAssetCacheInit);
+#else
+    SoeAssetCacheInit();
 #endif
     SoeCoop2pInit();
 }

@@ -66,7 +66,7 @@ int SoeSaveStateSlot(int slot);
 int SoeLoadStateSlot(int slot);
 void SoeInitUiSfx(void);
 #ifdef __ANDROID__
-void SoeAndroidEnsureMapsExtracted(void);
+void SoeAndroidFirstBootExtract(void (*extract_cache_fn)(void));
 #endif
 void SoeEnsureLauncherMusicExtracted(void);
 void SoeMixUiAudio(int16_t *pcm, int frames, int channels, int sample_rate);

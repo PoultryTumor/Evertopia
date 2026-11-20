@@ -5085,6 +5085,76 @@ static void SoeWaitForMapReady(uint16_t target_map)
  * Export All Maps: Creates ./MAPS/ folder and iterates through maps 0..126,
  * warping to each, waiting for decompression, and writing MAPS/map_%03u.png.
  */
+#ifdef __ANDROID__
+static SDL_Window   *s_android_ext_win = NULL;
+static SDL_Renderer *s_android_ext_ren = NULL;
+static SDL_Texture  *s_android_ext_tex = NULL;
+static uint32_t      s_android_ext_fb[320 * 180];
+
+static void SoeAndroidDrawExtractProgress(const char *subtitle, int pct)
+{
+    if (!s_android_ext_ren || !s_android_ext_tex) return;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+
+    const int W = 320, H = 180;
+    /* Dark Evertopia backdrop */
+    for (int i = 0; i < W * H; i++) {
+        s_android_ext_fb[i] = 0xFF0E131Cu;
+    }
+
+    /* Centered card panel */
+    const int px = 28, py = 36, pw = 264, ph = 108;
+    for (int y = py; y < py + ph; y++) {
+        for (int x = px; x < px + pw; x++) {
+            bool border = (x == px || x == px + pw - 1 || y == py || y == py + ph - 1);
+            s_android_ext_fb[y * W + x] = border ? 0xFF5A78A8u : 0xFF182233u;
+        }
+    }
+
+    const char *title = "ONE-TIME ASSET EXTRACTION";
+    int tw = MeasureSmallText(title);
+    DrawSmallText(s_android_ext_fb, W, H, (W - tw) / 2, py + 14, title, 0xFFFFFFFFu);
+
+    const char *note = "Preparing sprites, tilesets & maps (first launch only)";
+    int nw = MeasureSmallText(note);
+    DrawSmallText(s_android_ext_fb, W, H, (W - nw) / 2, py + 28, note, 0xFF9EB4D4u);
+
+    if (subtitle && subtitle[0]) {
+        int sw = MeasureSmallText(subtitle);
+        DrawSmallText(s_android_ext_fb, W, H, (W - sw) / 2, py + 48, subtitle, 0xFFD8E8FFu);
+    }
+
+    /* Progress bar */
+    const int bx = px + 22, by = py + 64, bw = pw - 44, bh = 14;
+    int fill_w = (bw - 2) * pct / 100;
+    for (int y = by; y < by + bh; y++) {
+        for (int x = bx; x < bx + bw; x++) {
+            bool border = (x == bx || x == bx + bw - 1 || y == by || y == by + bh - 1);
+            if (border) {
+                s_android_ext_fb[y * W + x] = 0xFF7FA6DCu;
+            } else if (x - (bx + 1) < fill_w) {
+                s_android_ext_fb[y * W + x] = 0xFF3CC8FFu;
+            } else {
+                s_android_ext_fb[y * W + x] = 0xFF0B1018u;
+            }
+        }
+    }
+
+    char pct_buf[32];
+    snprintf(pct_buf, sizeof(pct_buf), "%d%%", pct);
+    int pct_w = MeasureSmallText(pct_buf);
+    DrawSmallText(s_android_ext_fb, W, H, (W - pct_w) / 2, by + bh + 8, pct_buf, 0xFF70F0B8u);
+
+    SDL_UpdateTexture(s_android_ext_tex, NULL, s_android_ext_fb, W * (int)sizeof(uint32_t));
+    SDL_SetRenderDrawColor(s_android_ext_ren, 14, 19, 28, 255);
+    SDL_RenderClear(s_android_ext_ren);
+    SDL_RenderTexture(s_android_ext_ren, s_android_ext_tex, NULL, NULL);
+    SDL_RenderPresent(s_android_ext_ren);
+    SDL_PumpEvents();
+}
+#endif
+
 int SoeExportAllMaps(void)
 {
     WatchdogSetEnabled(0);
@@ -5172,7 +5242,13 @@ int SoeExportAllMaps(void)
             fclose(pf);
         }
 #ifdef __ANDROID__
-        SDL_PumpEvents();
+        {
+            char prog_line[64];
+            int pct = 10 + ((int)(m + 1) * 90) / 127;
+            if (pct > 99) pct = 99;
+            snprintf(prog_line, sizeof(prog_line), "Extracting Maps (%u / 127)...", (unsigned)(m + 1));
+            SoeAndroidDrawExtractProgress(prog_line, pct);
+        }
 #endif
     }
 
@@ -5210,7 +5286,7 @@ int SoeExportAllMaps(void)
 }
 
 #ifdef __ANDROID__
-void SoeAndroidEnsureMapsExtracted(void)
+void SoeAndroidFirstBootExtract(void (*extract_cache_fn)(void))
 {
     bool maps_ready = false;
     FILE *pf = fopen("Extract/MAPS/progress.txt", "r");
@@ -5225,10 +5301,29 @@ void SoeAndroidEnsureMapsExtracted(void)
         }
         fclose(pf);
     }
+
     if (maps_ready) {
+        if (extract_cache_fn) extract_cache_fn();
         fprintf(stderr, "[Android] Extract/MAPS/ already present; skipping map rip.\n");
         return;
     }
+
+    /* Open a temporary fullscreen progress window while extracting one-time assets */
+    s_android_ext_win = SDL_CreateWindow("Evertopia - Asset Extraction", 0, 0, SDL_WINDOW_FULLSCREEN);
+    if (s_android_ext_win) {
+        s_android_ext_ren = SDL_CreateRenderer(s_android_ext_win, NULL);
+        if (s_android_ext_ren) {
+            s_android_ext_tex = SDL_CreateTexture(s_android_ext_ren, SDL_PIXELFORMAT_ARGB8888,
+                                                  SDL_TEXTUREACCESS_STREAMING, 320, 180);
+            if (s_android_ext_tex) {
+                SDL_SetTextureScaleMode(s_android_ext_tex, SDL_SCALEMODE_NEAREST);
+            }
+        }
+    }
+
+    SoeAndroidDrawExtractProgress("Extracting Sprites & Tilesets...", 2);
+    if (extract_cache_fn) extract_cache_fn();
+    SoeAndroidDrawExtractProgress("Initializing Map Extractor...", 10);
 
     fprintf(stderr, "[Android] First-boot map extraction starting (127 maps)...\n");
     fflush(stderr);
@@ -5239,6 +5334,7 @@ void SoeAndroidEnsureMapsExtracted(void)
     size_t boot_size = boot_snap ? RtlSaveSnapshotToMemory(boot_snap, boot_cap) : 0;
 
     int count = SoeExportAllMaps();
+    SoeAndroidDrawExtractProgress("Extraction Complete! Starting Game...", 100);
     fprintf(stderr, "[Android] First-boot map extraction complete (%d maps).\n", count);
     fflush(stderr);
 
@@ -5248,6 +5344,10 @@ void SoeAndroidEnsureMapsExtracted(void)
     free(boot_snap);
     snes_frame_counter = 0;
     s_debug_toast_timer = 0;
+
+    if (s_android_ext_tex) { SDL_DestroyTexture(s_android_ext_tex); s_android_ext_tex = NULL; }
+    if (s_android_ext_ren) { SDL_DestroyRenderer(s_android_ext_ren); s_android_ext_ren = NULL; }
+    if (s_android_ext_win) { SDL_DestroyWindow(s_android_ext_win); s_android_ext_win = NULL; }
 }
 #endif
 
