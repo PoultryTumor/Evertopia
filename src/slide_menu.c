@@ -9031,6 +9031,18 @@ static int SoeGetWorldCamScrollLayer(const Ppu *ppu, bool vertical)
     int16_t s2 = (int16_t)(uint16_t)(g_ram[a2] | (g_ram[a2 + 1u] << 8));
     if (s1 == s2) return 0;
 
+    /* Secret of Evermore's true world camera lives at $7E:0059 (X) / $7E:005B (Y).
+     * On parallax maps (e.g. Map 56 & Map 65 jungle canopy), the engine writes $0059/$005B
+     * directly to the playable world layer (BG2) and computes the other layer (BG1) at a
+     * parallax ratio (e.g. 1.25x). Matching $0059/$005B directly never flips layers mid-walk. */
+    uint16_t cam_addr = vertical ? 0x005Bu : 0x0059u;
+    int16_t cam = (int16_t)(uint16_t)(g_ram[cam_addr] | (g_ram[cam_addr + 1u] << 8));
+    int d1 = abs((int)s1 - (int)cam);
+    int d2 = abs((int)s2 - (int)cam);
+    if (d2 != d1) {
+        return (d2 < d1) ? 1 : 0;
+    }
+
     uint16_t ent = (uint16_t)(g_ram[0x0F3Eu] | (g_ram[0x0F3Fu] << 8));
     if (ent < 0x0100u || ent >= 0xF000u) {
         ent = (uint16_t)(g_ram[0x0F40u] | (g_ram[0x0F41u] << 8));

@@ -8,6 +8,10 @@ A native PC static recompilation port of **Secret of Evermore** (SNES, USA), bui
 
 ## What's New
 
+### v0.9.1
+- **Parallax Camera & Foliage Scrolling Fix (Map 65 & All Parallax Maps):** Fixed widescreen margin jumps and overhead foliage judder on parallax-scrolling maps (e.g. Map 65 — Prehistoria Jungle) by locking world-camera layer detection directly to Secret of Evermore's true WRAM camera (`$7E:0059` / `$7E:005B`).
+- **Android One-Time Asset Extraction & UI Polish:** On Android, first launch now automatically extracts sprites, tilesets, and all 127 maps with a live **"One-Time Asset Extraction"** progress bar and percentage screen before starting the game, and replaces desktop exit options with **Exit to Android Launcher**.
+
 ### v0.9.0
 - **Android APK Release (`arm64-v8a`):** Added an Android `.apk` installer (`Evertopia-0.9.0-android-arm64.apk`) with full SDL3 built-in, Bluetooth, and USB game controller support (tested for handhelds like the Mangmi Air X and Android tablets with USB controllers), immersive landscape display, first-boot Android file picker for selecting your legally owned ROM, and the full Evertopia Launcher as the opening screen.
 - **Updated Out-of-the-Box Defaults:** All cheats (*Infinite HP*, *Infinite Stamina*, *One-Hit KO*, *Walk Through Walls*) now default to **Off** out of the box (vanilla bug fixes remain **On**); default dialog theme updated to **Ivor Tower**, sprite interpolation defaults to **Off**, desktop defaults to windowed mode (native fullscreen on Android), and Player 1 Gamepad / Player 2 Disabled match standard single-player setup.
