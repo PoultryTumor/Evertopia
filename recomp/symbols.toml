@@ -177,11 +177,11 @@ emit = false
 note = "Entity step collision check; dynamically ROM-patched for Walk Through Walls"
 
 [[func]]
-name = "soe_8F_B9F8"
-addr = "b9f8"
-bank = 0x8f
+name = "soe_90_82A8"
+addr = "82a8"
+bank = 0x90
 emit = false
-note = "Running stamina drain; dynamically ROM-patched at $8F:BA71 for Infinite Stamina"
+note = "Running stamina drain; dynamically ROM-patched at $90:82B2 for Infinite Stamina"
 
 [[func]]
 name = "soe_8C_EA43"

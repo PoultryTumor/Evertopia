@@ -9935,14 +9935,32 @@ void SoeBeginSimFrame(unsigned number)
         /* Infinite HP is implemented as a ROM hook on the damage routine ($8F:C237); no RAM writes. */
 
         if (s_inf_stamina_active) {
-            /* Keep weapon attack charge gauge at 100% full power */
-            if (g_ram[0x4EB8] < 0x04) {
+            /* Keep Boy & Dog stamina at exactly 0x0400 (100% ready).
+             * 0x0400 is neutral/ready (low byte 0x00, high byte 0x04).
+             * Values >= 0x0401 indicate a weapon charge attack in progress ($8F:CE66),
+             * so never write a non-zero low byte when clamping to 100%, and preserve
+             * values > 0x0400 so holding Attack to charge Level 1-3 attacks still works. */
+            uint16_t boy_stam = (uint16_t)g_ram[0x4EB7] | ((uint16_t)g_ram[0x4EB8] << 8);
+            if (boy_stam < 0x0400u) {
+                g_ram[0x4EB7] = 0x00;
                 g_ram[0x4EB8] = 0x04;
-                g_ram[0x4EB7] = 0x04;
+                boy_stam = 0x0400u;
             }
-            if (g_ram[0x4F66] < 0x04) {
+            if (boy_stam == 0x0400u) {
+                /* Clear the 100% HUD linger timer ($0B4D) so the bar stays blank */
+                g_ram[0x0B4D] = 0x00;
+                g_ram[0x0B4E] = 0x00;
+            }
+            uint16_t dog_stam = (uint16_t)g_ram[0x4F65] | ((uint16_t)g_ram[0x4F66] << 8);
+            if (dog_stam < 0x0400u) {
+                g_ram[0x4F65] = 0x00;
                 g_ram[0x4F66] = 0x04;
-                g_ram[0x4F65] = 0x04;
+                dog_stam = 0x0400u;
+            }
+            if (dog_stam == 0x0400u) {
+                /* Clear the Dog 100% HUD linger timer ($0B4F) so the bar stays blank */
+                g_ram[0x0B4F] = 0x00;
+                g_ram[0x0B50] = 0x00;
             }
         }
 
@@ -10014,12 +10032,19 @@ void SoeBeginSimFrame(unsigned number)
         }
     }
 
-    /* Running Stamina Patch in ROM ($8F:BA70) */
-    if (rom && g_snes->cart->romSize >= 0x0FBA75u) {
+    /* Running Stamina Patch in ROM ($90:82B2 -> ROM offset 0x1082B2).
+     * Original: LDA $0016,Y (B9 16 00) followed by stamina drain and JMP $8279.
+     * Patched:  JMP $8279   (4C 79 82) to skip stamina drain completely while running,
+     * keeping $002E,Y at 0x0400 so the stamina bar stays completely blank. */
+    if (rom && g_snes->cart->romSize >= 0x1082B5u) {
         if (s_inf_stamina_active) {
-            rom[0x0FBA71] = 0x00; /* SBC #0: running never depletes stamina */
+            rom[0x1082B2] = 0x4C; /* JMP $8279 */
+            rom[0x1082B3] = 0x79;
+            rom[0x1082B4] = 0x82;
         } else {
-            rom[0x0FBA71] = 0x0A; /* SBC #10: authentic running stamina drain */
+            rom[0x1082B2] = 0xB9; /* LDA $0016,Y (authentic running stamina drain) */
+            rom[0x1082B3] = 0x16;
+            rom[0x1082B4] = 0x00;
         }
     }
 

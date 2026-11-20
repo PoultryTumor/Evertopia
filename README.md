@@ -8,6 +8,11 @@ A native PC static recompilation port of **Secret of Evermore** (SNES, USA), bui
 
 ## What's New
 
+### v0.9.4
+- **Infinite Stamina Fix (Clean Bar & No Sword-Slash Lockout):** Fixed the Infinite Stamina debug toggle so the stamina bar stays completely blank with zero flickering/glitching while running or attacking, and fixed the bug where slashing a sword caused nonstop slashing and locked out player control.
+  - Clamped Boy (`$4EB7`) and Dog (`$4F65`) stamina to exact `0x0400` (100% neutral/ready) instead of `0x0404` (which crossed the `>= 0x0401` weapon-charge threshold at `$8F:CE66` and triggered infinite attacks), while still preserving values `> 0x0400` so holding Attack for Level 1–3 weapon charges continues to work.
+  - Cleared the `"100%"` HUD linger timers (`$0B4D` / `$0B4F`) at `0x0400` and relocated the runtime running-stamina ROM patch from the mistaken `$8F:BA71` address to the real running-drain routine at `$90:82B2` (with `$90:82A8` forced to LLE in `symbols.toml`).
+
 ### v0.9.3
 - **Windows x64 Setup Pack Fix (Still Experimental):** Fixed the `ninja: error: unknown target 'Evertopia'` build failure during first-run setup by aligning the desktop CMake target name with the `Evertopia` executable (also shortening Windows `.obj` paths by 17 characters to help avoid `PATH_MAX` warnings). *Tip: on Windows, extract the zip into a short folder path like `C:\Games\Evertopia` to stay well under Windows' 260-character path limit.*
 - **Clean Windows Zip Packaging & Rebuild Script:** Removed the accidentally embedded `evertopia-0.1.0-linux-x64.zip` from the repository/Windows pack, fixed the Windows deferred rebuild script (`recomp_deferred_rebuild.cmd`) so `cmake --build` exit codes are no longer masked by PowerShell piping and paths use clean Windows backslashes, enabled `SLICE8` CRC32 by default for all player builds, and defaulted Windows SDL3 renderer selection to `Auto` (prefers Vulkan when available with clean Direct3D/OpenGL fallback).

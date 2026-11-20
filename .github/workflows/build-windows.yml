@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Existing GitHub Release tag to attach the Windows zip to (e.g. v0.9.3)'
+        description: 'Existing GitHub Release tag to attach the Windows zip to (e.g. v0.9.4)'
         type: string
-        default: 'v0.9.3'
+        default: 'v0.9.4'
       embed_toolchain:
         description: 'Embed portable cmake-clang-v1 Windows toolchain (~200 MB, zero installs for players)'
         type: boolean
