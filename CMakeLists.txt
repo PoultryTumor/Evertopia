@@ -34,6 +34,8 @@ endif()
 # Must precede the include: runner.cmake reads it to add the loader sources.
 set(SNESRECOMP_ENABLE_MODS ON CACHE BOOL
     "Mod package loader + trusted plugins (required for every title)" FORCE)
+set(SNESRECOMP_CRC32_IMPL "SLICE8" CACHE STRING
+    "IEEE CRC implementation (BYTE or SLICE8)")
 include(${SNESRECOMP_ROOT}/runner/runner.cmake)
 
 set(_SOE_SOURCES
@@ -48,22 +50,26 @@ set(_SOE_SOURCES
     src/spc_jukebox.c
 )
 if(ANDROID)
-    add_library(SecretOfEvermoreSNESRecomp SHARED ${_SOE_SOURCES} android/stb_image_android.c)
-    set_target_properties(SecretOfEvermoreSNESRecomp PROPERTIES OUTPUT_NAME "main")
-    target_link_options(SecretOfEvermoreSNESRecomp PRIVATE -Wl,-z,max-page-size=16384)
+    set(_SOE_TARGET SecretOfEvermoreSNESRecomp)
+    add_library(${_SOE_TARGET} SHARED ${_SOE_SOURCES} android/stb_image_android.c)
+    set_target_properties(${_SOE_TARGET} PROPERTIES OUTPUT_NAME "main")
+    target_link_options(${_SOE_TARGET} PRIVATE -Wl,-z,max-page-size=16384)
 else()
-    add_executable(SecretOfEvermoreSNESRecomp ${_SOE_SOURCES})
-    set_target_properties(SecretOfEvermoreSNESRecomp PROPERTIES OUTPUT_NAME "Evertopia")
+    # Keep the CMake target name identical to the executable name ("Evertopia")
+    # so snesrecomp_codegen_host_autowire() (`cmake --build --target Evertopia`)
+    # matches on both Windows and Linux setup packs, and object paths stay short.
+    set(_SOE_TARGET Evertopia)
+    add_executable(${_SOE_TARGET} ${_SOE_SOURCES})
 endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
-    target_compile_options(SecretOfEvermoreSNESRecomp PRIVATE -mavx2)
+    target_compile_options(${_SOE_TARGET} PRIVATE -mavx2)
 endif()
 
 # ROM identity. rom_identity.txt is the one place the digests live: the build
 # turns it into snesrecomp_rom_identity.h (SNESRECOMP_ROM_EXPECTED_SHA256 and
 # friends) for src/main.c, and tools/regen.sh, scripts/package_release.sh and
 # the release workflow read the same file. A revision bump is one edit there.
-snesrecomp_rom_identity(SecretOfEvermoreSNESRecomp ${CMAKE_SOURCE_DIR}/rom_identity.txt)
+snesrecomp_rom_identity(${_SOE_TARGET} ${CMAKE_SOURCE_DIR}/rom_identity.txt)
 
 # Generated recompiler output. Not committed: it is derived from a copyrighted
 # ROM, so every developer regenerates it locally from their own copy -- and a
@@ -73,7 +79,7 @@ snesrecomp_rom_identity(SecretOfEvermoreSNESRecomp ${CMAKE_SOURCE_DIR}/rom_ident
 # That is what release zips contain; the player's machine produces the
 # playable binary from their own ROM. Without the option an empty src/gen/ is
 # still a hard error (the framework owns the message).
-snesrecomp_target_generated_code(SecretOfEvermoreSNESRecomp ${CMAKE_SOURCE_DIR}/src/gen)
+snesrecomp_target_generated_code(${_SOE_TARGET} ${CMAKE_SOURCE_DIR}/src/gen)
 
 # The mod catalog. This names WHERE the packages are; the framework owns the
 # layout they are staged into beside the executable, and stages them on every
@@ -88,11 +94,11 @@ snesrecomp_target_generated_code(SecretOfEvermoreSNESRecomp ${CMAKE_SOURCE_DIR}/
 # workspace ended up shipping an empty Mods page and nothing said so. Declaring
 # it is now also enforced: a project with packages that never calls this fails
 # to configure.
-snesrecomp_target_mod_catalog(SecretOfEvermoreSNESRecomp ${CMAKE_SOURCE_DIR}/mods/preloaded)
+snesrecomp_target_mod_catalog(${_SOE_TARGET} ${CMAKE_SOURCE_DIR}/mods/preloaded)
 # Any other directory the game reads exe-relative (a translations/ table, ...)
 # is staged with snesrecomp_target_stage_dir, never with a separate ALL target.
 
-target_include_directories(SecretOfEvermoreSNESRecomp PRIVATE
+target_include_directories(${_SOE_TARGET} PRIVATE
     ${SNESRECOMP_RUNNER_INCLUDE_DIRS}
     # common_rtl.c includes "config.h": the desktop key-map / Config contract
     # the framework host supplies (snesrecomp_target_desktop_host below).
@@ -100,8 +106,8 @@ target_include_directories(SecretOfEvermoreSNESRecomp PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/recomp
 )
-target_link_libraries(SecretOfEvermoreSNESRecomp PRIVATE ${SNESRECOMP_RUNNER_LIBRARIES})
-target_compile_definitions(SecretOfEvermoreSNESRecomp PRIVATE
+target_link_libraries(${_SOE_TARGET} PRIVATE ${SNESRECOMP_RUNNER_LIBRARIES})
+target_compile_definitions(${_SOE_TARGET} PRIVATE
     SNES_GAME_VERSION="${SNESRECOMP_BUILD_VERSION}"
     SNES_GAME_TITLE="Secret of Evermore"
 )
@@ -118,7 +124,7 @@ if(ANDROID AND NOT TARGET SDL3::SDL3 AND DEFINED SNESRECOMP_SDL3_SOURCE_DIR AND 
         target_link_options(SDL3-shared PRIVATE -Wl,-z,max-page-size=16384)
     endif()
 endif()
-snesrecomp_target_sdl(SecretOfEvermoreSNESRecomp)
+snesrecomp_target_sdl(${_SOE_TARGET})
 
 # The desktop host: launcher flow, ROM resolution, config.ini + [KeyMap],
 # window + SDL/OpenGL presenters, audio, gamepads, the save-state browser and
@@ -126,12 +132,12 @@ snesrecomp_target_sdl(SecretOfEvermoreSNESRecomp)
 # report. src/main.c is the shim that names this title and supplies its
 # hooks; the host is the framework's and improves on a submodule pull.
 # Add TIER2 once this port reads the interpreter-gap manifest after each run.
-snesrecomp_target_desktop_host(SecretOfEvermoreSNESRecomp)
+snesrecomp_target_desktop_host(${_SOE_TARGET})
 if(NOT ANDROID)
     # rom.cfg (the ROM the wizard set this project up from; git-ignored) is
     # staged beside the executable when none is there yet, so the first launch
     # opens on that dump rather than asking for one.
-    snesrecomp_target_rom_cache(SecretOfEvermoreSNESRecomp)
+    snesrecomp_target_rom_cache(${_SOE_TARGET})
 endif()
 
 # Shared Dear ImGui pre-boot launcher (ROM picker, verification, display /
@@ -148,7 +154,7 @@ include(${RECOMP_UI_ROOT}/recomp_ui.cmake)
 # BOXART stages launcher_assets/img/boxart.tga beside the exe; the launcher
 # shows assets/img/boxart.tga by default. EXISTS-guarded in recomp_ui.cmake,
 # so this configures cleanly before any art is fetched.
-recomp_target_launcher_ui(SecretOfEvermoreSNESRecomp CONSOLE snes
+recomp_target_launcher_ui(${_SOE_TARGET} CONSOLE snes
     BOXART "${CMAKE_SOURCE_DIR}/launcher_assets/img/boxart.tga")
 
 if(NOT ANDROID)
@@ -157,13 +163,13 @@ if(NOT ANDROID)
     # project contributes no configuration (snesrecomp_codegen_host_autowire in
     # src/main.c). recomp-ui/src is on the include path because the host speaks
     # RecompLauncherCGameInfo.
-    target_sources(SecretOfEvermoreSNESRecomp PRIVATE
+    target_sources(${_SOE_TARGET} PRIVATE
         ${SNESRECOMP_ROOT}/host/snesrecomp_codegen_host.c)
-    target_include_directories(SecretOfEvermoreSNESRecomp PRIVATE
+    target_include_directories(${_SOE_TARGET} PRIVATE
         ${SNESRECOMP_ROOT}/host
         ${RECOMP_UI_ROOT}/src)
 else()
-    target_include_directories(SecretOfEvermoreSNESRecomp PRIVATE
+    target_include_directories(${_SOE_TARGET} PRIVATE
         ${RECOMP_UI_ROOT}/src
         ${SNESRECOMP_ROOT}/third_party)
 endif()

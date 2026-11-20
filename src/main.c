@@ -119,7 +119,7 @@ static const char kSoeDefaultConfigIni[] =
     "Widescreen = 1\n"
     "FrameBlend = 0\n"
     "VSync = 1\n"
-    "Renderer = vulkan\n"
+    "Renderer = auto\n"
     "TripleBuffering = 1\n"
 #endif
     "[Sound]\n"
@@ -223,15 +223,9 @@ static void SoeConfigureLauncher(struct RecompLauncherCGameInfo *gi)
     s_default_settings.renderer      = 0;    /* Auto */
     snprintf(s_default_settings.renderer_id, sizeof(s_default_settings.renderer_id), "auto");
 #else
-    if (gi->renderer_labels && gi->num_renderers > 0) {
-        for (int i = 0; i < gi->num_renderers; i++) {
-            if (gi->renderer_labels[i] && strcmp(gi->renderer_labels[i], "Vulkan") == 0) {
-                s_default_settings.renderer = i;
-                break;
-            }
-        }
-    }
-    snprintf(s_default_settings.renderer_id, sizeof(s_default_settings.renderer_id), "vulkan");
+    s_default_settings.output_method = 0;    /* SDL (Auto: Vulkan/Direct3D/OpenGL) */
+    s_default_settings.renderer      = 0;    /* Auto */
+    snprintf(s_default_settings.renderer_id, sizeof(s_default_settings.renderer_id), "auto");
 #endif
     s_default_settings.frame_blend   = 0;
     s_default_settings.run_ahead     = 0;

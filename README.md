@@ -8,6 +8,11 @@ A native PC static recompilation port of **Secret of Evermore** (SNES, USA), bui
 
 ## What's New
 
+### v0.9.3
+- **Windows x64 Setup Pack Fix (Still Experimental):** Fixed the `ninja: error: unknown target 'Evertopia'` build failure during first-run setup by aligning the desktop CMake target name with the `Evertopia` executable (also shortening Windows `.obj` paths by 17 characters to help avoid `PATH_MAX` warnings). *Tip: on Windows, extract the zip into a short folder path like `C:\Games\Evertopia` to stay well under Windows' 260-character path limit.*
+- **Clean Windows Zip Packaging & Rebuild Script:** Removed the accidentally embedded `evertopia-0.1.0-linux-x64.zip` from the repository/Windows pack, fixed the Windows deferred rebuild script (`recomp_deferred_rebuild.cmd`) so `cmake --build` exit codes are no longer masked by PowerShell piping and paths use clean Windows backslashes, enabled `SLICE8` CRC32 by default for all player builds, and defaulted Windows SDL3 renderer selection to `Auto` (prefers Vulkan when available with clean Direct3D/OpenGL fallback).
+- **Automated Windows Smoke Test:** GitHub Actions now unpacks the freshly built Windows Setup Pack into a path containing spaces/parentheses and verifies a full configure + `--target Evertopia` build using only the embedded toolchain before publishing. *(Windows remains marked **Experimental** until tested on a physical Windows PC.)*
+
 ### v0.9.2
 - **Clean Debug Map Warp (Sprites, Palettes & Full BG Load):** Relocated the injected debug warp script out of Secret of Evermore's live `$80:9479..$80:94D8` sprite/OAM attribute table into unused `$81:98E8..$81:98EE` padding, eliminating permanent post-warp sprite/palette corruption across all maps.
 - **Uninterrupted Post-Warp Tilemap Upload:** Fixed `[Warp Monitor]` prematurely clearing SNES Forced Blank (`$0106` bit 7) on the first frame after a map ID change; rooms now finish draining VRAM/CGRAM/tilemap/sprite DMA queues and fade in cleanly via `Opcode 0x26` + `SoeRoomTransitionDrainIfReady()` with no black initial viewport.

@@ -32,3 +32,4 @@
 /android/app/src/main/jniLibs/
 /android/app/*.keystore
 *.apk
+*.zip

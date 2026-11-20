@@ -1215,6 +1215,17 @@ static void bat_write_set(FILE* f, const char* name, const char* value) {
     fprintf(f, "\"\r\n");
 }
 
+static void bat_write_set_path(FILE* f, const char* name, const char* value) {
+    fprintf(f, "set \"%s=", name);
+    for (const char* p = value; *p; ++p) {
+        char c = (*p == '/') ? '\\' : *p;
+        if (c == '%')
+            fputc('%', f);
+        fputc(c, f);
+    }
+    fprintf(f, "\"\r\n");
+}
+
 static int write_windows_deferred_rebuild_helper(char* err_msg, size_t err_cap) {
     if (!join_path(g_helper_path, sizeof(g_helper_path), g_build_dir,
                    "recomp_deferred_rebuild.cmd")) {
@@ -1234,13 +1245,13 @@ static int write_windows_deferred_rebuild_helper(char* err_msg, size_t err_cap) 
     fprintf(f, "setlocal EnableExtensions\r\n");
     fprintf(f, "title %s - rebuilding\r\n", g_display);
     bat_write_set(f, "PARENT_PID", pid_buf);
-    bat_write_set(f, "CMAKE", g_cmake);
-    bat_write_set(f, "BUILD_DIR", g_build_dir);
-    bat_write_set(f, "EXE", g_exe_path);
-    bat_write_set(f, "ROOT", g_project_root);
+    bat_write_set_path(f, "CMAKE", g_cmake);
+    bat_write_set_path(f, "BUILD_DIR", g_build_dir);
+    bat_write_set_path(f, "EXE", g_exe_path);
+    bat_write_set_path(f, "ROOT", g_project_root);
     bat_write_set(f, "TARGET", g_cmake_target);
     bat_write_set(f, "DISPLAY", g_display);
-    bat_write_set(f, "PACK", g_toolchain_root);
+    bat_write_set_path(f, "PACK", g_toolchain_root);
     fprintf(f,
             "echo Waiting for %%DISPLAY%% to exit...\r\n"
             ":waitloop\r\n"
@@ -1263,7 +1274,7 @@ static int write_windows_deferred_rebuild_helper(char* err_msg, size_t err_cap) 
             "ForEach-Object { $_.LastWriteTime = Get-Date }\"\r\n"
             "  echo Configuring...\r\n"
             "  \"%%CMAKE%%\" -S \"%%ROOT%%\" -B \"%%BUILD_DIR%%\" -G Ninja "
-            "-DCMAKE_BUILD_TYPE=Release\r\n"
+            "-DCMAKE_BUILD_TYPE=Release -DSNESRECOMP_CRC32_IMPL=SLICE8\r\n"
             "  if errorlevel 1 (\r\n"
             "    echo.\r\n"
             "    echo Configure failed. Fix the errors above, then retry.\r\n"
@@ -1272,15 +1283,23 @@ static int write_windows_deferred_rebuild_helper(char* err_msg, size_t err_cap) 
             "  )\r\n"
             ")\r\n"
             "echo Building...\r\n"
-            /* The console shows the build live; the log keeps it for a
-             * failure report after the window has gone. */
-            "\"%%CMAKE%%\" --build \"%%BUILD_DIR%%\" --parallel "
-            "--target \"%%TARGET%%\" 2>&1 | "
-            "powershell -NoProfile -Command \"$input | Tee-Object -FilePath "
-            "'%%BUILD_DIR%%\\snesrecomp_rebuild.log' -Append\"\r\n"
+            /* Run cmake inside PowerShell so output streams live to console AND
+             * snesrecomp_rebuild.log while preserving cmake's real exit code
+             * (a cmd.exe pipe to powershell masks cmake's errorlevel as 0). */
+            "powershell -NoProfile -Command \"& $env:CMAKE --build $env:BUILD_DIR "
+            "--parallel --target $env:TARGET 2>&1 | Tee-Object -FilePath "
+            "(Join-Path $env:BUILD_DIR 'snesrecomp_rebuild.log') -Append; "
+            "exit $LASTEXITCODE\"\r\n"
             "if errorlevel 1 (\r\n"
             "  echo.\r\n"
             "  echo Build failed. Fix the errors above, then rebuild manually.\r\n"
+            "  pause\r\n"
+            "  exit /b 1\r\n"
+            ")\r\n"
+            "if not exist \"%%EXE%%\" (\r\n"
+            "  echo.\r\n"
+            "  echo Build finished but \"%%EXE%%\" was not created.\r\n"
+            "  echo Check \"%%BUILD_DIR%%\\snesrecomp_rebuild.log\" for details.\r\n"
             "  pause\r\n"
             "  exit /b 1\r\n"
             ")\r\n"

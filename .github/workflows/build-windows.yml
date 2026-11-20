@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Existing GitHub Release tag to attach the Windows zip to (e.g. v0.8.0)'
+        description: 'Existing GitHub Release tag to attach the Windows zip to (e.g. v0.9.3)'
         type: string
-        default: 'v0.9.1'
+        default: 'v0.9.3'
       embed_toolchain:
         description: 'Embed portable cmake-clang-v1 Windows toolchain (~200 MB, zero installs for players)'
         type: boolean
@@ -28,11 +28,15 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Assert no generated C in tree
+      - name: Assert clean tree (no generated C or stray zips)
         run: |
           set -euo pipefail
           if compgen -G 'src/gen/*.c' >/dev/null || [[ -f recomp/funcs.h ]]; then
             echo "::error::src/gen/*.c or recomp/funcs.h is present in the checkout."
+            exit 1
+          fi
+          if compgen -G '*.zip' >/dev/null; then
+            echo "::error::Stray .zip archive found in repo root: $(ls -1 *.zip)"
             exit 1
           fi
 
@@ -61,7 +65,7 @@ jobs:
             -DSNESRECOMP_CRC32_IMPL=SLICE8 \
             -DSNESRECOMP_ENABLE_TRACE=OFF \
             -DSNESRECOMP_BUILD_VERSION="${VER}"
-          cmake --build build-ci -j4 --target SecretOfEvermoreSNESRecomp
+          cmake --build build-ci -j4 --target Evertopia
           ls -lh build-ci/Evertopia.exe
 
       - name: Package Windows Setup Pack
@@ -74,6 +78,59 @@ jobs:
           fi
           bash scripts/package_release.sh build-ci windows-x64 "${ARGS[@]+"${ARGS[@]}"}"
           ls -lh dist/
+
+      - name: Smoke-test unpacked Windows Setup Pack (player rebuild flow)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = (Get-ChildItem -Path dist -Filter 'evertopia-*-windows-x64.zip' | Select-Object -First 1).FullName
+          if (-not $zip) { throw "Windows setup zip not found in dist/" }
+
+          # 1. Verify no stray .zip files or ROMs are embedded in the archive.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $arch = [System.IO.Compression.ZipFile]::OpenRead($zip)
+          try {
+            $bad = $arch.Entries | Where-Object { $_.FullName -match '\.(zip|smc|sfc|srm)$' }
+            if ($bad) {
+              throw "Forbidden files inside Windows zip: $($bad.FullName -join ', ')"
+            }
+          } finally {
+            $arch.Dispose()
+          }
+
+          # 2. Unpack into a directory with spaces & parentheses (like Windows Downloads/LaunchBox).
+          $smokeRoot = Join-Path $env:RUNNER_TEMP 'Evertopia Smoke (1)'
+          if (Test-Path $smokeRoot) { Remove-Item -Recurse -Force $smokeRoot }
+          Expand-Archive -Path $zip -DestinationPath $smokeRoot -Force
+          $packDir = (Get-ChildItem -Path $smokeRoot -Directory | Select-Object -First 1).FullName
+          Write-Host "Unpacked to: $packDir"
+
+          # 3. Verify key files exist.
+          foreach ($rel in @('Evertopia.exe', 'CMakeLists.txt', 'snesrecomp\snesrecomp_cli.py', 'recomp\bank00.cfg', 'toolchain\env.bat')) {
+            $p = Join-Path $packDir $rel
+            if (-not (Test-Path $p)) { throw "Missing required file in setup pack: $rel" }
+          }
+
+          # 4. Run the exact configure + --target Evertopia build using ONLY the embedded toolchain\env.bat.
+          $cmdScript = @"
+          @echo off
+          setlocal EnableExtensions
+          call "$packDir\toolchain\env.bat"
+          cd /d "$packDir"
+          cmake -S "$packDir" -B "$packDir\build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DSNESRECOMP_SETUP_HOST=ON -DSNESRECOMP_CRC32_IMPL=SLICE8
+          if errorlevel 1 exit /b 1
+          powershell -NoProfile -Command "& cmake --build '$packDir\build' --parallel --target Evertopia 2>&1 | Tee-Object -FilePath '$packDir\build\snesrecomp_rebuild.log' -Append; exit `$LASTEXITCODE"
+          if errorlevel 1 exit /b 1
+          if not exist "$packDir\build\Evertopia.exe" exit /b 1
+          "@
+          $cmdFile = Join-Path $smokeRoot 'smoke_build.cmd'
+          Set-Content -Path $cmdFile -Value $cmdScript -Encoding Ascii
+          cmd.exe /c "`"$cmdFile`""
+          if ($LASTEXITCODE -ne 0) { throw "Embedded-toolchain player rebuild smoke test failed (exit $LASTEXITCODE)" }
+
+          $rebuilt = Get-Item (Join-Path $packDir 'build\Evertopia.exe')
+          Write-Host "Smoke test PASSED! Rebuilt: $($rebuilt.FullName) ($($rebuilt.Length) bytes)"
+          Remove-Item -Recurse -Force $smokeRoot
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
