@@ -50,6 +50,10 @@ jobs:
         run: |
           set -euo pipefail
           bash snesrecomp/tools/ci/fetch_toolchain.sh --artifact windows-x64
+
+      - name: Normalize toolchain/env.bat line endings
+        run: |
+          set -euo pipefail
           if [[ -f "${TOOLCHAIN_DIR}/env.bat" ]]; then
             echo "=== toolchain/env.bat (raw) ==="
             cat -A "${TOOLCHAIN_DIR}/env.bat"
