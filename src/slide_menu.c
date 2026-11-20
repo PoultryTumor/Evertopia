@@ -140,9 +140,14 @@ enum {
     GAME_OPT_DIALOG_THEME = 6, /* Dialog Box Theme: Blue Glass (Default), Original (Dither) */
     GAME_OPT_RING_MENU = 7,    /* Ring Menu: Enhanced (Smooth + Cached) or Original */
     GAME_OPT_RESET_ALL = 8,    /* Reset All Settings to Default */
+#ifdef __ANDROID__
+    GAME_OPT_EXIT_TO_DESKTOP = 9, /* Save all settings and exit to Android launcher */
+    GAME_OPT_COUNT = 10
+#else
     GAME_OPT_EXIT_TO_LAUNCHER = 9, /* Save all settings and return to launcher */
     GAME_OPT_EXIT_TO_DESKTOP = 10, /* Save all settings and exit to desktop */
     GAME_OPT_COUNT = 11
+#endif
 };
 
 /* Tab 1: Gameplay Fixes */
@@ -5166,6 +5171,9 @@ int SoeExportAllMaps(void)
             fprintf(pf, "%u 127 %u\n", (unsigned)(m + 1), (unsigned)m);
             fclose(pf);
         }
+#ifdef __ANDROID__
+        SDL_PumpEvents();
+#endif
     }
 
     if (base_snap) {
@@ -5200,6 +5208,48 @@ int SoeExportAllMaps(void)
     s_debug_toast_timer = 240;
     return exported;
 }
+
+#ifdef __ANDROID__
+void SoeAndroidEnsureMapsExtracted(void)
+{
+    bool maps_ready = false;
+    FILE *pf = fopen("Extract/MAPS/progress.txt", "r");
+    if (pf) {
+        int cur = 0, total = 0;
+        if (fscanf(pf, "%d %d", &cur, &total) == 2 && cur >= 127 && total >= 127) {
+            FILE *probe = fopen("Extract/MAPS/map_001.png", "rb");
+            if (probe) {
+                fclose(probe);
+                maps_ready = true;
+            }
+        }
+        fclose(pf);
+    }
+    if (maps_ready) {
+        fprintf(stderr, "[Android] Extract/MAPS/ already present; skipping map rip.\n");
+        return;
+    }
+
+    fprintf(stderr, "[Android] First-boot map extraction starting (127 maps)...\n");
+    fflush(stderr);
+
+    extern int snes_frame_counter;
+    size_t boot_cap = RtlSaveSnapshotToMemory(NULL, 0);
+    uint8_t *boot_snap = boot_cap ? (uint8_t *)malloc(boot_cap) : NULL;
+    size_t boot_size = boot_snap ? RtlSaveSnapshotToMemory(boot_snap, boot_cap) : 0;
+
+    int count = SoeExportAllMaps();
+    fprintf(stderr, "[Android] First-boot map extraction complete (%d maps).\n", count);
+    fflush(stderr);
+
+    if (boot_snap && boot_size > 0) {
+        RtlLoadSnapshotFromMemory(boot_snap, boot_size);
+    }
+    free(boot_snap);
+    snes_frame_counter = 0;
+    s_debug_toast_timer = 0;
+}
+#endif
 
 
 /* ── Music Dump ─────────────────────────────────────────────────────────
@@ -6421,6 +6471,14 @@ static void GetGameExitButtonBounds(int drawer_x, int drawer_w,
                                     int *out_lx, int *out_lw,
                                     int *out_dx, int *out_dw)
 {
+#ifdef __ANDROID__
+    int dw = MeasureSmallText("[ Exit to Android Launcher ]");
+    int start_x = drawer_x + (drawer_w - dw) / 2;
+    if (out_lx) *out_lx = start_x;
+    if (out_lw) *out_lw = 0;
+    if (out_dx) *out_dx = start_x;
+    if (out_dw) *out_dw = dw;
+#else
     int lw = MeasureSmallText("[ Exit to Launcher ]");
     int dw = MeasureSmallText("[ Exit to Desktop ]");
     int gap = 12;
@@ -6430,6 +6488,7 @@ static void GetGameExitButtonBounds(int drawer_x, int drawer_w,
     if (out_lw) *out_lw = lw;
     if (out_dx) *out_dx = start_x + lw + gap;
     if (out_dw) *out_dw = dw;
+#endif
 }
 
 /* ── 3-Slot Atomic Save States & Glass Toast Notification ─────────────────── */
@@ -6792,10 +6851,12 @@ static void AdjustTabOption(SoeMenuTab tab, int option_index, int direction)
             s_reset_confirm = RESET_CONFIRM_ALL;
             s_reset_confirm_choice = 1;
             break;
+#ifndef __ANDROID__
         case GAME_OPT_EXIT_TO_LAUNCHER:
             s_reset_confirm = RESET_CONFIRM_EXIT_LAUNCHER;
             s_reset_confirm_choice = 1;
             break;
+#endif
         case GAME_OPT_EXIT_TO_DESKTOP:
             s_reset_confirm = RESET_CONFIRM_EXIT_DESKTOP;
             s_reset_confirm_choice = 1;
@@ -7668,6 +7729,20 @@ static bool SDLCALL SlideMenuEventFilter(void *userdata, SDL_Event *event)
                     int count = GetTabOptionCount(s_active_tab);
                     int clicked_row = -1;
                     if (s_active_tab == TAB_GAME_OPTIONS) {
+#ifdef __ANDROID__
+                        int exit_y = GetGameTabRowY(GAME_OPT_EXIT_TO_DESKTOP);
+                        if (fy >= exit_y && fy < exit_y + 9) {
+                            clicked_row = GAME_OPT_EXIT_TO_DESKTOP;
+                        } else {
+                            for (int r = 0; r < GAME_OPT_EXIT_TO_DESKTOP; r++) {
+                                int ry = GetGameTabRowY(r);
+                                if (fy >= ry && fy < ry + 9) {
+                                    clicked_row = r;
+                                    break;
+                                }
+                            }
+                        }
+#else
                         int exit_y = GetGameTabRowY(GAME_OPT_EXIT_TO_LAUNCHER);
                         if (fy >= exit_y && fy < exit_y + 9) {
                             int lx = 0, lw = 0, dx = 0, dw = 0;
@@ -7682,6 +7757,7 @@ static bool SDLCALL SlideMenuEventFilter(void *userdata, SDL_Event *event)
                                 }
                             }
                         }
+#endif
                     } else if (s_active_tab == TAB_VIDEO_OPTIONS) {
                         int max_vis = (count < kAvVisibleRows) ? count : kAvVisibleRows;
                         if (fy >= start_y && fy < start_y + max_vis * row_h) {
@@ -7693,8 +7769,12 @@ static bool SDLCALL SlideMenuEventFilter(void *userdata, SDL_Event *event)
                     if (clicked_row >= 0 && clicked_row < count) {
                         int row = clicked_row;
                         s_tab_selected_row[s_active_tab] = row;
+#ifdef __ANDROID__
+                        bool is_exit_row = (s_active_tab == TAB_GAME_OPTIONS && row == GAME_OPT_EXIT_TO_DESKTOP);
+#else
                         bool is_exit_row = (s_active_tab == TAB_GAME_OPTIONS &&
                                             (row == GAME_OPT_EXIT_TO_LAUNCHER || row == GAME_OPT_EXIT_TO_DESKTOP));
+#endif
                         if (!is_exit_row || event->button.button == SDL_BUTTON_LEFT) {
                             SoePlayUiSfx(1);
                             AdjustTabOption(s_active_tab, row, (event->button.button == SDL_BUTTON_RIGHT) ? -1 : 1);
@@ -7732,6 +7812,20 @@ static bool SDLCALL SlideMenuEventFilter(void *userdata, SDL_Event *event)
                 int count = GetTabOptionCount(s_active_tab);
                 int hover_row = -1;
                 if (s_active_tab == TAB_GAME_OPTIONS) {
+#ifdef __ANDROID__
+                    int exit_y = GetGameTabRowY(GAME_OPT_EXIT_TO_DESKTOP);
+                    if (fy >= exit_y && fy < exit_y + 9) {
+                        hover_row = GAME_OPT_EXIT_TO_DESKTOP;
+                    } else {
+                        for (int r = 0; r < GAME_OPT_EXIT_TO_DESKTOP; r++) {
+                            int ry = GetGameTabRowY(r);
+                            if (fy >= ry && fy < ry + 9) {
+                                hover_row = r;
+                                break;
+                            }
+                        }
+                    }
+#else
                     int exit_y = GetGameTabRowY(GAME_OPT_EXIT_TO_LAUNCHER);
                     if (fy >= exit_y && fy < exit_y + 9) {
                         int lx = 0, lw = 0, dx = 0, dw = 0;
@@ -7746,6 +7840,7 @@ static bool SDLCALL SlideMenuEventFilter(void *userdata, SDL_Event *event)
                             }
                         }
                     }
+#endif
                 } else if (s_active_tab == TAB_VIDEO_OPTIONS) {
                     int max_vis = (count < kAvVisibleRows) ? count : kAvVisibleRows;
                     if (fy >= start_y && fy < start_y + max_vis * row_h) {
@@ -8046,23 +8141,29 @@ static void PollMenuKeyboardDirect(void)
             AdjustTabOption(s_active_tab, cur_row, 1);
         } else if (key_lf && !s_prev_key_lf) {
             /* Keyboard Left Arrow: step option backward (or switch Exit buttons) */
+#ifndef __ANDROID__
             if (s_active_tab == TAB_GAME_OPTIONS && (cur_row == GAME_OPT_EXIT_TO_DESKTOP || cur_row == GAME_OPT_EXIT_TO_LAUNCHER)) {
                 if (cur_row == GAME_OPT_EXIT_TO_DESKTOP) {
                     s_tab_selected_row[s_active_tab] = GAME_OPT_EXIT_TO_LAUNCHER;
                     SoePlayUiSfx(0);
                 }
-            } else {
+            } else
+#endif
+            {
                 SoePlayUiSfx(1);
                 AdjustTabOption(s_active_tab, cur_row, -1);
             }
         } else if (key_rt && !s_prev_key_rt) {
             /* Keyboard Right Arrow: step option forward (or switch Exit buttons) */
+#ifndef __ANDROID__
             if (s_active_tab == TAB_GAME_OPTIONS && (cur_row == GAME_OPT_EXIT_TO_DESKTOP || cur_row == GAME_OPT_EXIT_TO_LAUNCHER)) {
                 if (cur_row == GAME_OPT_EXIT_TO_LAUNCHER) {
                     s_tab_selected_row[s_active_tab] = GAME_OPT_EXIT_TO_DESKTOP;
                     SoePlayUiSfx(0);
                 }
-            } else {
+            } else
+#endif
+            {
                 SoePlayUiSfx(1);
                 AdjustTabOption(s_active_tab, cur_row, 1);
             }
@@ -10612,7 +10713,11 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                                             tc.div_r, tc.div_g, tc.div_b, 185);
                 }
             }
+#ifdef __ANDROID__
+            for (int i = 0; i < GAME_OPT_EXIT_TO_DESKTOP; i++) {
+#else
             for (int i = 0; i < GAME_OPT_EXIT_TO_LAUNCHER; i++) {
+#endif
                 int row_y = GetGameTabRowY(i);
                 bool is_sel = (i == sel_row);
                 int box_y = row_y - 1;
@@ -10674,8 +10779,19 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                 }
             }
 
-            /* Centered single-line Exit buttons: [ Exit to Launcher ]  [ Exit to Desktop ] */
+            /* Centered single-line Exit button(s) */
             {
+#ifdef __ANDROID__
+                int exit_y = GetGameTabRowY(GAME_OPT_EXIT_TO_DESKTOP);
+                int lx = 0, lw = 0, dx = 0, dw = 0;
+                GetGameExitButtonBounds(drawer_x, drawer_w, &lx, &lw, &dx, &dw);
+                bool sel_d = (sel_row == GAME_OPT_EXIT_TO_DESKTOP);
+                if (sel_d) {
+                    DrawThemedHighlightRect(pixels, stride, frame_h, dx - 3, exit_y, dw + 6, 9, &tc, true);
+                }
+                DrawSmallText(pixels, stride, frame_h, dx, exit_y, "[ Exit to Android Launcher ]",
+                              sel_d ? 0xFFFF7878u : 0xFFE85454u);
+#else
                 int exit_y = GetGameTabRowY(GAME_OPT_EXIT_TO_LAUNCHER);
                 int lx = 0, lw = 0, dx = 0, dw = 0;
                 GetGameExitButtonBounds(drawer_x, drawer_w, &lx, &lw, &dx, &dw);
@@ -10691,6 +10807,7 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                               sel_l ? 0xFF70B8FFu : 0xFF4C94E8u);
                 DrawSmallText(pixels, stride, frame_h, dx, exit_y, "[ Exit to Desktop ]",
                               sel_d ? 0xFFFF7878u : 0xFFE85454u);
+#endif
             }
 
             /* Live dynamic description of highlighted option */
@@ -10704,8 +10821,12 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                 "* Glass theme color (Omnitopia, Volcano, etc.) or Original.",
                 "* Ring Menu: Enhanced (smooth rotation & sprite cache) or Original.",
                 "* Restores all Game, Video, CRT & Bloom settings.",
+#ifdef __ANDROID__
+                "* Save all settings and SRAM, then exit to Android launcher."
+#else
                 "* Save all settings and SRAM, then return to launcher.",
                 "* Save all settings and SRAM, then exit to desktop."
+#endif
             };
             const char *desc = (sel_row >= 0 && sel_row < GAME_OPT_COUNT) ? kGameDescs[sel_row] : "";
             if (s_menu_toast_timer > 0) {
@@ -11287,7 +11408,11 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
             else if (s_reset_confirm == RESET_CONFIRM_CRT) msg = "Reset CRT settings to default?";
             else if (s_reset_confirm == RESET_CONFIRM_BLOOM) msg = "Reset Bloom settings to default?";
             else if (s_reset_confirm == RESET_CONFIRM_EXIT_LAUNCHER) msg = "Exit to Launcher?";
+#ifdef __ANDROID__
+            else if (s_reset_confirm == RESET_CONFIRM_EXIT_DESKTOP) msg = "Exit to Android Launcher?";
+#else
             else if (s_reset_confirm == RESET_CONFIRM_EXIT_DESKTOP) msg = "Exit to Desktop?";
+#endif
             DrawSmallText(pixels, stride, frame_h, dlg_x + 12, dlg_y + 20, msg, 0xFFFFFFFFu);
 
             int btn_w = 54;

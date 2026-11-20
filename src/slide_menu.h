@@ -65,6 +65,9 @@ void SoeMenuPausedTick(void);
 int SoeSaveStateSlot(int slot);
 int SoeLoadStateSlot(int slot);
 void SoeInitUiSfx(void);
+#ifdef __ANDROID__
+void SoeAndroidEnsureMapsExtracted(void);
+#endif
 void SoeEnsureLauncherMusicExtracted(void);
 void SoeMixUiAudio(int16_t *pcm, int frames, int channels, int sample_rate);
 void SoeCapturePostSimState(void);

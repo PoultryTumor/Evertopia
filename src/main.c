@@ -250,6 +250,9 @@ static void SoeAfterSnesInit(void)
 {
     SoeInitUiSfx();
     SoeAssetCacheInit();
+#ifdef __ANDROID__
+    SoeAndroidEnsureMapsExtracted();
+#endif
     SoeCoop2pInit();
 }
 
