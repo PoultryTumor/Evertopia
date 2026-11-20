@@ -8,6 +8,11 @@ A native PC static recompilation port of **Secret of Evermore** (SNES, USA), bui
 
 ## What's New
 
+### v0.9.0
+- **Android APK Release (`arm64-v8a`):** Added an Android `.apk` installer (`Evertopia-0.9.0-android-arm64.apk`) with full SDL3 built-in, Bluetooth, and USB game controller support (tested for handhelds like the Mangmi Air X and Android tablets with USB controllers), immersive landscape display, first-boot Android file picker for selecting your legally owned ROM, and the full Evertopia Launcher as the opening screen.
+- **Updated Out-of-the-Box Defaults:** All cheats (*Infinite HP*, *Infinite Stamina*, *One-Hit KO*, *Walk Through Walls*) now default to **Off** out of the box (vanilla bug fixes remain **On**); default dialog theme updated to **Ivor Tower**, sprite interpolation defaults to **Off**, desktop defaults to windowed mode (native fullscreen on Android), and Player 1 Gamepad / Player 2 Disabled match standard single-player setup.
+- **Map 49 (Podunk 1965 Intro) Parallax Scrolling Fix:** Disabled horizontal widescreen clamping on Map 49 (`$0031`) so both the Podunk street layer and the foreground foliage parallax layer scroll smoothly without stuttering.
+
 ### v0.8.0
 - **Windows x64 Release (Experimental):** Added an automated Windows x64 Setup Pack (`evertopia-0.8.0-windows-x64.zip`) built natively via GitHub Actions with the portable toolchain embedded — unzip, run `Evertopia.exe`, and select your ROM to build and play locally (if Windows SmartScreen prompts on first run, click *More info → Run anyway*).
 - **Map Exporter Fix (Large & Complex Maps):** Fixed garbled PNG exports on large/complex maps (including Great Pyramid Exterior, Gomi's Tower, Jungle South of Fire Eyes' Village, Oglin Caves, Swamp Maze, and Map 113) by waiting for `$7F` decompression, VRAM tileset streaming, CGRAM BG palettes, and screen unblanking to settle before capture, plus SNES-accurate 10-bit tile / 32K-word VRAM wrapping.

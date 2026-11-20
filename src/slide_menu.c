@@ -9046,7 +9046,10 @@ static void SoeComputeAnchoredWidescreenMargins(int extra, int16_t hscroll_cam, 
     uint16_t room_id = GetLoadedMapId();
     bool wrap_horizontal = IsNobiliaDesertMap(room_id) ||
                            ((room_id == 0x0011u || room_id == 0x0061u) && room_w_tiles == 48u);
-    if (!wrap_horizontal && room_w_tiles > 0 && room_h_tiles > 0 &&
+    /* Map 49 ($0031, Podunk 1965 street): dual parallax (street + foreground foliage)
+     * during intro cutscene; skip horizontal screen clamping so both layers scroll freely. */
+    bool disable_clamping = wrap_horizontal || (room_id == 0x0031u);
+    if (!disable_clamping && room_w_tiles > 0 && room_h_tiles > 0 &&
         stride_bytes == (uint16_t)room_w_tiles * 2u) {
         int eff_left_px = 0;
         int eff_right_px = (int)room_w_tiles * 16;

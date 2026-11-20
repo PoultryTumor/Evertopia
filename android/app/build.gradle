@@ -1,0 +1,74 @@
+plugins {
+    id 'com.android.application'
+}
+
+def versionFile = file('../../VERSION')
+def appVersionName = versionFile.exists() ? versionFile.text.trim() : '0.8.0'
+def versionParts = appVersionName.tokenize('.')
+def appVersionCode = (versionParts.size() >= 3)
+    ? (versionParts[0].toInteger() * 10000 + versionParts[1].toInteger() * 100 + versionParts[2].toInteger())
+    : 800
+
+def sdlJavaDir = file('../../../deps/SDL3-3.4.10/android-project/app/src/main/java')
+
+android {
+    namespace = "com.evertopia.app"
+    compileSdk = 34
+
+    defaultConfig {
+        applicationId "com.evertopia.app"
+        minSdk = 24
+        targetSdk = 34
+        versionCode = appVersionCode
+        versionName = appVersionName
+    }
+
+    sourceSets {
+        main {
+            java.srcDirs = ['src/main/java', sdlJavaDir]
+            jniLibs.srcDirs = ['src/main/jniLibs']
+            assets.srcDirs = ['src/main/assets']
+        }
+    }
+
+    signingConfigs {
+        release {
+            def ks = file('evertopia-release.keystore')
+            if (ks.exists()) {
+                storeFile ks
+                storePassword "evertopia"
+                keyAlias "evertopia"
+                keyPassword "evertopia"
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (file('evertopia-release.keystore').exists()) {
+                signingConfig signingConfigs.release
+            } else {
+                signingConfig signingConfigs.debug
+            }
+        }
+        debug {
+            debuggable true
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging = false
+        }
+    }
+
+    lint {
+        abortOnError = false
+    }
+}
