@@ -566,6 +566,7 @@ static const uint16_t kDogFormReqIds[5] = {
 static uint16_t s_warp_map_id = 0;
 static uint16_t s_warp_target_map = 0;
 static int s_warp_monitor_frames = 0;
+static int s_warp_stuck_black_frames = 0;
 static int s_post_warp_walk_timer = 0;
 static bool s_walk_walls_active = false;
 static bool s_inf_hp_active = false;
@@ -4847,14 +4848,18 @@ static void DebugExecuteWarpEx(uint16_t target_map, bool allow_cutscene_maps)
     /* 5. Clear stuck collision / physics flags */
     g_ram[0x0F55] = 0;
 
-    /* 6. Inject native room-warp script: Opcode 0x22 (Warp) followed by Opcode 0x26 (Fade In) */
-    rom[0x009479] = 0x22; /* Opcode 0x22 -> $8C:DB71 native room warp */
-    rom[0x00947A] = byte_x;
-    rom[0x00947B] = byte_y;
-    rom[0x00947C] = (uint8_t)(target_map & 0xFFu);
-    rom[0x00947D] = (uint8_t)(target_map >> 8);
-    rom[0x00947E] = 0x26; /* Opcode 0x26 -> $8C:DC18 unblank and fade screen in */
-    rom[0x00947F] = 0x00; /* Opcode 0x00 -> terminate script thread */
+    /* 6. Inject native room-warp script: Opcode 0x22 (Warp) followed by Opcode 0x26 (Fade In).
+     *    Placed in unused $81:98E8..$81:98EE 0xFF padding (right after the 24-byte Walk Through
+     *    Walls stub at $81:98D0..$81:98E7) so we NEVER touch the $80:9479..$80:94D8 sprite/OAM
+     *    attribute lookup table (read via ORA $809479,X at $80:92AB and $80:943D). */
+    if (0x0198EFu > g_snes->cart->romSize) return;
+    rom[0x0198E8u] = 0x22; /* Opcode 0x22 -> $8C:DB71 native room warp */
+    rom[0x0198E9u] = byte_x;
+    rom[0x0198EAu] = byte_y;
+    rom[0x0198EBu] = (uint8_t)(target_map & 0xFFu);
+    rom[0x0198ECu] = (uint8_t)(target_map >> 8);
+    rom[0x0198EDu] = 0x26; /* Opcode 0x26 -> $8C:DC18 unblank and fade screen in */
+    rom[0x0198EEu] = 0x00; /* Opcode 0x00 -> terminate script thread */
 
     /* 7. Find first available script thread slot */
     uint16_t thread_addr = 0;
@@ -4868,9 +4873,9 @@ static void DebugExecuteWarpEx(uint16_t target_map, bool allow_cutscene_maps)
         thread_addr = 0x2D9D;
     }
 
-    g_ram[thread_addr + 0] = 0x79;
-    g_ram[thread_addr + 1] = 0x94;
-    g_ram[thread_addr + 2] = 0x80; /* Bank $80 */
+    g_ram[thread_addr + 0] = 0xE8;
+    g_ram[thread_addr + 1] = 0x98;
+    g_ram[thread_addr + 2] = 0x81; /* Bank $81 */
     g_ram[thread_addr + 3] = 0x02; /* Active thread state */
     g_ram[thread_addr + 4] = 0x00;
     g_ram[thread_addr + 5] = 0x00;
@@ -4905,7 +4910,8 @@ static void DebugExecuteWarpEx(uint16_t target_map, bool allow_cutscene_maps)
 
     /* 9. Monitor warp transition and auto-engage Walk Through Walls for 5 seconds */
     s_warp_target_map = target_map;
-    s_warp_monitor_frames = 120;
+    s_warp_monitor_frames = 180;
+    s_warp_stuck_black_frames = 0;
     s_post_warp_walk_timer = 300;
 
     snprintf(s_debug_toast, sizeof(s_debug_toast), "Warp -> Map %u (%s)",
@@ -9816,12 +9822,42 @@ void SoeBeginSimFrame(unsigned number)
     if (s_warp_monitor_frames > 0) {
         s_warp_monitor_frames--;
         uint16_t cur_map = GetLoadedMapId();
-        if (cur_map == s_warp_target_map || s_warp_monitor_frames < 30) {
-            if (g_ram[0x0106] != 0x0F) {
-                fprintf(stderr, "[Warp Monitor] Unblanking screen at frame %u! Cur map: %u, target: %u\n",
+        uint8_t inidisp = g_ram[0x0106];
+        uint16_t fade_target = (uint16_t)g_ram[0x0B83] | ((uint16_t)g_ram[0x0B84] << 8);
+        bool full_bright = ((inidisp & 0x80u) == 0) && ((inidisp & 0x0Fu) == 0x0Fu);
+        bool fading_in = ((fade_target & 0x8000u) != 0) && ((fade_target & 0x000Fu) > 0);
+
+        if (cur_map == s_warp_target_map && full_bright) {
+            /* Native Opcode 0x22 + 0x26 completed its full VRAM upload and fade-in cleanly. */
+            s_warp_monitor_frames = 0;
+            s_warp_stuck_black_frames = 0;
+        } else {
+            /* Never clear forced blank ($0106 bit 7) while the room's VRAM/CGRAM/tilemap/sprite
+             * DMA queues are still draining or while a native fade-in is already running; doing
+             * so drops mid-load BG tilemap DMAs and leaves the initial viewport black. */
+            bool vram_dma_empty  = (g_ram[0x013B] == g_ram[0x013D]) && (g_ram[0x013C] == g_ram[0x013E]);
+            bool cgram_dma_empty = (g_ram[0x1290] == g_ram[0x128E]) && (g_ram[0x1291] == g_ram[0x128F]);
+            bool tilemap_empty   = (g_ram[0x1170] == g_ram[0x1172]) && (g_ram[0x1171] == g_ram[0x1173]);
+            bool spr16_empty     = (g_ram[0x15D6] == 0 && g_ram[0x15D7] == 0);
+            bool spr32_empty     = (g_ram[0x163C] == 0 && g_ram[0x163D] == 0);
+            bool queues_empty    = vram_dma_empty && cgram_dma_empty && tilemap_empty &&
+                                   spr16_empty && spr32_empty;
+
+            if (cur_map == s_warp_target_map && queues_empty && !fading_in && !full_bright) {
+                s_warp_stuck_black_frames++;
+            } else {
+                s_warp_stuck_black_frames = 0;
+            }
+
+            if (s_warp_stuck_black_frames >= 30 ||
+                (s_warp_monitor_frames == 0 && queues_empty && !full_bright && !fading_in)) {
+                fprintf(stderr, "[Warp Monitor] Failsafe fade-in at frame %u! Cur map: %u, target: %u\n",
                         number, (unsigned)cur_map, (unsigned)s_warp_target_map);
-                g_ram[0x0106] = 0x0F;  /* Force unblank screen & set full brightness (0x0F) */
-                g_ram[0x0B83] = 0x0F;  /* Restore full brightness */
+                g_ram[0x0106] = 0x00;
+                g_ram[0x0B83] = 0x0F;
+                g_ram[0x0B84] = 0x80; /* Request native fade-in so SoeRoomTransitionDrainIfReady runs */
+                s_warp_monitor_frames = 0;
+                s_warp_stuck_black_frames = 0;
             }
         }
     }

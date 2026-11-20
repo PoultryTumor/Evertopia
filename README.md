@@ -8,6 +8,10 @@ A native PC static recompilation port of **Secret of Evermore** (SNES, USA), bui
 
 ## What's New
 
+### v0.9.2
+- **Clean Debug Map Warp (Sprites, Palettes & Full BG Load):** Relocated the injected debug warp script out of Secret of Evermore's live `$80:9479..$80:94D8` sprite/OAM attribute table into unused `$81:98E8..$81:98EE` padding, eliminating permanent post-warp sprite/palette corruption across all maps.
+- **Uninterrupted Post-Warp Tilemap Upload:** Fixed `[Warp Monitor]` prematurely clearing SNES Forced Blank (`$0106` bit 7) on the first frame after a map ID change; rooms now finish draining VRAM/CGRAM/tilemap/sprite DMA queues and fade in cleanly via `Opcode 0x26` + `SoeRoomTransitionDrainIfReady()` with no black initial viewport.
+
 ### v0.9.1
 - **Parallax Camera & Foliage Scrolling Fix (Map 65 & All Parallax Maps):** Fixed widescreen margin jumps and overhead foliage judder on parallax-scrolling maps (e.g. Map 65 — Prehistoria Jungle) by locking world-camera layer detection directly to Secret of Evermore's true WRAM camera (`$7E:0059` / `$7E:005B`).
 - **Android One-Time Asset Extraction & UI Polish:** On Android, first launch now automatically extracts sprites, tilesets, and all 127 maps with a live **"One-Time Asset Extraction"** progress bar and percentage screen before starting the game, and replaces desktop exit options with **Exit to Android Launcher**.
