@@ -335,6 +335,7 @@ bool SoeAndroidTouchHandleEvent(const SDL_Event *ev)
                     float dy = ev->tfinger.y - s_swipe_start_y;
                     if (dx * dx + dy * dy >= 0.14f * 0.14f) {
                         s_swipe_fired = true;
+                        s_enabled = true; /* Re-enable overlay so user can navigate the menu */
                         s_menu_toggle_pending = true;
                     }
                 }
@@ -355,14 +356,6 @@ bool SoeAndroidTouchHandleEvent(const SDL_Event *ev)
         SDL_FingerID fid = ev->tfinger.fingerID;
         float nx = ev->tfinger.x;
         float ny = ev->tfinger.y;
-
-        /* When the slide-out settings menu is open, let all touches over the
-         * drawer (left ~72% of screen) pass straight through to SDL mouse/tap
-         * handling so tabs, rows, and ARE YOU SURE? YES/NO buttons work directly! */
-        if (s_menu_open_hint && nx < 0.72f) {
-            return false;
-        }
-
         float px = nx * (float)s_out_w;
         float py = ny * (float)s_out_h;
 

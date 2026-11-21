@@ -7648,6 +7648,16 @@ static bool SDLCALL SlideMenuEventFilter(void *userdata, SDL_Event *event)
         }
     }
 
+#ifdef __ANDROID__
+    /* On Android, menus are navigated strictly via joypad (physical controller
+     * or the on-screen touch controller overlay) — never direct screen taps. */
+    if (event->type == SDL_EVENT_MOUSE_MOTION ||
+        event->type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+        event->type == SDL_EVENT_MOUSE_BUTTON_UP) {
+        return true;
+    }
+#endif
+
     /* Show mouse cursor on movement/clicks and reset auto-hide timer */
     if (event->type == SDL_EVENT_MOUSE_MOTION || event->type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
         s_last_mouse_move_ticks = SDL_GetTicks();
@@ -8166,6 +8176,10 @@ static void PollMenuKeyboardDirect(void)
 
 #ifdef __ANDROID__
     SoeAndroidTouchSetMenuOpen(s_menu_open);
+    if (s_android_touch_overlay != SoeAndroidTouchIsEnabled()) {
+        s_android_touch_overlay = SoeAndroidTouchIsEnabled();
+        SoeSaveVideoConfig();
+    }
     if (SoeAndroidTouchConsumeMenuToggle()) {
         s_pending_toggle_event = true;
     }

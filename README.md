@@ -8,6 +8,10 @@ A native PC static recompilation port of **Secret of Evermore** (SNES, USA), bui
 
 ## What's New
 
+### v0.9.7
+- **Android Joypad-Only Menu Navigation:** Menus, tabs, Debug Tools, and `"ARE YOU SURE?"` confirmation dialogs on Android are now controlled strictly via joypad input — either a plugged-in/Bluetooth physical controller (matching the Linux/desktop controls) or the on-screen touch controller overlay (`Thumbstick` to move, **`A`** to activate/confirm, **`B`** to close/cancel, **`L`/`R`** to switch tabs, **`LT`** for Slide-Out Menu, **`RT`** for Debug Tools). Direct screen-tap clicking on menu items is disabled on Android to prevent accidental taps.
+- **Swipe-to-Restore Overlay Failsafe:** When the touch overlay is turned **Off** and no physical controller is connected, sliding a finger across the screen re-enables the touch overlay and opens the Settings menu so you immediately have joypad navigation back.
+
 ### v0.9.6
 - **Android Touch Overlay Refinements (`LT`/`RT` Triggers, Opacity Setting & Swipe Failsafe):**
   - Added onscreen **`LT`** (Slide-Out Settings Menu) and **`RT`** (Debug Overlay) back triggers beside `L` and `R` using **Kenney's Input Prompts** (CC0 1.0 Public Domain, [kenney.nl](https://kenney.nl)).
