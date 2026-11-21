@@ -141,18 +141,21 @@ enum {
     GAME_OPT_LOAD_STATE_2 = 4, /* Load State Slot 2 */
     GAME_OPT_LOAD_STATE_3 = 5, /* Load State Slot 3 */
     GAME_OPT_ORIGINAL_MODE = 6, /* Original Mode: 4:3 pillarbox all maps, classic ring menu & checkerboard windows */
-    GAME_OPT_DIALOG_THEME = 7,  /* Dialog Box Theme: Omnitopia Blue (Default), Original (Dither) */
 #ifdef __ANDROID__
-    GAME_OPT_TOUCH_OVERLAY = 8,    /* On-screen Touch Controls Overlay: On (Default) / Off */
-    GAME_OPT_TOUCH_OPACITY = 9,    /* On-screen Touch Overlay Opacity: 10%..100% (Default 20%) */
-    GAME_OPT_RESET_ALL = 10,       /* Reset All Settings to Default */
-    GAME_OPT_EXIT_TO_DESKTOP = 11, /* Save all settings and exit to Android launcher */
-    GAME_OPT_COUNT = 12
+    GAME_OPT_TOUCH_OVERLAY = 7,    /* On-screen Touch Controls Overlay: On (Default) / Off */
+    GAME_OPT_TOUCH_OPACITY = 8,    /* On-screen Touch Overlay Opacity: 10%..100% (Default 20%) */
+    GAME_OPT_MENU_FONT = 9,        /* Menu Font: Compact (6px) / Full Size (8px) */
+    GAME_OPT_DIALOG_THEME = 10,    /* Dialog Box Theme: Omnitopia Blue (Default), Original (Dither) */
+    GAME_OPT_RESET_ALL = 11,       /* Reset All Settings to Default */
+    GAME_OPT_EXIT_TO_DESKTOP = 12, /* Save all settings and exit to Android launcher */
+    GAME_OPT_COUNT = 13
 #else
-    GAME_OPT_RESET_ALL = 8,        /* Reset All Settings to Default */
-    GAME_OPT_EXIT_TO_LAUNCHER = 9, /* Save all settings and return to launcher */
-    GAME_OPT_EXIT_TO_DESKTOP = 10, /* Save all settings and exit to desktop */
-    GAME_OPT_COUNT = 11
+    GAME_OPT_MENU_FONT = 7,        /* Menu Font: Compact (6px) / Full Size (8px) */
+    GAME_OPT_DIALOG_THEME = 8,     /* Dialog Box Theme: Omnitopia Blue (Default), Original (Dither) */
+    GAME_OPT_RESET_ALL = 9,        /* Reset All Settings to Default */
+    GAME_OPT_EXIT_TO_LAUNCHER = 10, /* Save all settings and return to launcher */
+    GAME_OPT_EXIT_TO_DESKTOP = 11,  /* Save all settings and exit to desktop */
+    GAME_OPT_COUNT = 12
 #endif
 };
 
@@ -429,6 +432,9 @@ static bool s_lock_60fps = false;       /* Slideout toggle: false = High-Hz Subp
 static bool s_interpolate_sprites = false; /* Slideout toggle: Subpixel sprite interpolation */
 static bool s_enhanced_ring_menu = true;  /* Slideout toggle: Enhanced Ring Menu (smooth OAM + texel cache) */
 static bool s_original_mode = false;      /* Original Mode: 4:3 pillarbox all maps, classic ring menu & checkerboard windows */
+static bool s_menu_full_font = false;     /* Slideout Menu Font: false = Compact 6px ($C4:0C82), true = Full Size 8px ($C4:0000) */
+static bool s_draw_full_font = false;     /* Active font context during slideout menu rendering & hit-testing */
+static int  s_game_scroll_y = 0;          /* Pixel scroll offset for TAB_GAME_OPTIONS */
 static uint16_t s_orig_saved_0b15 = 0;    /* Saved $7E:0B15 pattern before entering Original Mode */
 static bool s_orig_prev_in_gameplay = false; /* Tracks title->gameplay transition for Original Mode default checkerboard */
 #ifdef __ANDROID__
@@ -862,7 +868,21 @@ static int MeasureSmallText(const char *s)
                           g_snes->cart->romSize >= 0x041904u)
                          ? g_snes->cart->rom : NULL;
     int cur_x = 0;
-    if (rom && rom[0x040C82] == 12 && rom[0x040C83] == 2) {
+    if (s_draw_full_font && rom && rom[0x040000] == 12 && rom[0x040001] == 2) {
+        const uint32_t font_widths_base = 0x040C02u;
+        for (; *s; s++) {
+            unsigned char c = (unsigned char)*s;
+            if (c == ' ') {
+                cur_x += 4;
+                continue;
+            }
+            if (c < 0x21 || c > 0x7E) c = '?';
+            uint32_t idx = (uint32_t)(c - 0x20u);
+            int w_ch = (int)rom[font_widths_base + idx];
+            if (w_ch <= 0 || w_ch > 12) w_ch = 5;
+            cur_x += w_ch + 1;
+        }
+    } else if (rom && rom[0x040C82] == 12 && rom[0x040C83] == 2) {
         const uint32_t font_widths_base = 0x041884u;
         for (; *s; s++) {
             unsigned char c = (unsigned char)*s;
@@ -877,7 +897,7 @@ static int MeasureSmallText(const char *s)
             cur_x += w_ch + 1;
         }
     } else {
-        cur_x = (int)strlen(s) * 6;
+        cur_x = (int)strlen(s) * (s_draw_full_font ? 7 : 6);
     }
     return cur_x;
 }
@@ -929,33 +949,39 @@ static void DrawSmallText(uint32_t *dst, int stride, int h_max,
                           g_snes->cart->romSize >= 0x041904u)
                          ? g_snes->cart->rom : NULL;
 
-    /* Use the authentic Secret of Evermore compact 6px bitmap font from bank $C4 ($C4:0C82) */
-    if (rom && rom[0x040C82] == 12 && rom[0x040C83] == 2) {
-        const uint32_t font_glyphs_base = 0x040C84u;
-        const uint32_t font_widths_base = 0x041884u;
+    /* Use Secret of Evermore's native 8px dialog font ($C4:0000) or compact 6px font ($C4:0C82) */
+    bool use_main = s_draw_full_font && rom && rom[0x040000] == 12 && rom[0x040001] == 2;
+    if (use_main || (rom && rom[0x040C82] == 12 && rom[0x040C83] == 2)) {
+        const uint32_t font_glyphs_base = use_main ? 0x040002u : 0x040C84u;
+        const uint32_t font_widths_base = use_main ? 0x040C02u : 0x041884u;
+        const int r_start = use_main ? 0 : 1;
+        const int r_end   = use_main ? 11 : 10;
+        const int fg_yoff = use_main ? 1 : 2;
+        const int sh_yoff = use_main ? 0 : 1;
+        const int space_adv = use_main ? 4 : 3;
         const uint32_t shadow_col = 0xFF040C24u;
         int cur_x = x0;
 
         for (; *s; s++) {
             unsigned char c = (unsigned char)*s;
             if (c == ' ') {
-                cur_x += 3; /* Space advance (glyph 0x20 in $C4:0C82 is '1/2' symbol) */
+                cur_x += space_adv;
                 continue;
             }
             if (c < 0x21 || c > 0x7E) c = '?';
 
             uint32_t idx = (uint32_t)(c - 0x20u);
             int w_ch = (int)rom[font_widths_base + idx];
-            if (w_ch <= 0 || w_ch > 12) w_ch = 4;
+            if (w_ch <= 0 || w_ch > 12) w_ch = use_main ? 5 : 4;
 
             uint32_t g_off = font_glyphs_base + idx * 24u;
 
             /* Pass 1: 1px drop shadow (down-right) for authentic SNES VWF contrast */
-            for (int r = 1; r <= 10; r++) {
+            for (int r = r_start; r <= r_end; r++) {
                 uint16_t bits = ((uint16_t)rom[g_off + (uint32_t)r] << 8) |
                                  (uint16_t)rom[g_off + 12u + (uint32_t)r];
                 if (!bits) continue;
-                int py = y0 + (r - 1);
+                int py = y0 + (r - sh_yoff);
                 if (py < 0 || py >= h_max) continue;
                 uint32_t *sh_row = &dst[py * stride];
                 for (int x = 0; x < w_ch; x++) {
@@ -966,11 +992,11 @@ static void DrawSmallText(uint32_t *dst, int stride, int h_max,
             }
 
             /* Pass 2: Crisp foreground glyph pixels */
-            for (int r = 1; r <= 10; r++) {
+            for (int r = r_start; r <= r_end; r++) {
                 uint16_t bits = ((uint16_t)rom[g_off + (uint32_t)r] << 8) |
                                  (uint16_t)rom[g_off + 12u + (uint32_t)r];
                 if (!bits) continue;
-                int py = y0 + (r - 2);
+                int py = y0 + (r - fg_yoff);
                 if (py < 0 || py >= h_max) continue;
                 uint32_t *fg_row = &dst[py * stride];
                 for (int x = 0; x < w_ch; x++) {
@@ -2206,6 +2232,7 @@ static void SoeSaveVideoConfig(void)
     fprintf(f, "  \"interpolate_sprites\": %d,\n", s_interpolate_sprites ? 1 : 0);
     fprintf(f, "  \"enhanced_ring_menu\": %d,\n", s_enhanced_ring_menu ? 1 : 0);
     fprintf(f, "  \"original_mode\": %d,\n", s_original_mode ? 1 : 0);
+    fprintf(f, "  \"menu_full_font\": %d,\n", s_menu_full_font ? 1 : 0);
     fprintf(f, "  \"eliminate_lag_frames\": %d,\n", s_eliminate_lag_frames ? 1 : 0);
 #ifdef __ANDROID__
     fprintf(f, "  \"touch_overlay\": %d,\n", s_android_touch_overlay ? 1 : 0);
@@ -2225,6 +2252,7 @@ static void SoeLoadVideoConfig(void)
     s_interpolate_sprites = false;
     s_enhanced_ring_menu = true;
     s_original_mode = false;
+    s_menu_full_font = false;
     s_eliminate_lag_frames = true;
 #ifdef __ANDROID__
     s_android_touch_overlay = true;
@@ -2271,6 +2299,8 @@ static void SoeLoadVideoConfig(void)
             s_enhanced_ring_menu = (val != 0);
         } else if (strcmp(q1 + 1, "original_mode") == 0) {
             s_original_mode = (val != 0);
+        } else if (strcmp(q1 + 1, "menu_full_font") == 0) {
+            s_menu_full_font = (val != 0);
         } else if (strcmp(q1 + 1, "eliminate_lag_frames") == 0) {
             s_eliminate_lag_frames = (val != 0);
 #ifdef __ANDROID__
@@ -6630,8 +6660,30 @@ static int GetTabOptionCount(SoeMenuTab tab)
     }
 }
 
+static int GetAvVisibleRows(void)
+{
+    return s_menu_full_font ? 10 : kAvVisibleRows;
+}
+
 static void GetTabRowLayout(SoeMenuTab tab, int *out_start_y, int *out_row_h)
 {
+    if (s_menu_full_font) {
+        if (tab == TAB_FIXES) {
+            *out_start_y = 60;
+            *out_row_h = 15;
+            return;
+        }
+        int count = GetTabOptionCount(tab);
+        *out_start_y = 48;
+        if (count >= 12) {
+            *out_row_h = 13;
+        } else if (count >= 8) {
+            *out_row_h = 14;
+        } else {
+            *out_row_h = 15;
+        }
+        return;
+    }
     if (tab == TAB_FIXES) {
         *out_start_y = 55;
         *out_row_h = 14;
@@ -6647,33 +6699,127 @@ static void GetTabRowLayout(SoeMenuTab tab, int *out_start_y, int *out_row_h)
     }
 }
 
+static int GetGameTabRowHeight(void)
+{
+    return s_menu_full_font ? 13 : 9;
+}
+
+static int GetGameTabSectionY(int section)
+{
+    if (s_menu_full_font) {
+        /* 0: SAVE STATE, 1: LOAD STATE, 2: GAME SETTINGS, 3: MENU SETTINGS */
+        switch (section) {
+        case 0: return 48;
+        case 1: return 102;
+        case 2: return 156;
+#ifdef __ANDROID__
+        case 3: return 210;
+#else
+        case 3: return 184;
+#endif
+        default: return 48;
+        }
+    }
+    switch (section) {
+    case 0: return 46;
+    case 1: return 81;
+    case 2: return 116;
+#ifdef __ANDROID__
+    case 3: return 152;
+#else
+    case 3: return 134;
+#endif
+    default: return 46;
+    }
+}
+
 static int GetGameTabRowY(int row)
 {
+    if (s_menu_full_font) {
+        if (row < 3) {
+            return 60 + row * 13;
+        } else if (row < 6) {
+            return 114 + (row - 3) * 13;
 #ifdef __ANDROID__
+        } else if (row < 9) {
+            return 168 + (row - 6) * 13;
+        } else if (row < 11) {
+            return 222 + (row - 9) * 13;
+        } else if (row == GAME_OPT_RESET_ALL) {
+            return 252;
+        } else {
+            return 268;
+        }
+#else
+        } else if (row == GAME_OPT_ORIGINAL_MODE) {
+            return 168;
+        } else if (row < 9) {
+            return 196 + (row - 7) * 13;
+        } else if (row == GAME_OPT_RESET_ALL) {
+            return 226;
+        } else {
+            return 242;
+        }
+#endif
+    }
     if (row < 3) {
         return 54 + row * 9;
     } else if (row < 6) {
         return 89 + (row - 3) * 9;
-    } else if (row < 10) {
+#ifdef __ANDROID__
+    } else if (row < 9) {
         return 124 + (row - 6) * 9;
+    } else if (row < 11) {
+        return 160 + (row - 9) * 9;
     } else if (row == GAME_OPT_RESET_ALL) {
-        return 163;
+        return 180;
     } else {
-        return 175;
+        return 192;
     }
 #else
-    if (row < 3) {
-        return 55 + row * 9;
-    } else if (row < 6) {
-        return 92 + (row - 3) * 9;
-    } else if (row < 8) {
-        return 129 + (row - 6) * 10;
+    } else if (row == GAME_OPT_ORIGINAL_MODE) {
+        return 124;
+    } else if (row < 9) {
+        return 142 + (row - 7) * 9;
     } else if (row == GAME_OPT_RESET_ALL) {
-        return 153;
+        return 162;
     } else {
-        return 166;
+        return 173;
     }
 #endif
+}
+
+static void UpdateGameTabScroll(int sel_row)
+{
+    const int view_top = s_menu_full_font ? 47 : 46;
+    const int view_bot = 183;
+    int rh = GetGameTabRowHeight();
+#ifdef __ANDROID__
+    int last_y = GetGameTabRowY(GAME_OPT_EXIT_TO_DESKTOP) + rh;
+#else
+    int last_y = GetGameTabRowY(GAME_OPT_EXIT_TO_LAUNCHER) + rh;
+#endif
+    int max_scroll = last_y - view_bot;
+    if (max_scroll < 0) max_scroll = 0;
+
+    if (sel_row >= 0 && sel_row < GAME_OPT_COUNT) {
+        int ry = GetGameTabRowY(sel_row);
+        int top_want = ry;
+        /* Keep section header visible when highlighting its first row */
+        if (sel_row == 0) top_want = GetGameTabSectionY(0);
+        else if (sel_row == 3) top_want = GetGameTabSectionY(1);
+        else if (sel_row == 6) top_want = GetGameTabSectionY(2);
+        else if (sel_row == GAME_OPT_MENU_FONT) top_want = GetGameTabSectionY(3);
+
+        if (top_want - s_game_scroll_y < view_top) {
+            s_game_scroll_y = top_want - view_top;
+        }
+        if (ry + rh - s_game_scroll_y > view_bot) {
+            s_game_scroll_y = ry + rh - view_bot;
+        }
+    }
+    if (s_game_scroll_y < 0) s_game_scroll_y = 0;
+    if (s_game_scroll_y > max_scroll) s_game_scroll_y = max_scroll;
 }
 
 static void GetGameExitButtonBounds(int drawer_x, int drawer_w,
@@ -6944,6 +7090,7 @@ static void SoeResetVideoToDefault(bool show_toast)
     s_interpolate_sprites = false;
     s_enhanced_ring_menu = true;
     s_original_mode = false;
+    s_menu_full_font = false;
     s_eliminate_lag_frames = true;
 #ifdef __ANDROID__
     s_android_touch_overlay = true;
@@ -7056,6 +7203,12 @@ static void AdjustTabOption(SoeMenuTab tab, int option_index, int direction)
             break;
         case GAME_OPT_ORIGINAL_MODE:
             SoeSetOriginalMode(!s_original_mode, true);
+            break;
+        case GAME_OPT_MENU_FONT:
+            s_menu_full_font = !s_menu_full_font;
+            s_game_scroll_y = 0;
+            s_av_scroll = 0;
+            SoeSaveVideoConfig();
             break;
         case GAME_OPT_DIALOG_THEME:
             s_dialog_theme = (SoeDialogTheme)(((int)s_dialog_theme + direction + DIALOG_THEME_COUNT) % DIALOG_THEME_COUNT);
@@ -8010,9 +8163,13 @@ static bool SDLCALL SlideMenuEventFilter(void *userdata, SDL_Event *event)
                     return false;
                 }
                 if (fx <= drawer_w) {
-                    /* Check if a tab bar button was clicked (2 rows: y 17..28, y 30..41) */
-                    if ((fy >= 17 && fy <= 28) || (fy >= 30 && fy <= 41)) {
-                        int row_idx = (fy >= 30) ? 1 : 0;
+                    /* Check if a tab bar button was clicked (2 rows) */
+                    int tab_r0_y = s_menu_full_font ? 16 : 17;
+                    int tab_r1_y = s_menu_full_font ? 30 : 30;
+                    int tab_h    = s_menu_full_font ? 12 : 11;
+                    if ((fy >= tab_r0_y && fy <= tab_r0_y + tab_h) ||
+                        (fy >= tab_r1_y && fy <= tab_r1_y + tab_h)) {
+                        int row_idx = (fy >= tab_r1_y) ? 1 : 0;
                         int tab_bar_x = 6;
                         int tab_bar_w = drawer_w - 12;
                         int tab_w = tab_bar_w / 4;
@@ -8036,37 +8193,43 @@ static bool SDLCALL SlideMenuEventFilter(void *userdata, SDL_Event *event)
                     int count = GetTabOptionCount(s_active_tab);
                     int clicked_row = -1;
                     if (s_active_tab == TAB_GAME_OPTIONS) {
+                        int grh = GetGameTabRowHeight();
+                        if (fy >= 46 && fy <= 184) {
 #ifdef __ANDROID__
-                        int exit_y = GetGameTabRowY(GAME_OPT_EXIT_TO_DESKTOP);
-                        if (fy >= exit_y && fy < exit_y + 9) {
-                            clicked_row = GAME_OPT_EXIT_TO_DESKTOP;
-                        } else {
-                            for (int r = 0; r < GAME_OPT_EXIT_TO_DESKTOP; r++) {
-                                int ry = GetGameTabRowY(r);
-                                if (fy >= ry && fy < ry + 9) {
-                                    clicked_row = r;
-                                    break;
+                            int exit_y = GetGameTabRowY(GAME_OPT_EXIT_TO_DESKTOP) - s_game_scroll_y;
+                            if (fy >= exit_y && fy < exit_y + grh) {
+                                clicked_row = GAME_OPT_EXIT_TO_DESKTOP;
+                            } else {
+                                for (int r = 0; r < GAME_OPT_EXIT_TO_DESKTOP; r++) {
+                                    int ry = GetGameTabRowY(r) - s_game_scroll_y;
+                                    if (fy >= ry && fy < ry + grh) {
+                                        clicked_row = r;
+                                        break;
+                                    }
                                 }
                             }
-                        }
 #else
-                        int exit_y = GetGameTabRowY(GAME_OPT_EXIT_TO_LAUNCHER);
-                        if (fy >= exit_y && fy < exit_y + 9) {
-                            int lx = 0, lw = 0, dx = 0, dw = 0;
-                            GetGameExitButtonBounds(0, drawer_w, &lx, &lw, &dx, &dw);
-                            clicked_row = (fx >= dx - 6) ? GAME_OPT_EXIT_TO_DESKTOP : GAME_OPT_EXIT_TO_LAUNCHER;
-                        } else {
-                            for (int r = 0; r < GAME_OPT_EXIT_TO_LAUNCHER; r++) {
-                                int ry = GetGameTabRowY(r);
-                                if (fy >= ry && fy < ry + 9) {
-                                    clicked_row = r;
-                                    break;
+                            int exit_y = GetGameTabRowY(GAME_OPT_EXIT_TO_LAUNCHER) - s_game_scroll_y;
+                            if (fy >= exit_y && fy < exit_y + grh) {
+                                int lx = 0, lw = 0, dx = 0, dw = 0;
+                                s_draw_full_font = s_menu_full_font;
+                                GetGameExitButtonBounds(0, drawer_w, &lx, &lw, &dx, &dw);
+                                s_draw_full_font = false;
+                                clicked_row = (fx >= dx - 6) ? GAME_OPT_EXIT_TO_DESKTOP : GAME_OPT_EXIT_TO_LAUNCHER;
+                            } else {
+                                for (int r = 0; r < GAME_OPT_EXIT_TO_LAUNCHER; r++) {
+                                    int ry = GetGameTabRowY(r) - s_game_scroll_y;
+                                    if (fy >= ry && fy < ry + grh) {
+                                        clicked_row = r;
+                                        break;
+                                    }
                                 }
                             }
-                        }
 #endif
+                        }
                     } else if (s_active_tab == TAB_VIDEO_OPTIONS) {
-                        int max_vis = (count < kAvVisibleRows) ? count : kAvVisibleRows;
+                        int av_vis = GetAvVisibleRows();
+                        int max_vis = (count < av_vis) ? count : av_vis;
                         if (fy >= start_y && fy < start_y + max_vis * row_h) {
                             clicked_row = s_av_scroll + (fy - start_y) / row_h;
                         }
@@ -8119,37 +8282,43 @@ static bool SDLCALL SlideMenuEventFilter(void *userdata, SDL_Event *event)
                 int count = GetTabOptionCount(s_active_tab);
                 int hover_row = -1;
                 if (s_active_tab == TAB_GAME_OPTIONS) {
+                    int grh = GetGameTabRowHeight();
+                    if (fy >= 46 && fy <= 184) {
 #ifdef __ANDROID__
-                    int exit_y = GetGameTabRowY(GAME_OPT_EXIT_TO_DESKTOP);
-                    if (fy >= exit_y && fy < exit_y + 9) {
-                        hover_row = GAME_OPT_EXIT_TO_DESKTOP;
-                    } else {
-                        for (int r = 0; r < GAME_OPT_EXIT_TO_DESKTOP; r++) {
-                            int ry = GetGameTabRowY(r);
-                            if (fy >= ry && fy < ry + 9) {
-                                hover_row = r;
-                                break;
+                        int exit_y = GetGameTabRowY(GAME_OPT_EXIT_TO_DESKTOP) - s_game_scroll_y;
+                        if (fy >= exit_y && fy < exit_y + grh) {
+                            hover_row = GAME_OPT_EXIT_TO_DESKTOP;
+                        } else {
+                            for (int r = 0; r < GAME_OPT_EXIT_TO_DESKTOP; r++) {
+                                int ry = GetGameTabRowY(r) - s_game_scroll_y;
+                                if (fy >= ry && fy < ry + grh) {
+                                    hover_row = r;
+                                    break;
+                                }
                             }
                         }
-                    }
 #else
-                    int exit_y = GetGameTabRowY(GAME_OPT_EXIT_TO_LAUNCHER);
-                    if (fy >= exit_y && fy < exit_y + 9) {
-                        int lx = 0, lw = 0, dx = 0, dw = 0;
-                        GetGameExitButtonBounds(0, drawer_w, &lx, &lw, &dx, &dw);
-                        hover_row = (fx >= dx - 6) ? GAME_OPT_EXIT_TO_DESKTOP : GAME_OPT_EXIT_TO_LAUNCHER;
-                    } else {
-                        for (int r = 0; r < GAME_OPT_EXIT_TO_LAUNCHER; r++) {
-                            int ry = GetGameTabRowY(r);
-                            if (fy >= ry && fy < ry + 9) {
-                                hover_row = r;
-                                break;
+                        int exit_y = GetGameTabRowY(GAME_OPT_EXIT_TO_LAUNCHER) - s_game_scroll_y;
+                        if (fy >= exit_y && fy < exit_y + grh) {
+                            int lx = 0, lw = 0, dx = 0, dw = 0;
+                            s_draw_full_font = s_menu_full_font;
+                            GetGameExitButtonBounds(0, drawer_w, &lx, &lw, &dx, &dw);
+                            s_draw_full_font = false;
+                            hover_row = (fx >= dx - 6) ? GAME_OPT_EXIT_TO_DESKTOP : GAME_OPT_EXIT_TO_LAUNCHER;
+                        } else {
+                            for (int r = 0; r < GAME_OPT_EXIT_TO_LAUNCHER; r++) {
+                                int ry = GetGameTabRowY(r) - s_game_scroll_y;
+                                if (fy >= ry && fy < ry + grh) {
+                                    hover_row = r;
+                                    break;
+                                }
                             }
                         }
-                    }
 #endif
+                    }
                 } else if (s_active_tab == TAB_VIDEO_OPTIONS) {
-                    int max_vis = (count < kAvVisibleRows) ? count : kAvVisibleRows;
+                    int av_vis = GetAvVisibleRows();
+                    int max_vis = (count < av_vis) ? count : av_vis;
                     if (fy >= start_y && fy < start_y + max_vis * row_h) {
                         hover_row = s_av_scroll + (fy - start_y) / row_h;
                     }
@@ -10961,8 +11130,8 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
 
         if (!menu_mosaic) {
             if (s_original_mode || (s_pillarbox_enabled && map_pillarboxed)) {
-                clamp_left = extra + 1;
-                clamp_right = extra + 256 - 1;
+                clamp_left = extra;
+                clamp_right = extra + 256;
             } else if (g_snes && g_snes->ppu) {
                 Ppu *ppu = g_snes->ppu;
                 int frame_left = (int)ppu->extraFrameLeft;
@@ -11000,7 +11169,7 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                                   ((g_snes->ppu->bgmode & 0x30) == 0x30);
             bool has_win = (g_snes && g_snes->ppu) &&
                            ((g_snes->ppu->screenWindowed[0] != 0) || (g_snes->ppu->screenWindowed[1] != 0));
-            int clamp_h = (!menu_mosaic && hud_vis && is_mode1_16x16 && !has_win && s_frame_counter >= 60)
+            int clamp_h = (!s_original_mode && !menu_mosaic && hud_vis && is_mode1_16x16 && !has_win && s_frame_counter >= 60)
                               ? 192
                               : frame_h;
             if (clamp_h > frame_h) clamp_h = frame_h;
@@ -11035,6 +11204,7 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
 
     /* 4. Render Slide-Out Menu Drawer (Dedicated Smooth High-Def Frosted Glass) */
     if (s_anim_x > -menu_w) {
+        s_draw_full_font = s_menu_full_font;
         int drawer_x = (int)s_anim_x;
         int drawer_w = (int)menu_w;
         int rx0 = (drawer_x < 0) ? 0 : drawer_x;
@@ -11089,31 +11259,39 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                                 tc.accent_r, tc.accent_g, tc.accent_b, 240);
 
         /* Title Banner */
-        DrawSmallText(pixels, stride, frame_h, drawer_x + 10, 5, "SETTINGS", 0xFFFFFFFF);
-        DrawSmallText(pixels, stride, frame_h, drawer_x + drawer_w - 85, 5, "LB/RB: Tab", tc.subtext_col);
+        int title_y = s_menu_full_font ? 3 : 5;
+        DrawSmallText(pixels, stride, frame_h, drawer_x + 10, title_y, "SETTINGS", 0xFFFFFFFF);
+        {
+            const char *tab_hint = "LB/RB: Tab";
+            int hint_w = MeasureSmallText(tab_hint);
+            DrawSmallText(pixels, stride, frame_h, drawer_x + drawer_w - hint_w - 10, title_y, tab_hint, tc.subtext_col);
+        }
 
         /* Top divider */
         DrawSemiTransparentRect(pixels, stride, frame_h,
-                                drawer_x + 6, 15, drawer_w - 12, 1,
+                                drawer_x + 6, s_menu_full_font ? 14 : 15, drawer_w - 12, 1,
                                 tc.div_r, tc.div_g, tc.div_b, 190);
 
-        /* ── Tab Bar (2 rows of 4 tabs: y: 17..28, 30..41) ──────────────── */
+        /* ── Tab Bar (2 rows of 4 tabs) ─────────────────────────────────── */
         static const char *const kTabNames[TAB_COUNT] = {
             "Game", "Video", "Audio", "Fixes", "CRT", "Bloom", "Input", "Help"
         };
         int tab_bar_x = drawer_x + 6;
         int tab_bar_w = drawer_w - 12;
         int tab_w = tab_bar_w / 4;
+        int tab_y0 = s_menu_full_font ? 16 : 17;
+        int tab_step = s_menu_full_font ? 14 : 13;
+        int tab_h = s_menu_full_font ? 12 : 11;
 
         for (int t = 0; t < TAB_COUNT; t++) {
             int row_idx = t / 4;
             int col_idx = t % 4;
             int tx = tab_bar_x + col_idx * tab_w;
             int tw = (col_idx == 3) ? (tab_bar_x + tab_bar_w - tx) : (tab_w - 2);
-            int ty = 17 + row_idx * 13;
+            int ty = tab_y0 + row_idx * tab_step;
             bool is_active = (t == (int)s_active_tab);
 
-            DrawThemedHighlightRect(pixels, stride, frame_h, tx, ty, tw, 11, &tc, is_active);
+            DrawThemedHighlightRect(pixels, stride, frame_h, tx, ty, tw, tab_h, &tc, is_active);
 
             int name_w = MeasureSmallText(kTabNames[t]);
             int text_x = tx + (tw - name_w) / 2;
@@ -11123,7 +11301,7 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
 
         /* Divider below Tab Bar */
         DrawSemiTransparentRect(pixels, stride, frame_h,
-                                drawer_x + 6, 43, drawer_w - 12, 1,
+                                drawer_x + 6, s_menu_full_font ? 45 : 43, drawer_w - 12, 1,
                                 tc.div_r, tc.div_g, tc.div_b, 190);
 
         /* ── Tab Page Content Area (y: 35..176) ─────────────────────────── */
@@ -11135,31 +11313,26 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
         int sel_row = s_tab_selected_row[s_active_tab];
 
         if (s_active_tab == TAB_GAME_OPTIONS) {
-            /* Tab 0: Game Options with section headers & dividers */
-            static const struct {
-                int y;
-                const char *title;
-            } kGameSections[3] = {
-#ifdef __ANDROID__
-                { 46, "SAVE STATE" },
-                { 81, "LOAD STATE" },
-                { 116, "GAME SETTINGS" },
-#else
-                { 46, "SAVE STATE" },
-                { 83, "LOAD STATE" },
-                { 120, "GAME SETTINGS" },
-#endif
+            /* Tab 0: Game Options with section headers, dividers & smooth vertical scroll */
+            UpdateGameTabScroll(sel_row);
+            const int g_view_top = s_menu_full_font ? 47 : 46;
+            const int g_view_bot = 183;
+            const int g_rh = GetGameTabRowHeight();
+
+            static const char *const kGameSectionTitles[4] = {
+                "SAVE STATE", "LOAD STATE", "GAME SETTINGS", "MENU SETTINGS"
             };
-            for (int s = 0; s < 3; s++) {
-                int hy = kGameSections[s].y;
-                const char *ht = kGameSections[s].title;
+            for (int s = 0; s < 4; s++) {
+                int hy = GetGameTabSectionY(s) - s_game_scroll_y;
+                if (hy < g_view_top || hy + (s_menu_full_font ? 9 : 7) > g_view_bot) continue;
+                const char *ht = kGameSectionTitles[s];
                 int htw = MeasureSmallText(ht);
                 DrawSmallText(pixels, stride, frame_h, content_x + 2, hy, ht, tc.subtext_col);
                 int line_x = content_x + 2 + htw + 6;
                 int line_w = (content_x + content_w - 4) - line_x;
                 if (line_w > 0) {
                     DrawSemiTransparentRect(pixels, stride, frame_h,
-                                            line_x, hy + 3, line_w, 1,
+                                            line_x, hy + (s_menu_full_font ? 4 : 3), line_w, 1,
                                             tc.div_r, tc.div_g, tc.div_b, 185);
                 }
             }
@@ -11168,11 +11341,12 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
 #else
             for (int i = 0; i < GAME_OPT_EXIT_TO_LAUNCHER; i++) {
 #endif
-                int row_y = GetGameTabRowY(i);
+                int row_y = GetGameTabRowY(i) - s_game_scroll_y;
+                if (row_y < g_view_top || row_y + g_rh - 1 > g_view_bot) continue;
                 bool is_sel = (i == sel_row);
                 int box_y = row_y - 1;
-                int box_h = 10;
-                int text_y = row_y;
+                int box_h = s_menu_full_font ? 12 : 10;
+                int text_y = s_menu_full_font ? (row_y + 1) : row_y;
                 if (is_sel) {
                     DrawThemedHighlightRect(pixels, stride, frame_h,
                                             content_x, box_y, content_w, box_h, &tc, true);
@@ -11205,14 +11379,6 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                     snprintf(label_buf, sizeof(label_buf), "Original Mode");
                     snprintf(val_buf, sizeof(val_buf), "%s", s_original_mode ? "On (4:3)" : "Off");
                     break;
-                case GAME_OPT_DIALOG_THEME:
-                    snprintf(label_buf, sizeof(label_buf), "Dialog Box Theme");
-                    if (s_original_mode) {
-                        snprintf(val_buf, sizeof(val_buf), "Original (SNES)");
-                    } else {
-                        snprintf(val_buf, sizeof(val_buf), "%s", kDialogThemeNames[s_dialog_theme]);
-                    }
-                    break;
 #ifdef __ANDROID__
                 case GAME_OPT_TOUCH_OVERLAY:
                     snprintf(label_buf, sizeof(label_buf), "Touch Overlay");
@@ -11223,6 +11389,18 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                     snprintf(val_buf, sizeof(val_buf), "%d%%", s_android_touch_opacity);
                     break;
 #endif
+                case GAME_OPT_MENU_FONT:
+                    snprintf(label_buf, sizeof(label_buf), "Menu Font");
+                    snprintf(val_buf, sizeof(val_buf), "%s", s_menu_full_font ? "Full Size (8px)" : "Compact (6px)");
+                    break;
+                case GAME_OPT_DIALOG_THEME:
+                    snprintf(label_buf, sizeof(label_buf), "Dialog Box Theme");
+                    if (s_original_mode) {
+                        snprintf(val_buf, sizeof(val_buf), "Original (SNES)");
+                    } else {
+                        snprintf(val_buf, sizeof(val_buf), "%s", kDialogThemeNames[s_dialog_theme]);
+                    }
+                    break;
                 case GAME_OPT_RESET_ALL:
                     snprintf(label_buf, sizeof(label_buf), "[ Reset All Settings to Default ]");
                     break;
@@ -11246,32 +11424,55 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
             /* Centered single-line Exit button(s) */
             {
 #ifdef __ANDROID__
-                int exit_y = GetGameTabRowY(GAME_OPT_EXIT_TO_DESKTOP);
-                int lx = 0, lw = 0, dx = 0, dw = 0;
-                GetGameExitButtonBounds(drawer_x, drawer_w, &lx, &lw, &dx, &dw);
-                bool sel_d = (sel_row == GAME_OPT_EXIT_TO_DESKTOP);
-                if (sel_d) {
-                    DrawThemedHighlightRect(pixels, stride, frame_h, dx - 3, exit_y, dw + 6, 9, &tc, true);
+                int exit_y = GetGameTabRowY(GAME_OPT_EXIT_TO_DESKTOP) - s_game_scroll_y;
+                if (exit_y >= g_view_top && exit_y + g_rh - 1 <= g_view_bot) {
+                    int lx = 0, lw = 0, dx = 0, dw = 0;
+                    GetGameExitButtonBounds(drawer_x, drawer_w, &lx, &lw, &dx, &dw);
+                    bool sel_d = (sel_row == GAME_OPT_EXIT_TO_DESKTOP);
+                    int ebh = s_menu_full_font ? 12 : 9;
+                    int ety = s_menu_full_font ? (exit_y + 1) : exit_y;
+                    if (sel_d) {
+                        DrawThemedHighlightRect(pixels, stride, frame_h, dx - 3, exit_y - (s_menu_full_font ? 1 : 0), dw + 6, ebh, &tc, true);
+                    }
+                    DrawSmallText(pixels, stride, frame_h, dx, ety, "[ Exit to Android Launcher ]",
+                                  sel_d ? 0xFFFF7878u : 0xFFE85454u);
                 }
-                DrawSmallText(pixels, stride, frame_h, dx, exit_y, "[ Exit to Android Launcher ]",
-                              sel_d ? 0xFFFF7878u : 0xFFE85454u);
 #else
-                int exit_y = GetGameTabRowY(GAME_OPT_EXIT_TO_LAUNCHER);
-                int lx = 0, lw = 0, dx = 0, dw = 0;
-                GetGameExitButtonBounds(drawer_x, drawer_w, &lx, &lw, &dx, &dw);
-                bool sel_l = (sel_row == GAME_OPT_EXIT_TO_LAUNCHER);
-                bool sel_d = (sel_row == GAME_OPT_EXIT_TO_DESKTOP);
-                if (sel_l) {
-                    DrawThemedHighlightRect(pixels, stride, frame_h, lx - 3, exit_y, lw + 6, 9, &tc, true);
+                int exit_y = GetGameTabRowY(GAME_OPT_EXIT_TO_LAUNCHER) - s_game_scroll_y;
+                if (exit_y >= g_view_top && exit_y + g_rh - 1 <= g_view_bot) {
+                    int lx = 0, lw = 0, dx = 0, dw = 0;
+                    GetGameExitButtonBounds(drawer_x, drawer_w, &lx, &lw, &dx, &dw);
+                    bool sel_l = (sel_row == GAME_OPT_EXIT_TO_LAUNCHER);
+                    bool sel_d = (sel_row == GAME_OPT_EXIT_TO_DESKTOP);
+                    int ebh = s_menu_full_font ? 12 : 9;
+                    int ety = s_menu_full_font ? (exit_y + 1) : exit_y;
+                    if (sel_l) {
+                        DrawThemedHighlightRect(pixels, stride, frame_h, lx - 3, exit_y - (s_menu_full_font ? 1 : 0), lw + 6, ebh, &tc, true);
+                    }
+                    if (sel_d) {
+                        DrawThemedHighlightRect(pixels, stride, frame_h, dx - 3, exit_y - (s_menu_full_font ? 1 : 0), dw + 6, ebh, &tc, true);
+                    }
+                    DrawSmallText(pixels, stride, frame_h, lx, ety, "[ Exit to Launcher ]",
+                                  sel_l ? 0xFF70B8FFu : 0xFF4C94E8u);
+                    DrawSmallText(pixels, stride, frame_h, dx, ety, "[ Exit to Desktop ]",
+                                  sel_d ? 0xFFFF7878u : 0xFFE85454u);
                 }
-                if (sel_d) {
-                    DrawThemedHighlightRect(pixels, stride, frame_h, dx - 3, exit_y, dw + 6, 9, &tc, true);
-                }
-                DrawSmallText(pixels, stride, frame_h, lx, exit_y, "[ Exit to Launcher ]",
-                              sel_l ? 0xFF70B8FFu : 0xFF4C94E8u);
-                DrawSmallText(pixels, stride, frame_h, dx, exit_y, "[ Exit to Desktop ]",
-                              sel_d ? 0xFFFF7878u : 0xFFE85454u);
 #endif
+            }
+
+            /* Scroll indicators when Game tab extends beyond viewport */
+            {
+#ifdef __ANDROID__
+                int g_last_y = GetGameTabRowY(GAME_OPT_EXIT_TO_DESKTOP) + g_rh;
+#else
+                int g_last_y = GetGameTabRowY(GAME_OPT_EXIT_TO_LAUNCHER) + g_rh;
+#endif
+                if (s_game_scroll_y > 0) {
+                    DrawSmallText(pixels, stride, frame_h, content_x + content_w - 6, g_view_top, "^", tc.sel_text_col);
+                }
+                if (g_last_y - s_game_scroll_y > g_view_bot) {
+                    DrawSmallText(pixels, stride, frame_h, content_x + content_w - 6, g_view_bot - (s_menu_full_font ? 10 : 8), "v", tc.sel_text_col);
+                }
             }
 
             /* Live dynamic description of highlighted option */
@@ -11283,47 +11484,53 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                 "* Restore full machine snapshot from Slot 2.",
                 "* Restore full machine snapshot from Slot 3.",
                 "* 4:3 pillarbox all maps, classic ring menu & checkerboard.",
-                "* Glass theme color (Omnitopia, Volcano, etc.) or Original.",
 #ifdef __ANDROID__
                 "* Toggle the translucent on-screen touch controller overlay.",
                 "* Adjust transparency of the on-screen touch controller.",
+                "* Switch slideout menu between Compact 6px and Full 8px font.",
+                "* Glass theme color (Omnitopia, Volcano, etc.) or Original.",
                 "* Restores all Game, Video, CRT & Bloom settings.",
                 "* Save all settings and SRAM, then exit to Android launcher."
 #else
+                "* Switch slideout menu between Compact 6px and Full 8px font.",
+                "* Glass theme color (Omnitopia, Volcano, etc.) or Original.",
                 "* Restores all Game, Video, CRT & Bloom settings.",
                 "* Save all settings and SRAM, then return to launcher.",
                 "* Save all settings and SRAM, then exit to desktop."
 #endif
             };
             const char *desc = (sel_row >= 0 && sel_row < GAME_OPT_COUNT) ? kGameDescs[sel_row] : "";
+            int desc_y = s_menu_full_font ? 186 : 189;
             if (s_menu_toast_timer > 0) {
                 s_menu_toast_timer--;
                 int tw = MeasureSmallText(s_menu_toast);
-                DrawSmallText(pixels, stride, frame_h, content_x + (content_w - tw) / 2, 189,
+                DrawSmallText(pixels, stride, frame_h, content_x + (content_w - tw) / 2, desc_y,
                               s_menu_toast, 0xFF90FFB8);
             } else {
-                DrawSmallText(pixels, stride, frame_h, content_x + 10, 189, desc, tc.subtext_col);
+                DrawSmallText(pixels, stride, frame_h, content_x + 10, desc_y, desc, tc.subtext_col);
             }
         }
         else if (s_active_tab == TAB_FIXES) {
             /* Tab 3: Gameplay Bugfixes */
+            int fix_hy = s_menu_full_font ? 48 : 46;
             int htw = MeasureSmallText("GAMEPLAY BUGFIXES");
-            DrawSmallText(pixels, stride, frame_h, content_x + 2, 46, "GAMEPLAY BUGFIXES", tc.subtext_col);
+            DrawSmallText(pixels, stride, frame_h, content_x + 2, fix_hy, "GAMEPLAY BUGFIXES", tc.subtext_col);
             int line_x = content_x + 2 + htw + 6;
             int line_w = (content_x + content_w - 4) - line_x;
             if (line_w > 0) {
                 DrawSemiTransparentRect(pixels, stride, frame_h,
-                                        line_x, 49, line_w, 1,
+                                        line_x, fix_hy + (s_menu_full_font ? 4 : 3), line_w, 1,
                                         tc.div_r, tc.div_g, tc.div_b, 185);
             }
             int fix_start_y = start_y;
             int fix_row_h = row_h;
+            int fix_box_h = s_menu_full_font ? 13 : 11;
             for (int i = 0; i < FIX_OPT_COUNT; i++) {
                 int row_y = fix_start_y + i * fix_row_h;
                 bool is_sel = (i == sel_row);
                 if (is_sel) {
                     DrawThemedHighlightRect(pixels, stride, frame_h,
-                                            content_x, row_y - 1, content_w, 11, &tc, true);
+                                            content_x, row_y - 1, content_w, fix_box_h, &tc, true);
                     DrawSmallText(pixels, stride, frame_h, content_x + 2, row_y + 1, ">", 0xFFFFFFFF);
                 }
 
@@ -11370,22 +11577,23 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
             DrawSmallText(pixels, stride, frame_h, content_x + 10, 189, desc, tc.subtext_col);
         }
         else if (s_active_tab == TAB_VIDEO_OPTIONS) {
-            /* Tab 1: A/V Options (scrollable 12-row window) */
+            /* Tab 1: A/V Options (scrollable window) */
+            int av_vis = GetAvVisibleRows();
             if (sel_row < s_av_scroll) s_av_scroll = sel_row;
-            if (sel_row >= s_av_scroll + kAvVisibleRows) s_av_scroll = sel_row - kAvVisibleRows + 1;
-            int max_av_scroll = VIDEO_OPT_COUNT - kAvVisibleRows;
+            if (sel_row >= s_av_scroll + av_vis) s_av_scroll = sel_row - av_vis + 1;
+            int max_av_scroll = VIDEO_OPT_COUNT - av_vis;
             if (max_av_scroll < 0) max_av_scroll = 0;
             if (s_av_scroll < 0) s_av_scroll = 0;
             if (s_av_scroll > max_av_scroll) s_av_scroll = max_av_scroll;
 
-            for (int r = 0; r < kAvVisibleRows; r++) {
+            for (int r = 0; r < av_vis; r++) {
                 int i = s_av_scroll + r;
                 if (i >= VIDEO_OPT_COUNT) break;
                 int row_y = start_y + r * row_h;
                 bool is_sel = (i == sel_row);
-                int box_y = (row_h <= 11) ? row_y : (row_y - 1);
-                int box_h = (row_h <= 11) ? 11 : (row_h - 1);
-                int text_y = (row_h <= 11) ? (row_y + 1) : (row_y + 2);
+                int box_y = s_menu_full_font ? (row_y - 1) : ((row_h <= 11) ? row_y : (row_y - 1));
+                int box_h = s_menu_full_font ? 12 : ((row_h <= 11) ? 11 : (row_h - 1));
+                int text_y = s_menu_full_font ? (row_y + 1) : ((row_h <= 11) ? (row_y + 1) : (row_y + 2));
 
                 if (is_sel) {
                     DrawThemedHighlightRect(pixels, stride, frame_h,
@@ -11497,9 +11705,9 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                 DrawSemiTransparentRect(pixels, stride, frame_h, ax + 1, ay + 1, 3, 1, 255, 255, 144, 240);
                 DrawSemiTransparentRect(pixels, stride, frame_h, ax,     ay + 2, 5, 1, 255, 255, 144, 240);
             }
-            if (s_av_scroll + kAvVisibleRows < VIDEO_OPT_COUNT) {
+            if (s_av_scroll + av_vis < VIDEO_OPT_COUNT) {
                 int ax = content_x + content_w - 6;
-                int ay = start_y + (kAvVisibleRows - 1) * row_h + 2;
+                int ay = start_y + (av_vis - 1) * row_h + 2;
                 DrawSemiTransparentRect(pixels, stride, frame_h, ax,     ay,     5, 1, 255, 255, 144, 240);
                 DrawSemiTransparentRect(pixels, stride, frame_h, ax + 1, ay + 1, 3, 1, 255, 255, 144, 240);
                 DrawSemiTransparentRect(pixels, stride, frame_h, ax + 2, ay + 2, 1, 1, 255, 255, 144, 240);
@@ -11848,34 +12056,49 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
             DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 30, "Trigs: LT: Settings Menu    RT: Debug Tools Overlay", tc.subtext_col);
         }
         else if (s_active_tab == TAB_HELP_README) {
-            /* Tab 5: Help / ReadMe */
-            int box_y = start_y + 1;
-            int box_h = 152;
+            /* Tab 7: Help / ReadMe */
+            int box_y = s_menu_full_font ? 47 : (start_y + 1);
+            int box_h = s_menu_full_font ? 149 : 152;
             DrawThemedHighlightRect(pixels, stride, frame_h, content_x, box_y, content_w, box_h, &tc, false);
 
-            DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 4,  "Secret of Evermore PC Native Recompilation (Evertopia)", 0xFFFFFFFF);
-            DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 14, "----------------------------------------", tc.muted_col);
-            DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 24, "Navigation: D-Pad / Arrows; A toggles; B / Esc closes", tc.subtext_col);
-            DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 35, "Switch Tab: LB / RB (or [ / ]), or click header", tc.subtext_col);
-            DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 46, "Filters   : CRT scanlines, bloom glow & Glass UI", tc.subtext_col);
-            DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 57, "Debug Menu: RT / F2 / ` opens Warps, Forms, Stats", tc.subtext_col);
-            DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 68, "Host Keys : Alt+Enter Fullscreen | Tab Turbo", tc.subtext_col);
-            DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 79, "States    : F11 Save Browser | F12 Rewind", tc.subtext_col);
-            DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 90, "Launcher  : --launcher or SkipLauncher=0 opens UI", tc.subtext_col);
-            DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 101,"Save Files: config.ini, keybinds.ini, *_config.json", tc.subtext_col);
-            DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 113,"License   : PolyForm Noncommercial 1.0.0 / MIT", tc.muted_col);
-            DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 125,"Thanks to Square USA, snesrecomp, snesrev & SDL", tc.muted_col);
-            DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 137,"Evertopia : Named by EddieEddie90 - Thank you!", tc.muted_col);
+            if (s_menu_full_font) {
+                static const char *const kHelpLines[12] = {
+                    "Secret of Evermore (Evertopia)",
+                    "Move: D-Pad/Arrows | A: Toggle | B: Close",
+                    "Tabs: LB/RB or [ / ] or click tab bar",
+                    "Visuals: CRT, Bloom & Glass UI themes",
+                    "Debug: RT / F2 / ` for Warps & Stats",
+                    "Keys: Alt+Enter Fullscreen | Tab Turbo",
+                    "States: F11 Browser | F12 Rewind",
+                    "Launcher: --launcher or SkipLauncher=0",
+                    "Configs: config.ini & *_config.json",
+                    "License: PolyForm Noncommercial / MIT",
+                    "Thanks: Square USA, snesrecomp & SDL",
+                    "Evertopia: Named by EddieEddie90!"
+                };
+                for (int li = 0; li < 12; li++) {
+                    uint32_t lc = (li == 0) ? 0xFFFFFFFFu : ((li >= 9) ? tc.muted_col : tc.subtext_col);
+                    DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 4 + li * 12, kHelpLines[li], lc);
+                }
+            } else {
+                DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 4,  "Secret of Evermore PC Native Recompilation (Evertopia)", 0xFFFFFFFF);
+                DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 14, "----------------------------------------", tc.muted_col);
+                DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 24, "Navigation: D-Pad / Arrows; A toggles; B / Esc closes", tc.subtext_col);
+                DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 35, "Switch Tab: LB / RB (or [ / ]), or click header", tc.subtext_col);
+                DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 46, "Filters   : CRT scanlines, bloom glow & Glass UI", tc.subtext_col);
+                DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 57, "Debug Menu: RT / F2 / ` opens Warps, Forms, Stats", tc.subtext_col);
+                DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 68, "Host Keys : Alt+Enter Fullscreen | Tab Turbo", tc.subtext_col);
+                DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 79, "States    : F11 Save Browser | F12 Rewind", tc.subtext_col);
+                DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 90, "Launcher  : --launcher or SkipLauncher=0 opens UI", tc.subtext_col);
+                DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 101,"Save Files: config.ini, keybinds.ini, *_config.json", tc.subtext_col);
+                DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 113,"License   : PolyForm Noncommercial 1.0.0 / MIT", tc.muted_col);
+                DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 125,"Thanks to Square USA, snesrecomp, snesrev & SDL", tc.muted_col);
+                DrawSmallText(pixels, stride, frame_h, content_x + 6, box_y + 137,"Evertopia : Named by EddieEddie90 - Thank you!", tc.muted_col);
+            }
         }
 
         /* Bottom separator */
         if (s_reset_confirm != RESET_CONFIRM_NONE) {
-            int dlg_w = 188;
-            int dlg_h = 54;
-            int dlg_x = content_x + (content_w - dlg_w) / 2;
-            int dlg_y = start_y + 42;
-            DrawThemedWindowPanel(pixels, stride, frame_w, frame_h, dlg_x, dlg_y, dlg_w, dlg_h, 0, 2, true, false);
-            DrawSmallText(pixels, stride, frame_h, dlg_x + 56, dlg_y + 8, "ARE YOU SURE?", 0xFFFFB040u);
             const char *msg = "Reset settings to default?";
             if (s_reset_confirm == RESET_CONFIRM_ALL) msg = "Reset ALL settings to default?";
             else if (s_reset_confirm == RESET_CONFIRM_VIDEO) msg = "Reset Video settings to default?";
@@ -11887,31 +12110,49 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
 #else
             else if (s_reset_confirm == RESET_CONFIRM_EXIT_DESKTOP) msg = "Exit to Desktop?";
 #endif
-            DrawSmallText(pixels, stride, frame_h, dlg_x + 12, dlg_y + 20, msg, 0xFFFFFFFFu);
+            int msg_w = MeasureSmallText(msg);
+            int dlg_w = (msg_w + 24 > 188) ? (msg_w + 24) : 188;
+            if (dlg_w > content_w - 8) dlg_w = content_w - 8;
+            int dlg_h = s_menu_full_font ? 60 : 54;
+            int dlg_x = content_x + (content_w - dlg_w) / 2;
+            int dlg_y = start_y + 42;
+            DrawThemedWindowPanel(pixels, stride, frame_w, frame_h, dlg_x, dlg_y, dlg_w, dlg_h, 0, 2, true, false);
+            int title_w = MeasureSmallText("ARE YOU SURE?");
+            DrawSmallText(pixels, stride, frame_h, dlg_x + (dlg_w - title_w) / 2, dlg_y + 8, "ARE YOU SURE?", 0xFFFFB040u);
+            DrawSmallText(pixels, stride, frame_h, dlg_x + (dlg_w - msg_w) / 2, dlg_y + (s_menu_full_font ? 22 : 20), msg, 0xFFFFFFFFu);
 
             int btn_w = 54;
-            int btn_h = 14;
+            int btn_h = s_menu_full_font ? 15 : 14;
             int yes_x = dlg_x + 30;
             int no_x = dlg_x + dlg_w - 30 - btn_w;
-            int btn_y = dlg_y + 33;
+            int btn_y = dlg_y + (s_menu_full_font ? 37 : 33);
+            int yes_tw = MeasureSmallText("YES");
+            int no_tw  = MeasureSmallText("NO");
             DrawThemedHighlightRect(pixels, stride, frame_h, yes_x, btn_y, btn_w, btn_h, &tc, s_reset_confirm_choice == 0);
-            DrawSmallText(pixels, stride, frame_h, yes_x + 18, btn_y + 4, "YES",
+            DrawSmallText(pixels, stride, frame_h, yes_x + (btn_w - yes_tw) / 2, btn_y + (s_menu_full_font ? 3 : 4), "YES",
                           s_reset_confirm_choice == 0 ? 0xFFFFFFFFu : tc.muted_col);
             DrawThemedHighlightRect(pixels, stride, frame_h, no_x, btn_y, btn_w, btn_h, &tc, s_reset_confirm_choice == 1);
-            DrawSmallText(pixels, stride, frame_h, no_x + 21, btn_y + 4, "NO",
+            DrawSmallText(pixels, stride, frame_h, no_x + (btn_w - no_tw) / 2, btn_y + (s_menu_full_font ? 3 : 4), "NO",
                           s_reset_confirm_choice == 1 ? 0xFFFFFFFFu : tc.muted_col);
         }
         DrawSemiTransparentRect(pixels, stride, frame_h,
-                                drawer_x + 6, frame_h - 26, drawer_w - 12, 1,
+                                drawer_x + 6, frame_h - (s_menu_full_font ? 24 : 26), drawer_w - 12, 1,
                                 tc.div_r, tc.div_g, tc.div_b, 190);
 
-        /* Bottom Navigation Hints Footer (centered) */
+        /* Bottom Navigation Hints Footer (centered, auto-fits width) */
         const char *footer_text = "LB/RB: Tab | D-Pad: Move | A: Toggle | B/LT/Esc: Close";
+        if (MeasureSmallText(footer_text) > drawer_w - 12) {
+            footer_text = "LB/RB:Tab  D-Pad:Move  A:Set  B/Esc:Close";
+        }
+        if (MeasureSmallText(footer_text) > drawer_w - 12) {
+            footer_text = "LB/RB:Tab  A:Set  B/Esc:Close";
+        }
         int foot_w = MeasureSmallText(footer_text);
         int foot_x = drawer_x + (drawer_w - foot_w) / 2;
         if (foot_x < drawer_x + 6) foot_x = drawer_x + 6;
-        DrawSmallText(pixels, stride, frame_h, foot_x, frame_h - 20,
+        DrawSmallText(pixels, stride, frame_h, foot_x, frame_h - (s_menu_full_font ? 19 : 20),
                       footer_text, tc.subtext_col);
+        s_draw_full_font = false;
     } else {
         /*
          * 10-Second "Menu [LT/F1]" (left) & "Debug [Hold RT/F2]" (right) Tabs:

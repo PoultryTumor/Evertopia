@@ -8,6 +8,13 @@ A native PC static recompilation port of **Secret of Evermore** (SNES, USA), bui
 
 ## What's New
 
+### v0.9.13
+- **New `MENU SETTINGS` Section & Full-Size Native SNES Menu Font:** Added a **MENU SETTINGS** section under the **Game** tab (grouping **Menu Font** and **Dialog Box Theme**).
+  - **Menu Font (`Compact (6px)` / `Full Size (8px)`):** Toggle the slide-out menu between the compact 6px HUD font (`$C4:0C82`) and Secret of Evermore's native full-size 8px in-game dialog/menu font (`$C4:0000`) with matching 1px drop shadows — saved in `Configs/video_config.json`.
+  - **Responsive Full-Size Layout:** Added smooth vertical scrolling with `^`/`v` indicators and hit-testing to the **Game** tab, scaled the **Video** tab window, tab bar, highlight bars, confirmation modal, **Help** tab, and footer hints so everything fits cleanly at 4:3, 16:9, and 21:9.
+- **What's Fixed — 1-Pixel 4:3 Pillarbox Alignment:** Removed the 1-pixel inward over-clamp (`extra + 1` / `extra + 255`) on pillarboxed screens and extended the Original Mode pillarbox clamp through the full `224px` height so the world (`y = 0..191`) and HUD (`y = 192..223`) edges are completely flush with zero step at row 192.
+- **All Platforms Updated (`v0.9.13`):** Rebuilt and updated Linux x64, Android arm64 APK (`versionCode 913`), and Windows x64 Setup Pack releases.
+
 ### v0.9.12
 - **What's Fixed — Original Mode 4:3 HUD Positioning:** Fixed the status bar HUD (portraits, HP, and stamina bars) remaining split to the outer widescreen margins when **Original Mode** (`On (4:3)`) is enabled.
   - While **Original Mode** is active, the two-character (Boy + Dog) HUD is now anchored inside the centered 4:3 pillarboxes just like the original 1995 SNES release, while the single-character HUD stays centered.
