@@ -9619,7 +9619,7 @@ static void SoeApplyHudWidescreenConfig(Ppu *ppu, int left_space, int right_spac
                            (dog_hud_col == 0x000Bu) ||
                            (boy_ent == 0u) ||
                            (dog_ent == 0u);
-    bool dual_edge_hud = (s_hud_mode == SOE_HUD_MOVE_LEFT && !single_char_hud);
+    bool dual_edge_hud = (!s_original_mode && s_hud_mode == SOE_HUD_MOVE_LEFT && !single_char_hud);
 
     PpuSetWidescreenHudAlwaysVisible(ppu, true);
     PpuSetWidescreenBg3Widen(ppu, 192);
@@ -11408,7 +11408,8 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                 case VIDEO_OPT_HUD_POSITION:
                     snprintf(label_buf, sizeof(label_buf), "Status Bar HUD Position");
                     snprintf(val_buf, sizeof(val_buf), "%s",
-                             s_hud_mode == SOE_HUD_MOVE_LEFT ? "Move Left Margin" : "Original 4:3 Center");
+                             s_original_mode ? "Original 4:3 (Orig)" :
+                             (s_hud_mode == SOE_HUD_MOVE_LEFT ? "Move Left Margin" : "Original 4:3 Center"));
                     break;
                 case VIDEO_OPT_PILLARBOX:
                     snprintf(label_buf, sizeof(label_buf), "Per-Map Pillarbox Clamping");

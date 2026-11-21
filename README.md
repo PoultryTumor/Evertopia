@@ -8,6 +8,12 @@ A native PC static recompilation port of **Secret of Evermore** (SNES, USA), bui
 
 ## What's New
 
+### v0.9.12
+- **What's Fixed — Original Mode 4:3 HUD Positioning:** Fixed the status bar HUD (portraits, HP, and stamina bars) remaining split to the outer widescreen margins when **Original Mode** (`On (4:3)`) is enabled.
+  - While **Original Mode** is active, the two-character (Boy + Dog) HUD is now anchored inside the centered 4:3 pillarboxes just like the original 1995 SNES release, while the single-character HUD stays centered.
+  - Turning **Original Mode** off immediately restores your saved **Status Bar HUD Position** (`Move Left Margin` / `Original 4:3 Center`) without overwriting it; **Video Options → Status Bar HUD Position** also displays `Original 4:3 (Orig)` while Original Mode is active.
+- **All Platforms Updated (`v0.9.12`):** Rebuilt and updated Linux x64, Android arm64 APK (`versionCode 912`), and Windows x64 Setup Pack releases.
+
 ### v0.9.11
 - **Original Mode (Game Options Toggle):** Added an **Original Mode** (`On (4:3)` / `Off`) toggle under **Game Options → GAME SETTINGS** so you can flick classic 1995 SNES presentation on and off anytime without disturbing your saved preferences.
   - **4:3 Pillarboxing Across All Maps:** Forces centered 4:3 pillarboxing on every map and menu screen (and disables Mode 4 side-margin mosaic) without reading or writing `map_pillarbox.json`.
