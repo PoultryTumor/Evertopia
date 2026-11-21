@@ -9196,16 +9196,13 @@ static int16_t SoeGetEffectivePpuScrollAxis(uint16_t ram_addr, uint16_t ppu_scro
     return (abs(diff) <= 32) ? (int16_t)((int)ram_s + diff) : ram_s;
 }
 
-static int SoeGetWorldCamScrollLayer(const Ppu *ppu, bool vertical)
+static int SoeResolveWorldCamLayerOnAxis(bool vertical)
 {
-    if (!ppu || (ppu->screenEnabled[0] & 0x03u) != 0x03u) return 0;
-    if ((g_ram[0x0B29] & 0x03u) != 0x03u) return 0;
-
     uint16_t a1 = vertical ? 0x0110u : 0x010Eu;
     uint16_t a2 = vertical ? 0x0114u : 0x0112u;
     int16_t s1 = (int16_t)(uint16_t)(g_ram[a1] | (g_ram[a1 + 1u] << 8));
     int16_t s2 = (int16_t)(uint16_t)(g_ram[a2] | (g_ram[a2 + 1u] << 8));
-    if (s1 == s2) return 0;
+    if (s1 == s2) return -1;
 
     /* Secret of Evermore's true world camera lives at $7E:0059 (X) / $7E:005B (Y).
      * On parallax maps (e.g. Map 56 & Map 65 jungle canopy), the engine writes $0059/$005B
@@ -9236,6 +9233,22 @@ static int SoeGetWorldCamScrollLayer(const Ppu *ppu, bool vertical)
         return 1;
     }
     return 0;
+}
+
+static int SoeGetWorldCamScrollLayer(const Ppu *ppu, bool vertical)
+{
+    if (!ppu || (ppu->screenEnabled[0] & 0x03u) != 0x03u) return 0;
+    if ((g_ram[0x0B29] & 0x03u) != 0x03u) return 0;
+
+    int layer = SoeResolveWorldCamLayerOnAxis(vertical);
+    if (layer >= 0) return layer;
+
+    /* At a map edge (e.g. X=0 on Map 56), both layers can share scroll 0 on one axis
+     * while still diverging via parallax on the perpendicular axis. Fall back to the
+     * other axis before defaulting to BG1 so a sparse parallax canopy layer is never
+     * mistaken for the playable world layer (which would falsely pillarbox the edge). */
+    layer = SoeResolveWorldCamLayerOnAxis(!vertical);
+    return (layer >= 0) ? layer : 0;
 }
 
 static int16_t SoeGetEffectivePpuCamScroll(const Ppu *ppu, bool vertical)
@@ -11168,11 +11181,13 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                 "* Restore full machine snapshot from Slot 2.",
                 "* Restore full machine snapshot from Slot 3.",
                 "* Glass theme color (Omnitopia, Volcano, etc.) or Original.",
-                "* Ring Menu: Enhanced (smooth rotation & sprite cache) or Original.",
-                "* Restores all Game, Video, CRT & Bloom settings.",
 #ifdef __ANDROID__
+                "* Toggle the translucent on-screen touch controller overlay.",
+                "* Adjust transparency of the on-screen touch controller.",
+                "* Restores all Game, Video, CRT & Bloom settings.",
                 "* Save all settings and SRAM, then exit to Android launcher."
 #else
+                "* Restores all Game, Video, CRT & Bloom settings.",
                 "* Save all settings and SRAM, then return to launcher.",
                 "* Save all settings and SRAM, then exit to desktop."
 #endif

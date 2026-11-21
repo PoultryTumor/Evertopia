@@ -8,6 +8,12 @@ A native PC static recompilation port of **Secret of Evermore** (SNES, USA), bui
 
 ## What's New
 
+### v0.9.9
+- **Parallax Map Edge Widescreen Clamping Fix (Map 56 & All Parallax Maps):** Fixed a bug where walking all the way to the left edge (`X = 0`) or top edge (`Y = 0`) of parallax-scrolling maps (such as Map 56 — Prehistoria Jungle) caused the screen to suddenly snap into a 4:3 pillarbox until walking back away from the edge.
+  - When BG1 and BG2 share the same scroll (`0`) on one axis at a map boundary while diverging via parallax on the perpendicular axis, `SoeGetWorldCamScrollLayer()` now falls back to checking the perpendicular axis instead of defaulting to BG1 (the sparse canopy layer), keeping BG2 (the playable ground) selected so the viewport anchors seamlessly in full widescreen.
+- **Game Tab Description Cleanup:** Fixed a misaligned footer description array (`kGameDescs`) on the **Game** tab after moving **Ring Menu** to the **Fixes** tab.
+- **All Platforms Updated (`v0.9.9`):** Rebuilt and updated Linux x64, Android arm64 APK (`versionCode 909`), and Windows x64 Setup Pack releases.
+
 ### v0.9.8
 - **Brighter Selected Menu Text Highlight:** Brightened the theme-tinted highlight text color (`sel_text_col`) on the currently selected menu item across all glass themes and the classic blue theme so active selections stand out more clearly and are easier to read.
 - **Consistent `On` / `Off` Setting Labels:** Standardized all settings and toggles across the menus from `"ON"` / `"OFF"` to `"On"` / `"Off"`.
