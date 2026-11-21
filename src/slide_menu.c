@@ -140,18 +140,19 @@ enum {
     GAME_OPT_LOAD_STATE_1 = 3, /* Load State Slot 1 */
     GAME_OPT_LOAD_STATE_2 = 4, /* Load State Slot 2 */
     GAME_OPT_LOAD_STATE_3 = 5, /* Load State Slot 3 */
-    GAME_OPT_DIALOG_THEME = 6, /* Dialog Box Theme: Omnitopia Blue (Default), Original (Dither) */
+    GAME_OPT_ORIGINAL_MODE = 6, /* Original Mode: 4:3 pillarbox all maps, classic ring menu & checkerboard windows */
+    GAME_OPT_DIALOG_THEME = 7,  /* Dialog Box Theme: Omnitopia Blue (Default), Original (Dither) */
 #ifdef __ANDROID__
-    GAME_OPT_TOUCH_OVERLAY = 7,    /* On-screen Touch Controls Overlay: On (Default) / Off */
-    GAME_OPT_TOUCH_OPACITY = 8,    /* On-screen Touch Overlay Opacity: 10%..100% (Default 20%) */
-    GAME_OPT_RESET_ALL = 9,        /* Reset All Settings to Default */
-    GAME_OPT_EXIT_TO_DESKTOP = 10, /* Save all settings and exit to Android launcher */
-    GAME_OPT_COUNT = 11
+    GAME_OPT_TOUCH_OVERLAY = 8,    /* On-screen Touch Controls Overlay: On (Default) / Off */
+    GAME_OPT_TOUCH_OPACITY = 9,    /* On-screen Touch Overlay Opacity: 10%..100% (Default 20%) */
+    GAME_OPT_RESET_ALL = 10,       /* Reset All Settings to Default */
+    GAME_OPT_EXIT_TO_DESKTOP = 11, /* Save all settings and exit to Android launcher */
+    GAME_OPT_COUNT = 12
 #else
-    GAME_OPT_RESET_ALL = 7,        /* Reset All Settings to Default */
-    GAME_OPT_EXIT_TO_LAUNCHER = 8, /* Save all settings and return to launcher */
-    GAME_OPT_EXIT_TO_DESKTOP = 9,  /* Save all settings and exit to desktop */
-    GAME_OPT_COUNT = 10
+    GAME_OPT_RESET_ALL = 8,        /* Reset All Settings to Default */
+    GAME_OPT_EXIT_TO_LAUNCHER = 9, /* Save all settings and return to launcher */
+    GAME_OPT_EXIT_TO_DESKTOP = 10, /* Save all settings and exit to desktop */
+    GAME_OPT_COUNT = 11
 #endif
 };
 
@@ -427,10 +428,18 @@ static bool s_pillarbox_enabled = true; /* Slideout toggle: Pillarboxes on/off *
 static bool s_lock_60fps = false;       /* Slideout toggle: false = High-Hz Subpixel Scroll (Auto Display Hz) */
 static bool s_interpolate_sprites = false; /* Slideout toggle: Subpixel sprite interpolation */
 static bool s_enhanced_ring_menu = true;  /* Slideout toggle: Enhanced Ring Menu (smooth OAM + texel cache) */
+static bool s_original_mode = false;      /* Original Mode: 4:3 pillarbox all maps, classic ring menu & checkerboard windows */
+static uint16_t s_orig_saved_0b15 = 0;    /* Saved $7E:0B15 pattern before entering Original Mode */
+static bool s_orig_prev_in_gameplay = false; /* Tracks title->gameplay transition for Original Mode default checkerboard */
 #ifdef __ANDROID__
 static bool s_android_touch_overlay = true; /* Android-only: On-screen Touch Controller Overlay (On on first boot) */
 static int s_android_touch_opacity = 20;    /* Android-only: Overlay Opacity 10..100% (Default 20%) */
 #endif
+
+static inline bool SoeIsEnhancedRingMenuActive(void)
+{
+    return !s_original_mode && s_enhanced_ring_menu;
+}
 
 /* Enhanced Ring Menu opening curve: ~30% slower approach (~13 frames) than before
  * with the same 6-frame damped radial spring bounce (44 -> 34 -> 45 -> 44 -> 42) on open only. */
@@ -450,7 +459,7 @@ static void SoeRingHookLoopTop(CpuState *cpu, uint32_t pc24)
 {
     (void)cpu;
     (void)pc24;
-    if (!s_enhanced_ring_menu || !s_ring_open_active) return;
+    if (!SoeIsEnhancedRingMenuActive() || !s_ring_open_active) return;
 
     static const uint8_t kRadii[19] = {
         238, 221, 204, 187, 170, 153, 136, 119, 103, 87, 72, 57, 44,
@@ -478,7 +487,7 @@ static void SoeRingHookLoopEnd(CpuState *cpu, uint32_t pc24)
 {
     (void)cpu;
     (void)pc24;
-    if (!s_enhanced_ring_menu || !s_ring_open_active) return;
+    if (!SoeIsEnhancedRingMenuActive() || !s_ring_open_active) return;
 
     s_ring_open_step++;
     if (s_ring_open_step < 19) {
@@ -494,7 +503,7 @@ static void SoeRingHookFinalSettle(CpuState *cpu, uint32_t pc24)
     (void)pc24;
     if (!s_ring_open_active) return;
     s_ring_open_active = false;
-    if (s_enhanced_ring_menu) {
+    if (SoeIsEnhancedRingMenuActive()) {
         g_ram[0x0619] = 0x2Au;
         g_ram[0x061A] = 0;
     }
@@ -512,6 +521,11 @@ static double s_active_pres_hz = 60.098811862;
 extern void snes_beam_frame_driver_set_fast_cpu(bool enabled);
 static SoeDialogTheme s_dialog_theme = DIALOG_THEME_OMNITOPIA;
 static bool s_solid_dialog_bg = true;   /* Kept synced with s_dialog_theme != DIALOG_THEME_ORIGINAL */
+
+static inline SoeDialogTheme SoeGetActiveDialogTheme(void)
+{
+    return s_original_mode ? DIALOG_THEME_ORIGINAL : s_dialog_theme;
+}
 static bool s_dialog_capture_active = false;
 static int s_dialog_capture_h = 192;
 static uint32_t s_bg3_overlay_buf[240 * 256];
@@ -2191,6 +2205,7 @@ static void SoeSaveVideoConfig(void)
     fprintf(f, "  \"lock_60fps\": %d,\n", s_lock_60fps ? 1 : 0);
     fprintf(f, "  \"interpolate_sprites\": %d,\n", s_interpolate_sprites ? 1 : 0);
     fprintf(f, "  \"enhanced_ring_menu\": %d,\n", s_enhanced_ring_menu ? 1 : 0);
+    fprintf(f, "  \"original_mode\": %d,\n", s_original_mode ? 1 : 0);
     fprintf(f, "  \"eliminate_lag_frames\": %d,\n", s_eliminate_lag_frames ? 1 : 0);
 #ifdef __ANDROID__
     fprintf(f, "  \"touch_overlay\": %d,\n", s_android_touch_overlay ? 1 : 0);
@@ -2209,6 +2224,7 @@ static void SoeLoadVideoConfig(void)
     s_lock_60fps = false;
     s_interpolate_sprites = false;
     s_enhanced_ring_menu = true;
+    s_original_mode = false;
     s_eliminate_lag_frames = true;
 #ifdef __ANDROID__
     s_android_touch_overlay = true;
@@ -2253,6 +2269,8 @@ static void SoeLoadVideoConfig(void)
             s_interpolate_sprites = (val != 0);
         } else if (strcmp(q1 + 1, "enhanced_ring_menu") == 0) {
             s_enhanced_ring_menu = (val != 0);
+        } else if (strcmp(q1 + 1, "original_mode") == 0) {
+            s_original_mode = (val != 0);
         } else if (strcmp(q1 + 1, "eliminate_lag_frames") == 0) {
             s_eliminate_lag_frames = (val != 0);
 #ifdef __ANDROID__
@@ -2283,6 +2301,33 @@ static void SoeLoadVideoConfig(void)
         s_ws_mode = SOE_WS_OFF;
     } else if (s_ws_mode == SOE_WS_OFF) {
         s_ws_mode = SOE_WS_21_9;
+    }
+}
+
+static void SoeSetOriginalMode(bool enable, bool save_config)
+{
+    if (enable) {
+        if (!s_original_mode) {
+            uint16_t cur_0b15 = (uint16_t)(g_ram[0x0B15] | (g_ram[0x0B16] << 8));
+            if (cur_0b15 >= 0x1924u && cur_0b15 <= 0x19A4u) {
+                s_orig_saved_0b15 = cur_0b15;
+            }
+            /* Default to authentic 1995 blue checkerboard window pattern */
+            g_ram[0x0B15] = 0x44;
+            g_ram[0x0B16] = 0x19;
+        }
+        s_original_mode = true;
+    } else {
+        if (s_original_mode) {
+            if (s_orig_saved_0b15 >= 0x1924u && s_orig_saved_0b15 <= 0x19A4u) {
+                g_ram[0x0B15] = (uint8_t)(s_orig_saved_0b15 & 0xFFu);
+                g_ram[0x0B16] = (uint8_t)(s_orig_saved_0b15 >> 8);
+            }
+        }
+        s_original_mode = false;
+    }
+    if (save_config) {
+        SoeSaveVideoConfig();
     }
 }
 
@@ -2571,7 +2616,7 @@ static void GetUiThemeColorsFor(SoeDialogTheme theme, SoeUiThemeColors *out)
 
 static void GetUiThemeColors(SoeUiThemeColors *out)
 {
-    GetUiThemeColorsFor(s_dialog_theme, out);
+    GetUiThemeColorsFor(SoeGetActiveDialogTheme(), out);
 }
 
 static void DrawGlassGradientBox(uint32_t *pixels, int stride, int frame_w, int frame_h,
@@ -2715,7 +2760,7 @@ static void DrawThemedWindowPanel(uint32_t *pixels, int stride, int frame_w, int
                                   int x, int y, int w, int h, int alpha_boost,
                                   int inset, bool draw_shadow, bool with_sparkle)
 {
-    DrawThemedWindowPanelFor(s_dialog_theme, pixels, stride, frame_w, frame_h,
+    DrawThemedWindowPanelFor(SoeGetActiveDialogTheme(), pixels, stride, frame_w, frame_h,
                              x, y, w, h, alpha_boost, inset, draw_shadow, with_sparkle);
 }
 
@@ -3110,7 +3155,7 @@ static void DrawGlassDialogBoxEffects(uint32_t *pixels, int stride, int frame_w,
  */
 static void SoeRenderProgrammaticDialogs(uint32_t *pixels, int stride, int frame_w, int frame_h)
 {
-    if (!pixels || s_dialog_theme == DIALOG_THEME_ORIGINAL || !s_dialog_capture_active) return;
+    if (!pixels || SoeGetActiveDialogTheme() == DIALOG_THEME_ORIGINAL || !s_dialog_capture_active) return;
     if (!g_snes || !g_snes->ppu) return;
 
     Ppu *ppu = g_snes->ppu;
@@ -3333,7 +3378,7 @@ static void SoeRenderProgrammaticDialogs(uint32_t *pixels, int stride, int frame
     }
 
     DrawGlassDialogBoxEffects(pixels, stride, frame_w, frame_h, native_x0,
-                              boxes, box_count, s_dialog_theme, NULL);
+                              boxes, box_count, SoeGetActiveDialogTheme(), NULL);
 
     /* Pass 3: Composite Authentic ROM Frame Borders, BG3 Cursors, Original ROM VWF Font & Text Shadows */
     for (int ny = 0; ny < cap_h; ny++) {
@@ -3401,9 +3446,10 @@ static void UploadWindowPrefsPreviewTile(Ppu *ppu, const SoeWinPrefsEntry *entry
 
 static int FindWinPrefsIndexForActiveState(void)
 {
-    if (s_dialog_theme != DIALOG_THEME_ORIGINAL) {
+    SoeDialogTheme active_theme = SoeGetActiveDialogTheme();
+    if (active_theme != DIALOG_THEME_ORIGINAL) {
         for (int i = 0; i < WINPREFS_ENTRY_COUNT; i++) {
-            if (kWinPrefsEntries[i].theme == s_dialog_theme) return i;
+            if (kWinPrefsEntries[i].theme == active_theme) return i;
         }
         return 1;
     }
@@ -3424,6 +3470,14 @@ static void SoeTickWindowPrefs(Ppu *ppu)
         if (s_in_winprefs) {
             s_in_winprefs = false;
         }
+        return;
+    }
+
+    /* In Original Mode, let the SNES game's native Window Prefs cycle authentic
+     * patterns untouched without injecting custom Glass themes or editing dialog_config.json. */
+    if (s_original_mode) {
+        s_in_winprefs = true;
+        s_winprefs_idx = FindWinPrefsIndexForActiveState();
         return;
     }
 
@@ -3520,11 +3574,12 @@ static void SoeRenderWindowPrefsOverlay(uint32_t *pixels, int stride, int frame_
         }
     }
 
-    if (ix1 > ix0 && iy1 > iy0 && s_dialog_theme != DIALOG_THEME_ORIGINAL) {
+    SoeDialogTheme active_theme = SoeGetActiveDialogTheme();
+    if (ix1 > ix0 && iy1 > iy0 && active_theme != DIALOG_THEME_ORIGINAL) {
         if (bx0 >= bx1) { bx0 = ix0; by0 = iy0; bx1 = ix1; by1 = iy1; }
         SoeDialogBoxRect box = { ix0, iy0, ix1, iy1, bx0, by0, bx1, by1 };
         DrawGlassDialogBoxEffects(pixels, stride, frame_w, frame_h, native_x0,
-                                  &box, 1, s_dialog_theme, s_wp_border_mask);
+                                  &box, 1, active_theme, s_wp_border_mask);
     }
 
     /* Display active pattern/theme name cleanly inside Window Prefs above the preview frame */
@@ -6594,25 +6649,29 @@ static void GetTabRowLayout(SoeMenuTab tab, int *out_start_y, int *out_row_h)
 
 static int GetGameTabRowY(int row)
 {
+#ifdef __ANDROID__
+    if (row < 3) {
+        return 54 + row * 9;
+    } else if (row < 6) {
+        return 89 + (row - 3) * 9;
+    } else if (row < 10) {
+        return 124 + (row - 6) * 9;
+    } else if (row == GAME_OPT_RESET_ALL) {
+        return 163;
+    } else {
+        return 175;
+    }
+#else
     if (row < 3) {
         return 55 + row * 9;
     } else if (row < 6) {
         return 92 + (row - 3) * 9;
-#ifdef __ANDROID__
-    } else if (row < 9) {
+    } else if (row < 8) {
         return 129 + (row - 6) * 10;
     } else if (row == GAME_OPT_RESET_ALL) {
-        return 161;
+        return 153;
     } else {
-        return 174;
-    }
-#else
-    } else if (row < 7) {
-        return 129 + (row - 6) * 10;
-    } else if (row == GAME_OPT_RESET_ALL) {
-        return 143;
-    } else {
-        return 156;
+        return 166;
     }
 #endif
 }
@@ -6853,6 +6912,12 @@ int SoeLoadStateSlot(int slot)
     memcpy(s_oam_prev, extra.oam_prev, sizeof(s_oam_prev));
     memcpy(s_oam_curr, extra.oam_curr, sizeof(s_oam_curr));
 
+    if (s_original_mode &&
+        (uint16_t)(g_ram[0x0B15] | (g_ram[0x0B16] << 8)) == 0x1994u) {
+        g_ram[0x0B15] = 0x44;
+        g_ram[0x0B16] = 0x19;
+    }
+
     snesrecomp_desktop_request_clock_reset();
     s_menu_open = false;
     s_anim_x = -GetMenuWidth();
@@ -6878,6 +6943,7 @@ static void SoeResetVideoToDefault(bool show_toast)
     s_lock_60fps = false;
     s_interpolate_sprites = false;
     s_enhanced_ring_menu = true;
+    s_original_mode = false;
     s_eliminate_lag_frames = true;
 #ifdef __ANDROID__
     s_android_touch_overlay = true;
@@ -6987,6 +7053,9 @@ static void AdjustTabOption(SoeMenuTab tab, int option_index, int direction)
         case GAME_OPT_LOAD_STATE_2:
         case GAME_OPT_LOAD_STATE_3:
             SoeLoadStateSlot(option_index - GAME_OPT_LOAD_STATE_1);
+            break;
+        case GAME_OPT_ORIGINAL_MODE:
+            SoeSetOriginalMode(!s_original_mode, true);
             break;
         case GAME_OPT_DIALOG_THEME:
             s_dialog_theme = (SoeDialogTheme)(((int)s_dialog_theme + direction + DIALOG_THEME_COUNT) % DIALOG_THEME_COUNT);
@@ -8946,6 +9015,7 @@ void SoeSlideMenuInit(void)
     SoeLoadCrtConfig();
     SoeLoadBloomConfig();
     SoeLoadDialogConfig();
+    s_orig_prev_in_gameplay = false;
     g_config.enable_gamepad[0] = true;
     if (g_config.player_src[0] == 0) {
         g_config.player_src[0] = 2; /* Default Player 1 to Gamepad (+ Keyboard in host_main.c) */
@@ -9630,11 +9700,11 @@ void SoeCapturePostSimState(void)
         Ppu *ppu = g_snes->ppu;
         int extra = SoeGetWidescreenExtra();
         uint16_t current_map = GetLoadedMapId();
-        bool map_pillarboxed = (s_map_pillarbox[current_map & 0xFF] == 0);
+        bool map_pillarboxed = s_original_mode || (s_map_pillarbox[current_map & 0xFF] == 0);
         bool is_mode1_16x16 = ((ppu->bgmode & 0x07) == 1) && ((ppu->bgmode & 0x30) == 0x30);
         bool has_window_mask = (ppu->screenWindowed[0] != 0) || (ppu->screenWindowed[1] != 0);
         if (extra > 0 && is_mode1_16x16 && !has_window_mask && s_frame_counter >= 60) {
-            if (!(s_pillarbox_enabled && map_pillarboxed)) {
+            if (!(s_original_mode || (s_pillarbox_enabled && map_pillarboxed))) {
                 int16_t eff_h = SoeGetEffectivePpuHScroll(ppu);
                 int16_t eff_v = SoeGetEffectivePpuVScroll(ppu);
                 int left_space = extra, right_space = extra;
@@ -9746,8 +9816,8 @@ void SoeCapturePostSimState(void)
         s_oam_sim_gen++;
         if (s_oam_sim_gen == 0) s_oam_sim_gen = 1;
 
-        const int same_tile_max_d = s_enhanced_ring_menu ? 28 : 8;
-        const int rot_tile_max_d = s_enhanced_ring_menu ? 28 : 6;
+        const int same_tile_max_d = SoeIsEnhancedRingMenuActive() ? 28 : 8;
+        const int rot_tile_max_d = SoeIsEnhancedRingMenuActive() ? 28 : 6;
 
         for (int sl = 0; sl < 128; sl++) {
             uint16_t w0 = ppu->oam[sl * 2];
@@ -10242,9 +10312,23 @@ void SoeBeginSimFrame(unsigned number)
     if (!g_snes || !g_snes->ppu) return;
     Ppu *ppu = g_snes->ppu;
 
+    /* When entering gameplay in Original Mode, ensure default window graphic is
+     * the authentic blue checkerboard (0x1944) rather than a leftover Glass placeholder (0x1994). */
+    {
+        bool now_in_gameplay = ((g_ram[0x0B29] & 0x03) == 0x03);
+        if (s_original_mode && now_in_gameplay && !s_orig_prev_in_gameplay) {
+            uint16_t cur_0b15 = (uint16_t)(g_ram[0x0B15] | (g_ram[0x0B16] << 8));
+            if (cur_0b15 == 0x1994u || cur_0b15 < 0x1924u || cur_0b15 > 0x19A4u) {
+                g_ram[0x0B15] = 0x44;
+                g_ram[0x0B16] = 0x19;
+            }
+        }
+        s_orig_prev_in_gameplay = now_in_gameplay;
+    }
+
     /* Sync in-game Window Prefs entries & apply Glass Dialog capture when active */
     SoeTickWindowPrefs(ppu);
-    PatchDialogWindowBackground(ppu, s_dialog_theme != DIALOG_THEME_ORIGINAL);
+    PatchDialogWindowBackground(ppu, SoeGetActiveDialogTheme() != DIALOG_THEME_ORIGINAL);
 
     int extra = SoeGetWidescreenExtra();
     if (extra <= 0) {
@@ -10262,6 +10346,7 @@ void SoeBeginSimFrame(unsigned number)
 
     /*
      * Center 4:3 Pillarboxed Screens:
+     * - Original Mode: ALL maps and screens are 4:3 pillarboxed (ignores map_pillarbox.json).
      * - Maps marked as 0 in map_pillarbox.json when pillarboxing is enabled.
      * - Non-Mode-1 screens or screens without 16x16 BG1/BG2 tiles (e.g. Mode 4
      *   Name Entry screen, boot credits, menus).
@@ -10269,13 +10354,13 @@ void SoeBeginSimFrame(unsigned number)
      *   such as the 1965 Podunk square-screen cinema/lab intro).
      */
     uint16_t current_map = GetLoadedMapId();
-    bool map_pillarboxed = (s_map_pillarbox[current_map & 0xFF] == 0);
+    bool map_pillarboxed = s_original_mode || (s_map_pillarbox[current_map & 0xFF] == 0);
 
     bool is_mode1_16x16 = ((ppu->bgmode & 0x07) == 1) && ((ppu->bgmode & 0x30) == 0x30);
     bool has_window_mask = (ppu->screenWindowed[0] != 0) || (ppu->screenWindowed[1] != 0);
 
-    if ((s_pillarbox_enabled && map_pillarboxed) || !is_mode1_16x16 || has_window_mask || number < 60) {
-        if (number >= 60 && IsMode4MenuMosaicActive(ppu)) {
+    if (s_original_mode || (s_pillarbox_enabled && map_pillarboxed) || !is_mode1_16x16 || has_window_mask || number < 60) {
+        if (!s_original_mode && number >= 60 && IsMode4MenuMosaicActive(ppu)) {
             s_cur_left_space = extra;
             s_cur_right_space = extra;
         } else {
@@ -10634,7 +10719,7 @@ static void RenderInterpolatedSprites(uint32_t *pixels, int stride, int frame_w,
             int curr_fb_x = (int)cur->x + (int)s_frame_left_curr;
             int dx = curr_fb_x - prev_fb_x;
             int dy = (int)cur->y - (int)prv->y;
-            int max_delta = (s_enhanced_ring_menu && ((prv->w1 & 0xCFFFu) == (cur->w1 & 0xCFFFu))) ? 28 : 12;
+            int max_delta = (SoeIsEnhancedRingMenuActive() && ((prv->w1 & 0xCFFFu) == (cur->w1 & 0xCFFFu))) ? 28 : 12;
             if (abs(dx) <= max_delta && abs(dy) <= max_delta) {
                 draw_x = (double)prev_fb_x + (double)dx * alpha + cam_res_shift_x;
                 draw_y = (double)prv->y + (double)dy * alpha + cam_res_shift_y;
@@ -10652,7 +10737,7 @@ static void RenderInterpolatedSprites(uint32_t *pixels, int stride, int frame_w,
         uint32_t tex_local[64 * 64];
         uint32_t *tex = tex_local;
         bool need_decode = true;
-        if (s_enhanced_ring_menu) {
+        if (SoeIsEnhancedRingMenuActive()) {
             SoeSpriteTexCache *cache = &s_sprite_tex_cache[sl];
             tex = cache->tex;
             if (cache->gen == s_oam_sim_gen &&
@@ -10802,7 +10887,7 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
     RtlWidescreenPresent(dst, pitch, field, frame_w, frame_h);
 
     uint16_t current_map = GetLoadedMapId();
-    bool map_pillarboxed = (s_map_pillarbox[current_map & 0xFF] == 0);
+    bool map_pillarboxed = s_original_mode || (s_map_pillarbox[current_map & 0xFF] == 0);
     int extra = SoeGetWidescreenExtra();
     bool in_gameplay = ((g_ram[0x0B29] & 0x03) == 0x03);
 
@@ -10824,7 +10909,7 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
         }
     }
     RenderInterpolatedSprites((uint32_t *)dst, (int)(pitch / 4), frame_w, frame_h, extra, alpha);
-    bool menu_mosaic = (extra > 0 && g_snes && g_snes->ppu &&
+    bool menu_mosaic = (!s_original_mode && extra > 0 && g_snes && g_snes->ppu &&
                         IsMode4MenuMosaicActive(g_snes->ppu));
 
     /* Tile Mode 4 menu screens (Save Select + Level/Stat/Act/Edit/Alchemy) across margins */
@@ -10834,7 +10919,7 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
     }
 
     /* 1.5. Pure-C Programmatic Dialog Box & Window Prefs Live Preview (before CRT & Bloom filters) */
-    if (s_dialog_theme != DIALOG_THEME_ORIGINAL && s_dialog_capture_active) {
+    if (SoeGetActiveDialogTheme() != DIALOG_THEME_ORIGINAL && s_dialog_capture_active) {
         SoeRenderProgrammaticDialogs((uint32_t *)dst, (int)(pitch / 4), frame_w, frame_h);
     }
     SoeRenderWindowPrefsOverlay((uint32_t *)dst, (int)(pitch / 4), frame_w, frame_h);
@@ -10875,7 +10960,7 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
         int clamp_right = frame_w;
 
         if (!menu_mosaic) {
-            if (s_pillarbox_enabled && map_pillarboxed) {
+            if (s_original_mode || (s_pillarbox_enabled && map_pillarboxed)) {
                 clamp_left = extra + 1;
                 clamp_right = extra + 256 - 1;
             } else if (g_snes && g_snes->ppu) {
@@ -11055,9 +11140,15 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                 int y;
                 const char *title;
             } kGameSections[3] = {
+#ifdef __ANDROID__
+                { 46, "SAVE STATE" },
+                { 81, "LOAD STATE" },
+                { 116, "GAME SETTINGS" },
+#else
                 { 46, "SAVE STATE" },
                 { 83, "LOAD STATE" },
                 { 120, "GAME SETTINGS" },
+#endif
             };
             for (int s = 0; s < 3; s++) {
                 int hy = kGameSections[s].y;
@@ -11110,9 +11201,17 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                     snprintf(val_buf, sizeof(val_buf), "%s", SoeStateSlotExists(slot) ? "[Ready]" : "[Empty]");
                     break;
                 }
+                case GAME_OPT_ORIGINAL_MODE:
+                    snprintf(label_buf, sizeof(label_buf), "Original Mode");
+                    snprintf(val_buf, sizeof(val_buf), "%s", s_original_mode ? "On (4:3)" : "Off");
+                    break;
                 case GAME_OPT_DIALOG_THEME:
                     snprintf(label_buf, sizeof(label_buf), "Dialog Box Theme");
-                    snprintf(val_buf, sizeof(val_buf), "%s", kDialogThemeNames[s_dialog_theme]);
+                    if (s_original_mode) {
+                        snprintf(val_buf, sizeof(val_buf), "Original (SNES)");
+                    } else {
+                        snprintf(val_buf, sizeof(val_buf), "%s", kDialogThemeNames[s_dialog_theme]);
+                    }
                     break;
 #ifdef __ANDROID__
                 case GAME_OPT_TOUCH_OVERLAY:
@@ -11183,6 +11282,7 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                 "* Restore full machine snapshot from Slot 1.",
                 "* Restore full machine snapshot from Slot 2.",
                 "* Restore full machine snapshot from Slot 3.",
+                "* 4:3 pillarbox all maps, classic ring menu & checkerboard.",
                 "* Glass theme color (Omnitopia, Volcano, etc.) or Original.",
 #ifdef __ANDROID__
                 "* Toggle the translucent on-screen touch controller overlay.",
@@ -11248,7 +11348,7 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                     break;
                 case FIX_OPT_RING_MENU:
                     label = "Ring Menu";
-                    val_str = s_enhanced_ring_menu ? "Enhanced" : "Original";
+                    val_str = s_original_mode ? "Original (Orig)" : (s_enhanced_ring_menu ? "Enhanced" : "Original");
                     break;
                 }
 
@@ -11312,11 +11412,13 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                     break;
                 case VIDEO_OPT_PILLARBOX:
                     snprintf(label_buf, sizeof(label_buf), "Per-Map Pillarbox Clamping");
-                    snprintf(val_buf, sizeof(val_buf), "%s", s_pillarbox_enabled ? "Enabled" : "Disabled");
+                    snprintf(val_buf, sizeof(val_buf), "%s",
+                             s_original_mode ? "All 4:3 (Orig)" : (s_pillarbox_enabled ? "Enabled" : "Disabled"));
                     break;
                 case VIDEO_OPT_SOLID_DIALOG:
                     snprintf(label_buf, sizeof(label_buf), "Dialog Box Theme");
-                    snprintf(val_buf, sizeof(val_buf), "%s", kDialogThemeNames[s_dialog_theme]);
+                    snprintf(val_buf, sizeof(val_buf), "%s",
+                             s_original_mode ? "Original (Orig)" : kDialogThemeNames[s_dialog_theme]);
                     break;
                 case VIDEO_OPT_ASPECT_RATIO:
                     snprintf(label_buf, sizeof(label_buf), "Display Aspect Mode");

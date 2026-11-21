@@ -8,6 +8,14 @@ A native PC static recompilation port of **Secret of Evermore** (SNES, USA), bui
 
 ## What's New
 
+### v0.9.11
+- **Original Mode (Game Options Toggle):** Added an **Original Mode** (`On (4:3)` / `Off`) toggle under **Game Options → GAME SETTINGS** so you can flick classic 1995 SNES presentation on and off anytime without disturbing your saved preferences.
+  - **4:3 Pillarboxing Across All Maps:** Forces centered 4:3 pillarboxing on every map and menu screen (and disables Mode 4 side-margin mosaic) without reading or writing `map_pillarbox.json`.
+  - **Classic SNES Ring Menu:** Switches to the original SNES ring menu while Original Mode is active without modifying your saved `enhanced_ring_menu` preference.
+  - **Original Blue Checkerboard Windows:** Bypasses custom Glass dialog themes, defaults the window background to the authentic 1995 blue checkerboard (`0x1944`), and keeps in-game Window Prefs strictly on classic SNES patterns without overwriting `dialog_config.json`.
+  - **Instant Preference Restore:** Turning Original Mode off immediately restores your preferred widescreen/pillarbox, ring menu, and Glass dialog theme settings.
+- **All Platforms Updated (`v0.9.11`):** Rebuilt and updated Linux x64, Android arm64 APK (`versionCode 911`), and Windows x64 Setup Pack releases.
+
 ### v0.9.10
 - **Swamp / Dark-Surface Widescreen Snap Fix (Map 103 & Ultrawide):** Fixed horizontal screen snapping when standing still or walking near dark playable surfaces such as the Prehistoria Swamp tar pits (Map 103, `$0067`) in 21:9 ultrawide.
   - Tightened the uniform-void RGB555 color threshold in `SoeIsTileUniformVoid()` and `SoeRoomColHasContent()` from `<= 4` to `<= 2`, so true near-black multi-chamber void walls still clamp cleanly while dark surfaces like Swamp tar (`R=3, G=3, B=4`) are never mistaken for void or toggled back and forth by animated tar bubbles.
