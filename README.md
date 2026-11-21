@@ -8,6 +8,11 @@ A native PC static recompilation port of **Secret of Evermore** (SNES, USA), bui
 
 ## What's New
 
+### v0.9.5
+- **Android Translucent Touch Controller Overlay (Android-Only):** Added a built-in SDL3 on-screen touch controller for Android using crisp transparent icons from **Kenney's Input Prompts** (CC0 1.0 Public Domain, [kenney.nl](https://kenney.nl)): 8-way virtual thumbstick (bottom-left), SNES `X / Y / A / B` diamond (bottom-right), `L` / `R` shoulders (upper corners), `Select` / `Start` (bottom-center), and a subtle `Home` menu toggle (top-center) with ghostly float opacity and pressed highlight feedback.
+  - Enabled (**On**) by default on first boot, and toggleable anytime in the Android **Game** menu tab (**Touch Overlay: On / Off**, saved to `video_config.json`).
+- **Default Glass Theme — Omnitopia Blue:** Updated the default / first-boot dialog box & UI glass theme across all platforms (Linux, Windows, Android) and *Reset All Settings to Default* to **Omnitopia Blue** (the first glass theme).
+
 ### v0.9.4
 - **Infinite Stamina Fix (Clean Bar & No Sword-Slash Lockout):** Fixed the Infinite Stamina debug toggle so the stamina bar stays completely blank with zero flickering/glitching while running or attacking, and fixed the bug where slashing a sword caused nonstop slashing and locked out player control.
   - Clamped Boy (`$4EB7`) and Dog (`$4F65`) stamina to exact `0x0400` (100% neutral/ready) instead of `0x0404` (which crossed the `>= 0x0401` weapon-charge threshold at `$8F:CE66` and triggered infinite attacks), while still preserving values `> 0x0400` so holding Attack for Level 1–3 weapon charges continues to work.
@@ -177,6 +182,7 @@ Run `./build/Evertopia` (or copy it beside your `evermore.smc`).
 - **EddieEddie90** — Special thanks for coming up with the name **Evertopia**!
 - **Square Soft / Square USA (Redmond, WA) & Nintendo** — Special thanks to everyone involved in creating **Secret of Evermore** (1995): the designers, programmers, artists, writers, localization team, and **Jeremy Soule** for the unforgettable soundtrack.
 - **Matthew Stanley & Contributors** — Creators of [snesrecomp](https://github.com/RetroPortingToolKit/snesrecomp) and [recomp-ui](https://github.com/RetroPortingToolKit/recomp-ui), which power the static recompiler, beam-aligned PPU/runtime, and launcher.
+- **Kenney** ([www.kenney.nl](https://kenney.nl)) — Creator of **Kenney's Input Prompts** (CC0 1.0 Public Domain), used for the crisp translucent on-screen controller buttons and thumbstick graphics in the Android touch overlay.
 - **snesrev** (`zelda3` / `smw`), **LakeSnes** (`elzo_d` 65816 CPU core), **xander-haj/Z3R**, **SDL3**, **Dear ImGui**, and the SNES preservation and reverse-engineering community.
 
 ---

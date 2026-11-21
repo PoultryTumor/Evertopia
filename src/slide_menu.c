@@ -31,6 +31,9 @@
  */
 
 #include "slide_menu.h"
+#ifdef __ANDROID__
+#include "android_touch.h"
+#endif
 #include "host_main.h"
 #include "desktop/config.h"
 #include "desktop/display_aspect.h"
@@ -139,11 +142,13 @@ enum {
     GAME_OPT_LOAD_STATE_3 = 5, /* Load State Slot 3 */
     GAME_OPT_DIALOG_THEME = 6, /* Dialog Box Theme: Blue Glass (Default), Original (Dither) */
     GAME_OPT_RING_MENU = 7,    /* Ring Menu: Enhanced (Smooth + Cached) or Original */
-    GAME_OPT_RESET_ALL = 8,    /* Reset All Settings to Default */
 #ifdef __ANDROID__
-    GAME_OPT_EXIT_TO_DESKTOP = 9, /* Save all settings and exit to Android launcher */
-    GAME_OPT_COUNT = 10
+    GAME_OPT_TOUCH_OVERLAY = 8,    /* On-screen Touch Controls Overlay: On (Default) / Off */
+    GAME_OPT_RESET_ALL = 9,        /* Reset All Settings to Default */
+    GAME_OPT_EXIT_TO_DESKTOP = 10, /* Save all settings and exit to Android launcher */
+    GAME_OPT_COUNT = 11
 #else
+    GAME_OPT_RESET_ALL = 8,        /* Reset All Settings to Default */
     GAME_OPT_EXIT_TO_LAUNCHER = 9, /* Save all settings and return to launcher */
     GAME_OPT_EXIT_TO_DESKTOP = 10, /* Save all settings and exit to desktop */
     GAME_OPT_COUNT = 11
@@ -421,6 +426,9 @@ static bool s_pillarbox_enabled = true; /* Slideout toggle: Pillarboxes on/off *
 static bool s_lock_60fps = false;       /* Slideout toggle: false = High-Hz Subpixel Scroll (Auto Display Hz) */
 static bool s_interpolate_sprites = false; /* Slideout toggle: Subpixel sprite interpolation */
 static bool s_enhanced_ring_menu = true;  /* Slideout toggle: Enhanced Ring Menu (smooth OAM + texel cache) */
+#ifdef __ANDROID__
+static bool s_android_touch_overlay = true; /* Android-only: On-screen Touch Controller Overlay (On on first boot) */
+#endif
 
 /* Enhanced Ring Menu opening curve: ~30% slower approach (~13 frames) than before
  * with the same 6-frame damped radial spring bounce (44 -> 34 -> 45 -> 44 -> 42) on open only. */
@@ -500,7 +508,7 @@ static void SoeInstallEnhancedRingMenuHooks(void)
 static bool s_eliminate_lag_frames = true; /* Slideout toggle: Fast CPU/DMA to eliminate SNES lag frames */
 static double s_active_pres_hz = 60.098811862;
 extern void snes_beam_frame_driver_set_fast_cpu(bool enabled);
-static SoeDialogTheme s_dialog_theme = DIALOG_THEME_IVOR_TOWER;
+static SoeDialogTheme s_dialog_theme = DIALOG_THEME_OMNITOPIA;
 static bool s_solid_dialog_bg = true;   /* Kept synced with s_dialog_theme != DIALOG_THEME_ORIGINAL */
 static bool s_dialog_capture_active = false;
 static int s_dialog_capture_h = 192;
@@ -2116,7 +2124,7 @@ static void SoeSaveDialogConfig(void)
 
 static void SoeLoadDialogConfig(void)
 {
-    s_dialog_theme = DIALOG_THEME_IVOR_TOWER;
+    s_dialog_theme = DIALOG_THEME_OMNITOPIA;
     s_solid_dialog_bg = true;
 
     const char *path = GetDialogConfigFilePath();
@@ -2182,6 +2190,9 @@ static void SoeSaveVideoConfig(void)
     fprintf(f, "  \"interpolate_sprites\": %d,\n", s_interpolate_sprites ? 1 : 0);
     fprintf(f, "  \"enhanced_ring_menu\": %d,\n", s_enhanced_ring_menu ? 1 : 0);
     fprintf(f, "  \"eliminate_lag_frames\": %d,\n", s_eliminate_lag_frames ? 1 : 0);
+#ifdef __ANDROID__
+    fprintf(f, "  \"touch_overlay\": %d,\n", s_android_touch_overlay ? 1 : 0);
+#endif
     fprintf(f, "  \"pillarbox_edit_mode\": %d\n", 0);
     fprintf(f, "}\n");
     fclose(f);
@@ -2196,6 +2207,10 @@ static void SoeLoadVideoConfig(void)
     s_interpolate_sprites = false;
     s_enhanced_ring_menu = true;
     s_eliminate_lag_frames = true;
+#ifdef __ANDROID__
+    s_android_touch_overlay = true;
+    SoeAndroidTouchSetEnabled(true);
+#endif
     snes_beam_frame_driver_set_fast_cpu(true);
 
     const char *path = GetVideoConfigFilePath();
@@ -2235,12 +2250,19 @@ static void SoeLoadVideoConfig(void)
             s_enhanced_ring_menu = (val != 0);
         } else if (strcmp(q1 + 1, "eliminate_lag_frames") == 0) {
             s_eliminate_lag_frames = (val != 0);
+#ifdef __ANDROID__
+        } else if (strcmp(q1 + 1, "touch_overlay") == 0) {
+            s_android_touch_overlay = (val != 0);
+#endif
         } else if (strcmp(q1 + 1, "pillarbox_edit_mode") == 0) {
             (void)val; /* legacy key, ignored */
         }
     }
     fclose(f);
 
+#ifdef __ANDROID__
+    SoeAndroidTouchSetEnabled(s_android_touch_overlay);
+#endif
     snes_beam_frame_driver_set_fast_cpu(s_eliminate_lag_frames);
     g_config.disable_frame_delay = false;
 
@@ -6564,6 +6586,15 @@ static int GetGameTabRowY(int row)
         return 55 + row * 9;
     } else if (row < 6) {
         return 92 + (row - 3) * 9;
+#ifdef __ANDROID__
+    } else if (row < 9) {
+        return 129 + (row - 6) * 10;
+    } else if (row == GAME_OPT_RESET_ALL) {
+        return 161;
+    } else {
+        return 174;
+    }
+#else
     } else if (row < 8) {
         return 129 + (row - 6) * 10;
     } else if (row == GAME_OPT_RESET_ALL) {
@@ -6571,6 +6602,7 @@ static int GetGameTabRowY(int row)
     } else {
         return 166;
     }
+#endif
 }
 
 static void GetGameExitButtonBounds(int drawer_x, int drawer_w,
@@ -6835,10 +6867,14 @@ static void SoeResetVideoToDefault(bool show_toast)
     s_interpolate_sprites = false;
     s_enhanced_ring_menu = true;
     s_eliminate_lag_frames = true;
+#ifdef __ANDROID__
+    s_android_touch_overlay = true;
+    SoeAndroidTouchSetEnabled(true);
+#endif
     snes_beam_frame_driver_set_fast_cpu(true);
     g_config.disable_frame_delay = false;
     SoeApplyWidescreenMode(SOE_WS_21_9);
-    s_dialog_theme = DIALOG_THEME_IVOR_TOWER;
+    s_dialog_theme = DIALOG_THEME_OMNITOPIA;
     s_solid_dialog_bg = true;
     SoeSaveDialogConfig();
     g_config.display_aspect = kSnesDisplayAspect_SquarePixels8x7; /* 8:7 Square */
@@ -6953,6 +6989,13 @@ static void AdjustTabOption(SoeMenuTab tab, int option_index, int direction)
             s_enhanced_ring_menu = !s_enhanced_ring_menu;
             SoeSaveVideoConfig();
             break;
+#ifdef __ANDROID__
+        case GAME_OPT_TOUCH_OVERLAY:
+            s_android_touch_overlay = !s_android_touch_overlay;
+            SoeAndroidTouchSetEnabled(s_android_touch_overlay);
+            SoeSaveVideoConfig();
+            break;
+#endif
         case GAME_OPT_RESET_ALL:
             s_reset_confirm = RESET_CONFIRM_ALL;
             s_reset_confirm_choice = 1;
@@ -8039,6 +8082,25 @@ static void PollMenuKeyboardDirect(void)
             if (ax >  16000) pad_rt = true;
         }
         SDL_free(pad_ids);
+    }
+#endif
+
+#ifdef __ANDROID__
+    if (SoeAndroidTouchConsumeMenuToggle()) {
+        s_pending_toggle_event = true;
+    }
+    if (s_menu_open || s_debug_overlay || s_jukebox_open || s_key_trade_open ||
+        s_warp_win_open || s_give_all_confirm_open || s_map_picker_open) {
+        uint32_t tpad = SoeAndroidTouchGetPadMask();
+        if (tpad & (1u << 4))  pad_up = true;        /* SNES_PAD_UP */
+        if (tpad & (1u << 5))  pad_dn = true;        /* SNES_PAD_DOWN */
+        if (tpad & (1u << 6))  pad_lf = true;        /* SNES_PAD_LEFT */
+        if (tpad & (1u << 7))  pad_rt = true;        /* SNES_PAD_RIGHT */
+        if (tpad & (1u << 8))  pad_act = true;       /* SNES_PAD_A */
+        if (tpad & (1u << 0))  pad_cancel = true;    /* SNES_PAD_B */
+        if (tpad & ((1u << 1) | (1u << 9))) pad_keep_song = true; /* Y / X */
+        if (tpad & (1u << 10)) pad_fast_prev = true; /* SNES_PAD_L */
+        if (tpad & (1u << 11)) pad_fast_next = true; /* SNES_PAD_R */
     }
 #endif
 
@@ -10932,6 +10994,12 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                     snprintf(label_buf, sizeof(label_buf), "Ring Menu");
                     snprintf(val_buf, sizeof(val_buf), "%s", s_enhanced_ring_menu ? "Enhanced" : "Original");
                     break;
+#ifdef __ANDROID__
+                case GAME_OPT_TOUCH_OVERLAY:
+                    snprintf(label_buf, sizeof(label_buf), "Touch Overlay");
+                    snprintf(val_buf, sizeof(val_buf), "%s", s_android_touch_overlay ? "On" : "Off");
+                    break;
+#endif
                 case GAME_OPT_RESET_ALL:
                     snprintf(label_buf, sizeof(label_buf), "[ Reset All Settings to Default ]");
                     break;

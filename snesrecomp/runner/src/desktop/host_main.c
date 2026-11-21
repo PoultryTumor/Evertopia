@@ -1879,8 +1879,19 @@ static void DrawPpuFrameWithPerf(void) {
 
 /* Seat-0 input word the overlays navigate with — the same sources the guest
  * gets, minus the script (an overlay is a human facility). */
+#ifdef __ANDROID__
+extern bool SoeAndroidTouchHandleEvent(const SDL_Event *ev);
+extern uint32_t SoeAndroidTouchGetPadMask(void);
+extern void SoeAndroidTouchRender(SDL_Renderer *renderer);
+extern void SoeAndroidTouchShutdown(void);
+#endif
+
 static uint32 OverlayNavInputs(void) {
-  return g_input_state | g_pad_buttons | g_gamepad[0].axis_buttons;
+  uint32 v = g_input_state | g_pad_buttons | g_gamepad[0].axis_buttons;
+#ifdef __ANDROID__
+  v |= SoeAndroidTouchGetPadMask();
+#endif
+  return v;
 }
 
 /* Controller and joystick events, in ONE place, because the overlays' modal
@@ -2783,6 +2794,9 @@ static bool SdlRenderer_Init(SDL_Window *window) {
 }
 
 static void SdlRenderer_Destroy(void) {
+#ifdef __ANDROID__
+  SoeAndroidTouchShutdown();
+#endif
   if (g_texture_locked && g_texture) {
     SDL_UnlockTexture(g_texture);
     g_texture_locked = false;
@@ -2953,6 +2967,9 @@ static void SdlRenderer_EndDraw(void) {
   snesrecomp_sdl_render_texture(g_renderer, g_texture, NULL,
                                 &g_sdl_present_rect);
   DrawNativeOverlaySdl();
+#ifdef __ANDROID__
+  SoeAndroidTouchRender(g_renderer);
+#endif
   SDL_RenderPresent(g_renderer);
 }
 
@@ -4686,6 +4703,10 @@ error_reading:;
 
     double event_profile_start = ProfileStart();
     while (SDL_PollEvent(&event)) {
+#ifdef __ANDROID__
+      if (SoeAndroidTouchHandleEvent(&event))
+        continue;
+#endif
       if (HandleDeviceEvent(&event))
         continue;
       switch (event.type) {

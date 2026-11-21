@@ -51,7 +51,7 @@ set(_SOE_SOURCES
 )
 if(ANDROID)
     set(_SOE_TARGET SecretOfEvermoreSNESRecomp)
-    add_library(${_SOE_TARGET} SHARED ${_SOE_SOURCES} android/stb_image_android.c)
+    add_library(${_SOE_TARGET} SHARED ${_SOE_SOURCES} android/stb_image_android.c src/android_touch.c)
     set_target_properties(${_SOE_TARGET} PROPERTIES OUTPUT_NAME "main")
     target_link_options(${_SOE_TARGET} PRIVATE -Wl,-z,max-page-size=16384)
 else()
