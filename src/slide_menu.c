@@ -140,29 +140,29 @@ enum {
     GAME_OPT_LOAD_STATE_1 = 3, /* Load State Slot 1 */
     GAME_OPT_LOAD_STATE_2 = 4, /* Load State Slot 2 */
     GAME_OPT_LOAD_STATE_3 = 5, /* Load State Slot 3 */
-    GAME_OPT_DIALOG_THEME = 6, /* Dialog Box Theme: Blue Glass (Default), Original (Dither) */
-    GAME_OPT_RING_MENU = 7,    /* Ring Menu: Enhanced (Smooth + Cached) or Original */
+    GAME_OPT_DIALOG_THEME = 6, /* Dialog Box Theme: Omnitopia Blue (Default), Original (Dither) */
 #ifdef __ANDROID__
-    GAME_OPT_TOUCH_OVERLAY = 8,    /* On-screen Touch Controls Overlay: On (Default) / Off */
-    GAME_OPT_TOUCH_OPACITY = 9,    /* On-screen Touch Overlay Opacity: 10%..100% (Default 20%) */
-    GAME_OPT_RESET_ALL = 10,       /* Reset All Settings to Default */
-    GAME_OPT_EXIT_TO_DESKTOP = 11, /* Save all settings and exit to Android launcher */
-    GAME_OPT_COUNT = 12
-#else
-    GAME_OPT_RESET_ALL = 8,        /* Reset All Settings to Default */
-    GAME_OPT_EXIT_TO_LAUNCHER = 9, /* Save all settings and return to launcher */
-    GAME_OPT_EXIT_TO_DESKTOP = 10, /* Save all settings and exit to desktop */
+    GAME_OPT_TOUCH_OVERLAY = 7,    /* On-screen Touch Controls Overlay: On (Default) / Off */
+    GAME_OPT_TOUCH_OPACITY = 8,    /* On-screen Touch Overlay Opacity: 10%..100% (Default 20%) */
+    GAME_OPT_RESET_ALL = 9,        /* Reset All Settings to Default */
+    GAME_OPT_EXIT_TO_DESKTOP = 10, /* Save all settings and exit to Android launcher */
     GAME_OPT_COUNT = 11
+#else
+    GAME_OPT_RESET_ALL = 7,        /* Reset All Settings to Default */
+    GAME_OPT_EXIT_TO_LAUNCHER = 8, /* Save all settings and return to launcher */
+    GAME_OPT_EXIT_TO_DESKTOP = 9,  /* Save all settings and exit to desktop */
+    GAME_OPT_COUNT = 10
 #endif
 };
 
-/* Tab 1: Gameplay Fixes */
+/* Tab 3: Gameplay Fixes */
 enum {
-    FIX_OPT_SHEATH = 0,   /* Silver Sheath sword boost fix */
-    FIX_OPT_ATLAS = 1,    /* Atlas/Defend stat underflow clamp */
-    FIX_OPT_DOG_LVL = 2,  /* Dog level 39+ curve fix */
-    FIX_OPT_SOFTLOCK = 3, /* Boundary softlock prevention */
-    FIX_OPT_COUNT = 4
+    FIX_OPT_SHEATH = 0,    /* Silver Sheath sword boost fix */
+    FIX_OPT_ATLAS = 1,     /* Atlas/Defend stat underflow clamp */
+    FIX_OPT_DOG_LVL = 2,   /* Dog level 39+ curve fix */
+    FIX_OPT_SOFTLOCK = 3,  /* Boundary softlock prevention */
+    FIX_OPT_RING_MENU = 4, /* Ring Menu: Enhanced (Smooth + Cached) or Original */
+    FIX_OPT_COUNT = 5
 };
 
 /* Dialog Box Style & Shadow Options */
@@ -2526,7 +2526,7 @@ static void GetUiThemeColorsFor(SoeDialogTheme theme, SoeUiThemeColors *out)
         out->accent_r = 175; out->accent_g = 200; out->accent_b = 240;
         out->subtext_col = 0xFFD8E4F8u;
         out->muted_col = 0xFFBCCCE8u;
-        out->sel_text_col = 0xFFBCE0FFu;
+        out->sel_text_col = 0xFFD8EEFFu;
         return;
     }
 
@@ -2563,9 +2563,9 @@ static void GetUiThemeColorsFor(SoeDialogTheme theme, SoeUiThemeColors *out)
     int mb = ClampByte(pal->top_b + 145);
     out->muted_col = 0xFF000000u | ((uint32_t)mr << 16) | ((uint32_t)mg << 8) | (uint32_t)mb;
 
-    int hr = ClampByte(115 + (pal->top_r * 3) / 4);
-    int hg = ClampByte(115 + (pal->top_g * 3) / 4);
-    int hb = ClampByte(115 + (pal->top_b * 3) / 4);
+    int hr = ClampByte(175 + pal->top_r);
+    int hg = ClampByte(175 + pal->top_g);
+    int hb = ClampByte(175 + pal->top_b);
     out->sel_text_col = 0xFF000000u | ((uint32_t)hr << 16) | ((uint32_t)hg << 8) | (uint32_t)hb;
 }
 
@@ -4122,7 +4122,7 @@ static void ActivateKeyTradeSelection(int delta)
             g_ram[it->addr] ^= it->mask;
         }
         bool has = (g_ram[it->addr] & it->mask) != 0;
-        snprintf(s_debug_toast, sizeof(s_debug_toast), "%s: %s", it->name, has ? "ON" : "OFF");
+        snprintf(s_debug_toast, sizeof(s_debug_toast), "%s: %s", it->name, has ? "On" : "Off");
     } else {
         uint16_t cur = ReadLe16(&g_ram[it->addr]);
         int next = (int)cur + delta;
@@ -6599,20 +6599,20 @@ static int GetGameTabRowY(int row)
     } else if (row < 6) {
         return 92 + (row - 3) * 9;
 #ifdef __ANDROID__
-    } else if (row < 10) {
+    } else if (row < 9) {
         return 129 + (row - 6) * 10;
     } else if (row == GAME_OPT_RESET_ALL) {
-        return 171;
+        return 161;
     } else {
-        return 184;
+        return 174;
     }
 #else
-    } else if (row < 8) {
+    } else if (row < 7) {
         return 129 + (row - 6) * 10;
     } else if (row == GAME_OPT_RESET_ALL) {
-        return 153;
+        return 143;
     } else {
-        return 166;
+        return 156;
     }
 #endif
 }
@@ -6999,10 +6999,6 @@ static void AdjustTabOption(SoeMenuTab tab, int option_index, int direction)
             }
             SoeSaveDialogConfig();
             break;
-        case GAME_OPT_RING_MENU:
-            s_enhanced_ring_menu = !s_enhanced_ring_menu;
-            SoeSaveVideoConfig();
-            break;
 #ifdef __ANDROID__
         case GAME_OPT_TOUCH_OVERLAY:
             s_android_touch_overlay = !s_android_touch_overlay;
@@ -7053,6 +7049,10 @@ static void AdjustTabOption(SoeMenuTab tab, int option_index, int direction)
         case FIX_OPT_SOFTLOCK:
             s_fix_softlocks = !s_fix_softlocks;
             SoeSaveDebugConfig();
+            break;
+        case FIX_OPT_RING_MENU:
+            s_enhanced_ring_menu = !s_enhanced_ring_menu;
+            SoeSaveVideoConfig();
             break;
         }
         break;
@@ -7339,14 +7339,14 @@ static void AdjustDebugOption(int option_index, int direction)
         s_inf_hp_active = !s_inf_hp_active;
         SoeSaveDebugConfig();
         snprintf(s_debug_toast, sizeof(s_debug_toast), "Infinite HP: %s",
-                 s_inf_hp_active ? "ON" : "OFF");
+                 s_inf_hp_active ? "On" : "Off");
         s_debug_toast_timer = 90;
         break;
     case DBG_INF_STAMINA:
         s_inf_stamina_active = !s_inf_stamina_active;
         SoeSaveDebugConfig();
         snprintf(s_debug_toast, sizeof(s_debug_toast), "Infinite Stamina: %s",
-                 s_inf_stamina_active ? "ON" : "OFF");
+                 s_inf_stamina_active ? "On" : "Off");
         s_debug_toast_timer = 90;
         break;
     case DBG_ONE_HIT_KO:
@@ -7368,14 +7368,14 @@ static void AdjustDebugOption(int option_index, int direction)
             }
         }
         snprintf(s_debug_toast, sizeof(s_debug_toast), "One-Hit KO: %s",
-                 s_one_hit_ko_active ? "ON" : "OFF");
+                 s_one_hit_ko_active ? "On" : "Off");
         s_debug_toast_timer = 90;
         break;
     case DBG_WALK_WALLS:
         s_walk_walls_active = !s_walk_walls_active;
         SoeSaveDebugConfig();
         snprintf(s_debug_toast, sizeof(s_debug_toast), "Walk Walls: %s",
-                 s_walk_walls_active ? "ON" : "OFF");
+                 s_walk_walls_active ? "On" : "Off");
         s_debug_toast_timer = 90;
         break;
     case DBG_DOG_FORM:
@@ -11098,10 +11098,6 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                     snprintf(label_buf, sizeof(label_buf), "Dialog Box Theme");
                     snprintf(val_buf, sizeof(val_buf), "%s", kDialogThemeNames[s_dialog_theme]);
                     break;
-                case GAME_OPT_RING_MENU:
-                    snprintf(label_buf, sizeof(label_buf), "Ring Menu");
-                    snprintf(val_buf, sizeof(val_buf), "%s", s_enhanced_ring_menu ? "Enhanced" : "Original");
-                    break;
 #ifdef __ANDROID__
                 case GAME_OPT_TOUCH_OVERLAY:
                     snprintf(label_buf, sizeof(label_buf), "Touch Overlay");
@@ -11214,29 +11210,32 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                 }
 
                 const char *label = "";
-                bool enabled = false;
+                const char *val_str = "";
                 switch (i) {
                 case FIX_OPT_SHEATH:
                     label = "Silver Sheath Attack Boost Fix";
-                    enabled = s_fix_silver_sheath;
+                    val_str = s_fix_silver_sheath ? "Enabled" : "Disabled";
                     break;
                 case FIX_OPT_ATLAS:
                     label = "Atlas / Defend Stat Underflow Fix";
-                    enabled = s_fix_atlas_underflow;
+                    val_str = s_fix_atlas_underflow ? "Enabled" : "Disabled";
                     break;
                 case FIX_OPT_DOG_LVL:
                     label = "Dog Level 39+ Progression Fix";
-                    enabled = s_fix_dog_leveling;
+                    val_str = s_fix_dog_leveling ? "Enabled" : "Disabled";
                     break;
                 case FIX_OPT_SOFTLOCK:
                     label = "Boundary Softlock Prevention";
-                    enabled = s_fix_softlocks;
+                    val_str = s_fix_softlocks ? "Enabled" : "Disabled";
+                    break;
+                case FIX_OPT_RING_MENU:
+                    label = "Ring Menu";
+                    val_str = s_enhanced_ring_menu ? "Enhanced" : "Original";
                     break;
                 }
 
                 DrawSmallText(pixels, stride, frame_h, content_x + 10, row_y + 1, label,
                               is_sel ? tc.sel_text_col : 0xFFFFFFFF);
-                const char *val_str = enabled ? "Enabled" : "Disabled";
                 int vw = MeasureSmallText(val_str);
                 DrawSmallText(pixels, stride, frame_h, content_x + content_w - vw - 8, row_y + 1, val_str,
                               is_sel ? 0xFFFFFFFF : tc.subtext_col);
@@ -11246,7 +11245,8 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                 "* Fix: Silver Sheath correctly boosts sword attack.",
                 "* Fix: Prevents Defend/Atlas buffs wrapping stats.",
                 "* Fix: Fixes dog EXP formula past Lv 39 up to 99.",
-                "* Fix: Prevents player clipping walls on map load."
+                "* Fix: Prevents player clipping walls on map load.",
+                "* Fix: Smooth cached ring menu (or Original SNES)."
             };
             const char *desc = (sel_row >= 0 && sel_row < FIX_OPT_COUNT) ? kFixDescs[sel_row] : "";
             DrawSmallText(pixels, stride, frame_h, content_x + 10, 189, desc, tc.subtext_col);
@@ -11323,7 +11323,7 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                 case VIDEO_OPT_TRIPLE_BUFFER:
                     snprintf(label_buf, sizeof(label_buf), "Triple Buffering");
                     snprintf(val_buf, sizeof(val_buf), "%s",
-                             snesrecomp_get_triple_buffering() ? "ON" : "OFF");
+                             snesrecomp_get_triple_buffering() ? "On" : "Off");
                     break;
                 case VIDEO_OPT_CRT_SCANLINES:
                     snprintf(label_buf, sizeof(label_buf), "CRT Emulation Preset");
@@ -11430,7 +11430,7 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                 case AUDIO_OPT_ENABLE:
                     snprintf(label_buf, sizeof(label_buf), "Audio Output");
                     snprintf(val_buf, sizeof(val_buf), "%s",
-                             g_config.enable_audio ? "ON" : "OFF");
+                             g_config.enable_audio ? "On" : "Off");
                     break;
                 case AUDIO_OPT_VOLUME:
                     snprintf(label_buf, sizeof(label_buf), "Master Volume");
@@ -12185,7 +12185,7 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                                     jb_tc.div_r, jb_tc.div_g, jb_tc.div_b, 190);
 
             const char *jb_f1 = "[A] Play   [B] Close";
-            const char *jb_f2 = s_jukebox_lock_song ? "[Y] Keep Song: ON" : "[Y] Keep Song: OFF";
+            const char *jb_f2 = s_jukebox_lock_song ? "[Y] Keep Song: On" : "[Y] Keep Song: Off";
             int fw1 = MeasureSmallText(jb_f1);
             int fw2 = MeasureSmallText(jb_f2);
             DrawSmallText(pixels, stride, frame_h, jb_x + (jb_w - fw1) / 2, jb_y + 138, jb_f1, 0xFFFFFFFF);

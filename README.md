@@ -8,6 +8,13 @@ A native PC static recompilation port of **Secret of Evermore** (SNES, USA), bui
 
 ## What's New
 
+### v0.9.8
+- **Brighter Selected Menu Text Highlight:** Brightened the theme-tinted highlight text color (`sel_text_col`) on the currently selected menu item across all glass themes and the classic blue theme so active selections stand out more clearly and are easier to read.
+- **Consistent `On` / `Off` Setting Labels:** Standardized all settings and toggles across the menus from `"ON"` / `"OFF"` to `"On"` / `"Off"`.
+- **Moved Ring Menu Setting to Fixes Tab:** Moved the **Ring Menu** (`Enhanced` / `Original`) toggle from the **Game** tab to the **Fixes** tab alongside the other gameplay fixes.
+- **Android Touch Overlay Default Opacity (`20%`):** Confirmed `20%` as the default and first-boot opacity for the Android touch controller overlay.
+- **All Platforms Updated (`v0.9.8`):** Rebuilt and updated Linux x64, Android arm64 APK (`versionCode 908`), and Windows x64 Setup Pack releases.
+
 ### v0.9.7
 - **Android Joypad-Only Menu Navigation:** Menus, tabs, Debug Tools, and `"ARE YOU SURE?"` confirmation dialogs on Android are now controlled strictly via joypad input — either a plugged-in/Bluetooth physical controller (matching the Linux/desktop controls) or the on-screen touch controller overlay (`Thumbstick` to move, **`A`** to activate/confirm, **`B`** to close/cancel, **`L`/`R`** to switch tabs, **`LT`** for Slide-Out Menu, **`RT`** for Debug Tools). Direct screen-tap clicking on menu items is disabled on Android to prevent accidental taps.
 - **Swipe-to-Restore Overlay Failsafe:** When the touch overlay is turned **Off** and no physical controller is connected, sliding a finger across the screen re-enables the touch overlay and opens the Settings menu so you immediately have joypad navigation back.
