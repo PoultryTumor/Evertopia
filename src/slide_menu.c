@@ -9321,17 +9321,20 @@ static bool SoeIsTileUniformVoid(const Ppu *ppu, int layer, uint16_t word, bool 
     if (c == 0) {
         if (!allow_dark_solid) return true;
         uint16_t bg_rgb = ppu->cgram[0];
-        return ((bg_rgb & 0x1Fu) <= 4u &&
-                ((bg_rgb >> 5) & 0x1Fu) <= 4u &&
-                ((bg_rgb >> 10) & 0x1Fu) <= 4u);
+        return ((bg_rgb & 0x1Fu) <= 2u &&
+                ((bg_rgb >> 5) & 0x1Fu) <= 2u &&
+                ((bg_rgb >> 10) & 0x1Fu) <= 2u);
     }
     if (!allow_dark_solid) return false;
 
+    /* Only treat true near-black solid tiles (RGB555 <= 2, e.g. multi-chamber void walls)
+     * as void — dark playable surfaces like Prehistoria Swamp tar (R=3,G=3,B=4) are real map
+     * content and must not trigger void clamping or snap when animated bubbles pop in them. */
     uint16_t pbase = (uint16_t)(((word >> 10) & 7u) * 16u);
     uint16_t rgb15 = ppu->cgram[pbase + c];
-    return ((rgb15 & 0x1Fu) <= 4u &&
-            ((rgb15 >> 5) & 0x1Fu) <= 4u &&
-            ((rgb15 >> 10) & 0x1Fu) <= 4u);
+    return ((rgb15 & 0x1Fu) <= 2u &&
+            ((rgb15 >> 5) & 0x1Fu) <= 2u &&
+            ((rgb15 >> 10) & 0x1Fu) <= 2u);
 }
 
 static bool SoeRoomColHasContent(uint8_t width, uint8_t height, int tx, int ty0, int ty1, uint8_t layer_mask)
@@ -9344,9 +9347,9 @@ static bool SoeRoomColHasContent(uint8_t width, uint8_t height, int tx, int ty0,
     bool dark_backdrop = true;
     if (bg2_only && ppu) {
         uint16_t bg_rgb = ppu->cgram[0];
-        dark_backdrop = ((bg_rgb & 0x1Fu) <= 4u &&
-                         ((bg_rgb >> 5) & 0x1Fu) <= 4u &&
-                         ((bg_rgb >> 10) & 0x1Fu) <= 4u);
+        dark_backdrop = ((bg_rgb & 0x1Fu) <= 2u &&
+                         ((bg_rgb >> 5) & 0x1Fu) <= 2u &&
+                         ((bg_rgb >> 10) & 0x1Fu) <= 2u);
     }
     for (int ty = ty0; ty <= ty1; ty++) {
         uint32_t idx = ((uint32_t)ty * width + (uint32_t)tx) * 2u;

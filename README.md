@@ -8,6 +8,11 @@ A native PC static recompilation port of **Secret of Evermore** (SNES, USA), bui
 
 ## What's New
 
+### v0.9.10
+- **Swamp / Dark-Surface Widescreen Snap Fix (Map 103 & Ultrawide):** Fixed horizontal screen snapping when standing still or walking near dark playable surfaces such as the Prehistoria Swamp tar pits (Map 103, `$0067`) in 21:9 ultrawide.
+  - Tightened the uniform-void RGB555 color threshold in `SoeIsTileUniformVoid()` and `SoeRoomColHasContent()` from `<= 4` to `<= 2`, so true near-black multi-chamber void walls still clamp cleanly while dark surfaces like Swamp tar (`R=3, G=3, B=4`) are never mistaken for void or toggled back and forth by animated tar bubbles.
+- **All Platforms Updated (`v0.9.10`):** Rebuilt and updated Linux x64, Android arm64 APK (`versionCode 910`), and Windows x64 Setup Pack releases.
+
 ### v0.9.9
 - **Parallax Map Edge Widescreen Clamping Fix (Map 56 & All Parallax Maps):** Fixed a bug where walking all the way to the left edge (`X = 0`) or top edge (`Y = 0`) of parallax-scrolling maps (such as Map 56 — Prehistoria Jungle) caused the screen to suddenly snap into a 4:3 pillarbox until walking back away from the edge.
   - When BG1 and BG2 share the same scroll (`0`) on one axis at a map boundary while diverging via parallax on the perpendicular axis, `SoeGetWorldCamScrollLayer()` now falls back to checking the perpendicular axis instead of defaulting to BG1 (the sparse canopy layer), keeping BG2 (the playable ground) selected so the viewport anchors seamlessly in full widescreen.
