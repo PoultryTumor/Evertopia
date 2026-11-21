@@ -5,8 +5,10 @@
  * rendered directly via SDL3 hardware textures with alpha modulation for a
  * translucent "ghostly float" appearance.
  *
- * Android-only (#ifdef __ANDROID__). Enabled by default on first boot and
- * toggleable via the in-game Settings -> Game tab ("Touch Overlay: On/Off").
+ * Android-only (#ifdef __ANDROID__). Enabled by default on first boot at 20%
+ * opacity (configurable 10%..100%) and toggleable via Settings -> Game tab.
+ * When disabled and no physical controller is connected, sliding across the
+ * screen opens the Settings menu so the user can re-enable the overlay.
  */
 #ifdef __ANDROID__
 
@@ -26,23 +28,28 @@ enum {
     TOUCH_TEX_Y,
     TOUCH_TEX_L,
     TOUCH_TEX_R,
+    TOUCH_TEX_LT,
+    TOUCH_TEX_RT,
     TOUCH_TEX_START,
     TOUCH_TEX_SELECT,
-    TOUCH_TEX_MENU,
     TOUCH_TEX_STICK_BASE,
     TOUCH_TEX_STICK_KNOB,
     TOUCH_TEX_COUNT
+};
+
+enum {
+    TOUCH_ACTION_SNES = 0,
+    TOUCH_ACTION_MENU_TOGGLE,
+    TOUCH_ACTION_DEBUG_TOGGLE
 };
 
 typedef struct {
     float cx, cy;       /* Center in render output pixels */
     float size;         /* Drawn square width/height in pixels */
     float hit_radius;   /* Circular hit radius in pixels */
-    uint32_t pad_bit;   /* SNES_PAD_* bit (0 for Menu button) */
+    uint32_t pad_bit;   /* SNES_PAD_* bit (0 for LT/RT special triggers) */
     int tex_idx;        /* TOUCH_TEX_* index */
-    uint8_t idle_alpha; /* Ghostly float alpha (0..255) */
-    uint8_t press_alpha;/* Pressed feedback alpha (0..255) */
-    bool is_menu;
+    int action;         /* TOUCH_ACTION_* */
 } TouchButton;
 
 typedef struct {
@@ -51,7 +58,7 @@ typedef struct {
     float stick_knob_size;
     float stick_radius;     /* Outer ring radius */
     float stick_max_travel; /* Max knob center displacement */
-    TouchButton buttons[9];
+    TouchButton buttons[10];
     int button_count;
 } TouchLayout;
 
@@ -64,7 +71,10 @@ typedef struct {
     bool is_stick;
 } TouchFinger;
 
-static bool s_enabled = true; /* On by default on first boot */
+static bool s_enabled = true;      /* On by default on first boot */
+static int s_opacity_pct = 20;     /* Default 20% (50% more transparent than ~40%) */
+static bool s_menu_open_hint = false;
+
 static SDL_Renderer *s_tex_renderer = NULL;
 static SDL_Texture *s_textures[TOUCH_TEX_COUNT];
 static int s_out_w = 1280;
@@ -72,11 +82,36 @@ static int s_out_h = 720;
 
 static TouchFinger s_fingers[MAX_TOUCH_FINGERS];
 static uint32_t s_pad_mask = 0;
-static uint32_t s_btn_pressed_mask = 0; /* Bit i = layout.buttons[i] pressed */
+static uint32_t s_btn_pressed_mask = 0;
 static bool s_stick_active = false;
 static float s_stick_dx = 0.0f;
 static float s_stick_dy = 0.0f;
 static bool s_menu_toggle_pending = false;
+static bool s_debug_toggle_pending = false;
+
+/* Swipe-to-open-menu failsafe when overlay is OFF and no controller is connected */
+static bool s_swipe_active = false;
+static bool s_swipe_fired = false;
+static SDL_FingerID s_swipe_id = 0;
+static float s_swipe_start_x = 0.0f;
+static float s_swipe_start_y = 0.0f;
+
+static uint8_t ComputeIdleAlpha(float weight)
+{
+    int a = (int)lroundf(((float)s_opacity_pct / 100.0f) * 255.0f * weight);
+    if (a < 14) a = 14;
+    if (a > 255) a = 255;
+    return (uint8_t)a;
+}
+
+static uint8_t ComputePressAlpha(float weight)
+{
+    int idle = (int)ComputeIdleAlpha(weight);
+    int a = idle * 2 + 30;
+    if (a < 90) a = 90;
+    if (a > 240) a = 240;
+    return (uint8_t)a;
+}
 
 static void ComputeLayout(int w, int h, TouchLayout *L)
 {
@@ -105,32 +140,33 @@ static void ComputeLayout(int w, int h, TouchLayout *L)
     float btn_sz = u * 0.138f;
     float btn_hit = btn_sz * 0.62f;
 
-    /* Shoulder L/R: top-left & top-right */
-    float lr_sz = u * 0.135f;
-    float l_cx = fw * 0.075f;
+    /* Shoulder L/R and Back Triggers LT (Slideout Menu) / RT (Debug) along top corners */
+    float lr_sz = u * 0.132f;
+    float trig_sz = u * 0.126f;
+    float l_cx = fw * 0.072f;
     if (l_cx < u * 0.095f) l_cx = u * 0.095f;
     float r_cx = fw - l_cx;
-    float lr_cy = fh * 0.11f;
+    float lr_cy = fh * 0.105f;
+    float trig_gap = u * 0.155f;
+    float lt_cx = l_cx + trig_gap;
+    float rt_cx = r_cx - trig_gap;
 
     /* Select / Start: bottom-center */
     float ss_sz = u * 0.095f;
     float ss_cy = fh * 0.91f;
     float ss_dx = u * 0.095f;
 
-    /* Menu (Home): top-center */
-    float menu_sz = u * 0.095f;
-    float menu_cy = fh * 0.08f;
-
     int idx = 0;
-    L->buttons[idx++] = (TouchButton){ face_cx + d, face_cy, btn_sz, btn_hit, SNES_PAD_A, TOUCH_TEX_A, 115, 220, false };
-    L->buttons[idx++] = (TouchButton){ face_cx, face_cy + d, btn_sz, btn_hit, SNES_PAD_B, TOUCH_TEX_B, 115, 220, false };
-    L->buttons[idx++] = (TouchButton){ face_cx, face_cy - d, btn_sz, btn_hit, SNES_PAD_X, TOUCH_TEX_X, 115, 220, false };
-    L->buttons[idx++] = (TouchButton){ face_cx - d, face_cy, btn_sz, btn_hit, SNES_PAD_Y, TOUCH_TEX_Y, 115, 220, false };
-    L->buttons[idx++] = (TouchButton){ l_cx, lr_cy, lr_sz, lr_sz * 0.68f, SNES_PAD_L, TOUCH_TEX_L, 105, 210, false };
-    L->buttons[idx++] = (TouchButton){ r_cx, lr_cy, lr_sz, lr_sz * 0.68f, SNES_PAD_R, TOUCH_TEX_R, 105, 210, false };
-    L->buttons[idx++] = (TouchButton){ fw * 0.5f - ss_dx, ss_cy, ss_sz, ss_sz * 0.72f, SNES_PAD_SELECT, TOUCH_TEX_SELECT, 100, 205, false };
-    L->buttons[idx++] = (TouchButton){ fw * 0.5f + ss_dx, ss_cy, ss_sz, ss_sz * 0.72f, SNES_PAD_START, TOUCH_TEX_START, 100, 205, false };
-    L->buttons[idx++] = (TouchButton){ fw * 0.5f, menu_cy, menu_sz, menu_sz * 0.75f, 0u, TOUCH_TEX_MENU, 95, 210, true };
+    L->buttons[idx++] = (TouchButton){ face_cx + d, face_cy, btn_sz, btn_hit, SNES_PAD_A, TOUCH_TEX_A, TOUCH_ACTION_SNES };
+    L->buttons[idx++] = (TouchButton){ face_cx, face_cy + d, btn_sz, btn_hit, SNES_PAD_B, TOUCH_TEX_B, TOUCH_ACTION_SNES };
+    L->buttons[idx++] = (TouchButton){ face_cx, face_cy - d, btn_sz, btn_hit, SNES_PAD_X, TOUCH_TEX_X, TOUCH_ACTION_SNES };
+    L->buttons[idx++] = (TouchButton){ face_cx - d, face_cy, btn_sz, btn_hit, SNES_PAD_Y, TOUCH_TEX_Y, TOUCH_ACTION_SNES };
+    L->buttons[idx++] = (TouchButton){ l_cx,  lr_cy, lr_sz,   lr_sz   * 0.66f, SNES_PAD_L, TOUCH_TEX_L,  TOUCH_ACTION_SNES };
+    L->buttons[idx++] = (TouchButton){ r_cx,  lr_cy, lr_sz,   lr_sz   * 0.66f, SNES_PAD_R, TOUCH_TEX_R,  TOUCH_ACTION_SNES };
+    L->buttons[idx++] = (TouchButton){ lt_cx, lr_cy, trig_sz, trig_sz * 0.66f, 0u,         TOUCH_TEX_LT, TOUCH_ACTION_MENU_TOGGLE };
+    L->buttons[idx++] = (TouchButton){ rt_cx, lr_cy, trig_sz, trig_sz * 0.66f, 0u,         TOUCH_TEX_RT, TOUCH_ACTION_DEBUG_TOGGLE };
+    L->buttons[idx++] = (TouchButton){ fw * 0.5f - ss_dx, ss_cy, ss_sz, ss_sz * 0.72f, SNES_PAD_SELECT, TOUCH_TEX_SELECT, TOUCH_ACTION_SNES };
+    L->buttons[idx++] = (TouchButton){ fw * 0.5f + ss_dx, ss_cy, ss_sz, ss_sz * 0.72f, SNES_PAD_START,  TOUCH_TEX_START,  TOUCH_ACTION_SNES };
     L->button_count = idx;
 }
 
@@ -142,6 +178,14 @@ static void ClearAllTouches(void)
     s_stick_active = false;
     s_stick_dx = 0.0f;
     s_stick_dy = 0.0f;
+}
+
+static bool HasPhysicalGamepad(void)
+{
+    int n = 0;
+    SDL_JoystickID *ids = SDL_GetGamepads(&n);
+    if (ids) SDL_free(ids);
+    return n > 0;
 }
 
 static void RecomputeState(void)
@@ -191,7 +235,7 @@ static void RecomputeState(void)
             float dy = py - btn->cy;
             if (dx * dx + dy * dy <= btn->hit_radius * btn->hit_radius) {
                 pressed_mask |= (1u << b);
-                if (!btn->is_menu) {
+                if (btn->action == TOUCH_ACTION_SNES) {
                     pad |= btn->pad_bit;
                 }
             }
@@ -210,12 +254,39 @@ void SoeAndroidTouchSetEnabled(bool enabled)
     s_enabled = enabled;
     if (!enabled) {
         ClearAllTouches();
+    } else {
+        s_swipe_active = false;
+        s_swipe_fired = false;
     }
 }
 
 bool SoeAndroidTouchIsEnabled(void)
 {
     return s_enabled;
+}
+
+void SoeAndroidTouchSetOpacity(int percent)
+{
+    if (percent < 10) percent = 10;
+    if (percent > 100) percent = 100;
+    s_opacity_pct = percent;
+}
+
+int SoeAndroidTouchGetOpacity(void)
+{
+    return s_opacity_pct;
+}
+
+void SoeAndroidTouchSetMenuOpen(bool open)
+{
+    if (s_menu_open_hint != open) {
+        s_menu_open_hint = open;
+        if (open) {
+            ClearAllTouches();
+            s_swipe_active = false;
+            s_swipe_fired = false;
+        }
+    }
 }
 
 uint32_t SoeAndroidTouchGetPadMask(void)
@@ -232,14 +303,66 @@ bool SoeAndroidTouchConsumeMenuToggle(void)
     return false;
 }
 
+bool SoeAndroidTouchConsumeDebugToggle(void)
+{
+    if (s_debug_toggle_pending) {
+        s_debug_toggle_pending = false;
+        return true;
+    }
+    return false;
+}
+
 bool SoeAndroidTouchHandleEvent(const SDL_Event *ev)
 {
-    if (!s_enabled || !ev) return false;
+    if (!ev) return false;
+
+    /* Failsafe: when overlay is OFF and no physical controller is connected,
+     * sliding a finger across the screen opens the Settings menu so the user
+     * can re-enable the touch overlay. */
+    if (!s_enabled) {
+        if (!s_menu_open_hint && !HasPhysicalGamepad()) {
+            if (ev->type == SDL_EVENT_FINGER_DOWN) {
+                if (!s_swipe_active) {
+                    s_swipe_active = true;
+                    s_swipe_fired = false;
+                    s_swipe_id = ev->tfinger.fingerID;
+                    s_swipe_start_x = ev->tfinger.x;
+                    s_swipe_start_y = ev->tfinger.y;
+                }
+            } else if (ev->type == SDL_EVENT_FINGER_MOTION) {
+                if (s_swipe_active && !s_swipe_fired && ev->tfinger.fingerID == s_swipe_id) {
+                    float dx = ev->tfinger.x - s_swipe_start_x;
+                    float dy = ev->tfinger.y - s_swipe_start_y;
+                    if (dx * dx + dy * dy >= 0.14f * 0.14f) {
+                        s_swipe_fired = true;
+                        s_menu_toggle_pending = true;
+                    }
+                }
+            } else if (ev->type == SDL_EVENT_FINGER_UP || ev->type == SDL_EVENT_FINGER_CANCELED) {
+                if (s_swipe_active && ev->tfinger.fingerID == s_swipe_id) {
+                    s_swipe_active = false;
+                    s_swipe_fired = false;
+                }
+            }
+        } else {
+            s_swipe_active = false;
+            s_swipe_fired = false;
+        }
+        return false;
+    }
 
     if (ev->type == SDL_EVENT_FINGER_DOWN) {
         SDL_FingerID fid = ev->tfinger.fingerID;
         float nx = ev->tfinger.x;
         float ny = ev->tfinger.y;
+
+        /* When the slide-out settings menu is open, let all touches over the
+         * drawer (left ~72% of screen) pass straight through to SDL mouse/tap
+         * handling so tabs, rows, and ARE YOU SURE? YES/NO buttons work directly! */
+        if (s_menu_open_hint && nx < 0.72f) {
+            return false;
+        }
+
         float px = nx * (float)s_out_w;
         float py = ny * (float)s_out_h;
 
@@ -264,7 +387,7 @@ bool SoeAndroidTouchHandleEvent(const SDL_Event *ev)
             }
         }
 
-        /* Check if this touch hits any button (and fire Menu toggle on edge) */
+        /* Check if this touch hits any button (and fire LT/RT toggles on edge) */
         bool hit_any = is_stick;
         if (!is_stick) {
             for (int b = 0; b < L.button_count; b++) {
@@ -273,14 +396,15 @@ bool SoeAndroidTouchHandleEvent(const SDL_Event *ev)
                 float dy = py - btn->cy;
                 if (dx * dx + dy * dy <= btn->hit_radius * btn->hit_radius) {
                     hit_any = true;
-                    if (btn->is_menu) {
+                    if (btn->action == TOUCH_ACTION_MENU_TOGGLE) {
                         s_menu_toggle_pending = true;
+                    } else if (btn->action == TOUCH_ACTION_DEBUG_TOGGLE) {
+                        s_debug_toggle_pending = true;
                     }
                 }
             }
         }
 
-        /* Always record finger in case it slides onto a face button, or only if it hit a control */
         if (hit_any) {
             int slot = -1;
             for (int i = 0; i < MAX_TOUCH_FINGERS; i++) {
@@ -364,9 +488,10 @@ static void EnsureTextures(SDL_Renderer *renderer)
         { TOUCH_TEX_Y,          kKenneyBtnY,      sizeof(kKenneyBtnY) },
         { TOUCH_TEX_L,          kKenneyBtnL,      sizeof(kKenneyBtnL) },
         { TOUCH_TEX_R,          kKenneyBtnR,      sizeof(kKenneyBtnR) },
+        { TOUCH_TEX_LT,         kKenneyBtnLT,     sizeof(kKenneyBtnLT) },
+        { TOUCH_TEX_RT,         kKenneyBtnRT,     sizeof(kKenneyBtnRT) },
         { TOUCH_TEX_START,      kKenneyBtnStart,  sizeof(kKenneyBtnStart) },
         { TOUCH_TEX_SELECT,     kKenneyBtnSelect, sizeof(kKenneyBtnSelect) },
-        { TOUCH_TEX_MENU,       kKenneyBtnMenu,   sizeof(kKenneyBtnMenu) },
         { TOUCH_TEX_STICK_BASE, kKenneyStickBase, sizeof(kKenneyStickBase) },
         { TOUCH_TEX_STICK_KNOB, kKenneyStickKnob, sizeof(kKenneyStickKnob) },
     };
@@ -399,7 +524,8 @@ void SoeAndroidTouchRender(SDL_Renderer *renderer)
             L.stick_base_size,
             L.stick_base_size
         };
-        SDL_SetTextureAlphaMod(s_textures[TOUCH_TEX_STICK_BASE], s_stick_active ? 150 : 90);
+        SDL_SetTextureAlphaMod(s_textures[TOUCH_TEX_STICK_BASE],
+                               s_stick_active ? ComputePressAlpha(0.80f) : ComputeIdleAlpha(0.80f));
         SDL_RenderTexture(renderer, s_textures[TOUCH_TEX_STICK_BASE], NULL, &dst);
     }
     if (s_textures[TOUCH_TEX_STICK_KNOB]) {
@@ -411,11 +537,12 @@ void SoeAndroidTouchRender(SDL_Renderer *renderer)
             L.stick_knob_size,
             L.stick_knob_size
         };
-        SDL_SetTextureAlphaMod(s_textures[TOUCH_TEX_STICK_KNOB], s_stick_active ? 215 : 120);
+        SDL_SetTextureAlphaMod(s_textures[TOUCH_TEX_STICK_KNOB],
+                               s_stick_active ? ComputePressAlpha(1.05f) : ComputeIdleAlpha(1.05f));
         SDL_RenderTexture(renderer, s_textures[TOUCH_TEX_STICK_KNOB], NULL, &dst);
     }
 
-    /* 2. Draw face, shoulder, start/select, and menu buttons */
+    /* 2. Draw face, shoulder, LT/RT triggers, and start/select buttons */
     for (int b = 0; b < L.button_count; b++) {
         const TouchButton *btn = &L.buttons[b];
         SDL_Texture *tex = s_textures[btn->tex_idx];
@@ -429,7 +556,8 @@ void SoeAndroidTouchRender(SDL_Renderer *renderer)
             sz,
             sz
         };
-        SDL_SetTextureAlphaMod(tex, pressed ? btn->press_alpha : btn->idle_alpha);
+        float weight = (btn->action == TOUCH_ACTION_SNES) ? 1.0f : 0.90f;
+        SDL_SetTextureAlphaMod(tex, pressed ? ComputePressAlpha(weight) : ComputeIdleAlpha(weight));
         SDL_RenderTexture(renderer, tex, NULL, &dst);
     }
 }

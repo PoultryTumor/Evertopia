@@ -144,9 +144,10 @@ enum {
     GAME_OPT_RING_MENU = 7,    /* Ring Menu: Enhanced (Smooth + Cached) or Original */
 #ifdef __ANDROID__
     GAME_OPT_TOUCH_OVERLAY = 8,    /* On-screen Touch Controls Overlay: On (Default) / Off */
-    GAME_OPT_RESET_ALL = 9,        /* Reset All Settings to Default */
-    GAME_OPT_EXIT_TO_DESKTOP = 10, /* Save all settings and exit to Android launcher */
-    GAME_OPT_COUNT = 11
+    GAME_OPT_TOUCH_OPACITY = 9,    /* On-screen Touch Overlay Opacity: 10%..100% (Default 20%) */
+    GAME_OPT_RESET_ALL = 10,       /* Reset All Settings to Default */
+    GAME_OPT_EXIT_TO_DESKTOP = 11, /* Save all settings and exit to Android launcher */
+    GAME_OPT_COUNT = 12
 #else
     GAME_OPT_RESET_ALL = 8,        /* Reset All Settings to Default */
     GAME_OPT_EXIT_TO_LAUNCHER = 9, /* Save all settings and return to launcher */
@@ -428,6 +429,7 @@ static bool s_interpolate_sprites = false; /* Slideout toggle: Subpixel sprite i
 static bool s_enhanced_ring_menu = true;  /* Slideout toggle: Enhanced Ring Menu (smooth OAM + texel cache) */
 #ifdef __ANDROID__
 static bool s_android_touch_overlay = true; /* Android-only: On-screen Touch Controller Overlay (On on first boot) */
+static int s_android_touch_opacity = 20;    /* Android-only: Overlay Opacity 10..100% (Default 20%) */
 #endif
 
 /* Enhanced Ring Menu opening curve: ~30% slower approach (~13 frames) than before
@@ -2192,6 +2194,7 @@ static void SoeSaveVideoConfig(void)
     fprintf(f, "  \"eliminate_lag_frames\": %d,\n", s_eliminate_lag_frames ? 1 : 0);
 #ifdef __ANDROID__
     fprintf(f, "  \"touch_overlay\": %d,\n", s_android_touch_overlay ? 1 : 0);
+    fprintf(f, "  \"touch_opacity\": %d,\n", s_android_touch_opacity);
 #endif
     fprintf(f, "  \"pillarbox_edit_mode\": %d\n", 0);
     fprintf(f, "}\n");
@@ -2209,7 +2212,9 @@ static void SoeLoadVideoConfig(void)
     s_eliminate_lag_frames = true;
 #ifdef __ANDROID__
     s_android_touch_overlay = true;
+    s_android_touch_opacity = 20;
     SoeAndroidTouchSetEnabled(true);
+    SoeAndroidTouchSetOpacity(20);
 #endif
     snes_beam_frame_driver_set_fast_cpu(true);
 
@@ -2253,6 +2258,12 @@ static void SoeLoadVideoConfig(void)
 #ifdef __ANDROID__
         } else if (strcmp(q1 + 1, "touch_overlay") == 0) {
             s_android_touch_overlay = (val != 0);
+        } else if (strcmp(q1 + 1, "touch_opacity") == 0) {
+            if (val < 10) val = 10;
+            if (val > 100) val = 100;
+            s_android_touch_opacity = ((val + 5) / 10) * 10;
+            if (s_android_touch_opacity < 10) s_android_touch_opacity = 10;
+            if (s_android_touch_opacity > 100) s_android_touch_opacity = 100;
 #endif
         } else if (strcmp(q1 + 1, "pillarbox_edit_mode") == 0) {
             (void)val; /* legacy key, ignored */
@@ -2262,6 +2273,7 @@ static void SoeLoadVideoConfig(void)
 
 #ifdef __ANDROID__
     SoeAndroidTouchSetEnabled(s_android_touch_overlay);
+    SoeAndroidTouchSetOpacity(s_android_touch_opacity);
 #endif
     snes_beam_frame_driver_set_fast_cpu(s_eliminate_lag_frames);
     g_config.disable_frame_delay = false;
@@ -6587,12 +6599,12 @@ static int GetGameTabRowY(int row)
     } else if (row < 6) {
         return 92 + (row - 3) * 9;
 #ifdef __ANDROID__
-    } else if (row < 9) {
+    } else if (row < 10) {
         return 129 + (row - 6) * 10;
     } else if (row == GAME_OPT_RESET_ALL) {
-        return 161;
+        return 171;
     } else {
-        return 174;
+        return 184;
     }
 #else
     } else if (row < 8) {
@@ -6869,7 +6881,9 @@ static void SoeResetVideoToDefault(bool show_toast)
     s_eliminate_lag_frames = true;
 #ifdef __ANDROID__
     s_android_touch_overlay = true;
+    s_android_touch_opacity = 20;
     SoeAndroidTouchSetEnabled(true);
+    SoeAndroidTouchSetOpacity(20);
 #endif
     snes_beam_frame_driver_set_fast_cpu(true);
     g_config.disable_frame_delay = false;
@@ -6995,6 +7009,15 @@ static void AdjustTabOption(SoeMenuTab tab, int option_index, int direction)
             SoeAndroidTouchSetEnabled(s_android_touch_overlay);
             SoeSaveVideoConfig();
             break;
+        case GAME_OPT_TOUCH_OPACITY: {
+            int next_pct = s_android_touch_opacity + (direction >= 0 ? 10 : -10);
+            if (next_pct > 100) next_pct = 10;
+            if (next_pct < 10) next_pct = 100;
+            s_android_touch_opacity = next_pct;
+            SoeAndroidTouchSetOpacity(s_android_touch_opacity);
+            SoeSaveVideoConfig();
+            break;
+        }
 #endif
         case GAME_OPT_RESET_ALL:
             s_reset_confirm = RESET_CONFIRM_ALL;
@@ -7851,6 +7874,62 @@ static bool SDLCALL SlideMenuEventFilter(void *userdata, SDL_Event *event)
             /* 4. Check Slide Drawer clicks (Tabbed format) */
             if (s_menu_open) {
                 int drawer_w = (int)GetMenuWidth();
+                if (s_reset_confirm != RESET_CONFIRM_NONE) {
+                    int content_x = 8;
+                    int content_w = drawer_w - 16;
+                    int start_y = 36, row_h = 16;
+                    GetTabRowLayout(s_active_tab, &start_y, &row_h);
+                    int dlg_w = 188;
+                    int dlg_h = 54;
+                    int dlg_x = content_x + (content_w - dlg_w) / 2;
+                    int dlg_y = start_y + 42;
+                    int btn_w = 54;
+                    int btn_h = 14;
+                    int yes_x = dlg_x + 30;
+                    int no_x = dlg_x + dlg_w - 30 - btn_w;
+                    int btn_y = dlg_y + 33;
+                    if (fx >= yes_x - 6 && fx <= yes_x + btn_w + 6 &&
+                        fy >= btn_y - 6 && fy <= btn_y + btn_h + 6) {
+                        SoeResetConfirmKind kind = s_reset_confirm;
+                        s_reset_confirm_choice = 0;
+                        s_reset_confirm = RESET_CONFIRM_NONE;
+                        SoePlayUiSfx(1);
+                        switch (kind) {
+                            case RESET_CONFIRM_ALL:
+                                SoeResetAllToDefault();
+                                break;
+                            case RESET_CONFIRM_VIDEO:
+                                SoeResetVideoToDefault(true);
+                                break;
+                            case RESET_CONFIRM_CRT:
+                                SoeApplyDefaultCrtSettings();
+                                SoeSaveCrtConfig();
+                                SoeSetMenuToast(">> CRT settings restored to default! <<");
+                                break;
+                            case RESET_CONFIRM_BLOOM:
+                                SoeApplyDefaultBloomSettings();
+                                SoeSaveBloomConfig();
+                                SoeSetMenuToast(">> Bloom settings restored to default! <<");
+                                break;
+                            case RESET_CONFIRM_EXIT_LAUNCHER:
+                                SoeSaveAllConfigsAndExitToLauncher();
+                                break;
+                            case RESET_CONFIRM_EXIT_DESKTOP:
+                                SoeSaveAllConfigsAndExit();
+                                break;
+                            default:
+                                break;
+                        }
+                    } else if ((fx >= no_x - 6 && fx <= no_x + btn_w + 6 &&
+                                fy >= btn_y - 6 && fy <= btn_y + btn_h + 6) ||
+                               fx < dlg_x || fx > dlg_x + dlg_w ||
+                               fy < dlg_y || fy > dlg_y + dlg_h) {
+                        s_reset_confirm_choice = 1;
+                        s_reset_confirm = RESET_CONFIRM_NONE;
+                        SoePlayUiSfx(2);
+                    }
+                    return false;
+                }
                 if (fx <= drawer_w) {
                     /* Check if a tab bar button was clicked (2 rows: y 17..28, y 30..41) */
                     if ((fy >= 17 && fy <= 28) || (fy >= 30 && fy <= 41)) {
@@ -8086,8 +8165,23 @@ static void PollMenuKeyboardDirect(void)
 #endif
 
 #ifdef __ANDROID__
+    SoeAndroidTouchSetMenuOpen(s_menu_open);
     if (SoeAndroidTouchConsumeMenuToggle()) {
         s_pending_toggle_event = true;
+    }
+    if (SoeAndroidTouchConsumeDebugToggle()) {
+        s_debug_overlay = !s_debug_overlay;
+        SoePlayUiSfx(s_debug_overlay ? 1 : 2);
+        if (s_debug_overlay) {
+            s_menu_open = false;
+            s_reset_confirm = RESET_CONFIRM_NONE;
+        } else {
+            s_jukebox_open = false;
+            s_key_trade_open = false;
+            s_warp_win_open = false;
+            s_give_all_confirm_open = false;
+            s_map_picker_open = false;
+        }
     }
     if (s_menu_open || s_debug_overlay || s_jukebox_open || s_key_trade_open ||
         s_warp_win_open || s_give_all_confirm_open || s_map_picker_open) {
@@ -10998,6 +11092,10 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                 case GAME_OPT_TOUCH_OVERLAY:
                     snprintf(label_buf, sizeof(label_buf), "Touch Overlay");
                     snprintf(val_buf, sizeof(val_buf), "%s", s_android_touch_overlay ? "On" : "Off");
+                    break;
+                case GAME_OPT_TOUCH_OPACITY:
+                    snprintf(label_buf, sizeof(label_buf), "Overlay Opacity");
+                    snprintf(val_buf, sizeof(val_buf), "%d%%", s_android_touch_opacity);
                     break;
 #endif
                 case GAME_OPT_RESET_ALL:

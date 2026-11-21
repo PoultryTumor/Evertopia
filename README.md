@@ -8,6 +8,13 @@ A native PC static recompilation port of **Secret of Evermore** (SNES, USA), bui
 
 ## What's New
 
+### v0.9.6
+- **Android Touch Overlay Refinements (`LT`/`RT` Triggers, Opacity Setting & Swipe Failsafe):**
+  - Added onscreen **`LT`** (Slide-Out Settings Menu) and **`RT`** (Debug Overlay) back triggers beside `L` and `R` using **Kenney's Input Prompts** (CC0 1.0 Public Domain, [kenney.nl](https://kenney.nl)).
+  - Lowered default touch overlay opacity by 50% (to **`20%`** idle opacity) for an even cleaner ghostly float, and added an **`Overlay Opacity`** (`10%`–`100%`) setting in the Android **Game** menu tab (saved to `video_config.json`).
+  - Fixed **"ARE YOU SURE?"** `YES` / `NO` confirmation dialogs so they respond directly to touchscreen taps (and mouse clicks), and ensured touches on the slide-out menu drawer pass cleanly through the overlay.
+  - Added a **swipe-to-open-menu failsafe**: if the touch overlay is turned **Off** and no physical controller is connected, sliding a finger across the screen opens the Settings menu so you can easily re-enable the overlay.
+
 ### v0.9.5
 - **Android Translucent Touch Controller Overlay (Android-Only):** Added a built-in SDL3 on-screen touch controller for Android using crisp transparent icons from **Kenney's Input Prompts** (CC0 1.0 Public Domain, [kenney.nl](https://kenney.nl)): 8-way virtual thumbstick (bottom-left), SNES `X / Y / A / B` diamond (bottom-right), `L` / `R` shoulders (upper corners), `Select` / `Start` (bottom-center), and a subtle `Home` menu toggle (top-center) with ghostly float opacity and pressed highlight feedback.
   - Enabled (**On**) by default on first boot, and toggleable anytime in the Android **Game** menu tab (**Touch Overlay: On / Off**, saved to `video_config.json`).
