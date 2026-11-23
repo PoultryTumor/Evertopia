@@ -190,18 +190,17 @@ enum {
     VIDEO_OPT_WIDESCREEN = 0,   /* 16:9, 21:9, Off (4:3) */
     VIDEO_OPT_HUD_POSITION = 1, /* Move Left, Original */
     VIDEO_OPT_PILLARBOX = 2,    /* Enabled, Disabled */
-    VIDEO_OPT_SOLID_DIALOG = 3, /* Solid Blue, Original */
-    VIDEO_OPT_ASPECT_RATIO = 4, /* 4:3 CRT, 8:7 Square, 1:1 */
-    VIDEO_OPT_WINDOW_SCALE = 5, /* 1x, 2x, 3x, 4x, Fullscreen */
-    VIDEO_OPT_VSYNC = 6,        /* Off, On, Adaptive */
-    VIDEO_OPT_TRIPLE_BUFFER = 7,/* OFF, ON */
-    VIDEO_OPT_CRT_SCANLINES = 8,/* Quick Preset switcher */
-    VIDEO_OPT_SPRITE_LIMITS = 9,/* ON (No Flicker), OFF (Standard 32) */
-    VIDEO_OPT_LOCK_60FPS = 10,  /* High-Hz Subpixel Scroll, Locked 60 FPS */
-    VIDEO_OPT_INTERPOLATE_SPRITES = 11, /* ON (Subpixel), OFF (60 Hz Snap) */
-    VIDEO_OPT_ELIMINATE_LAG = 12, /* ON (Fast CPU/DMA), OFF (Original SNES) */
-    VIDEO_OPT_RESET = 13,       /* [ Reset Video Settings to Default ] */
-    VIDEO_OPT_COUNT = 14
+    VIDEO_OPT_ASPECT_RATIO = 3, /* 4:3 CRT, 8:7 Square, 1:1 */
+    VIDEO_OPT_WINDOW_SCALE = 4, /* 1x, 2x, 3x, 4x, Fullscreen */
+    VIDEO_OPT_VSYNC = 5,        /* Off, On, Adaptive */
+    VIDEO_OPT_TRIPLE_BUFFER = 6,/* OFF, ON */
+    VIDEO_OPT_CRT_SCANLINES = 7,/* Quick Preset switcher */
+    VIDEO_OPT_SPRITE_LIMITS = 8,/* ON (No Flicker), OFF (Standard 32) */
+    VIDEO_OPT_LOCK_60FPS = 9,   /* High-Hz Subpixel Scroll, Locked 60 FPS */
+    VIDEO_OPT_INTERPOLATE_SPRITES = 10, /* ON (Subpixel), OFF (60 Hz Snap) */
+    VIDEO_OPT_ELIMINATE_LAG = 11, /* ON (Fast CPU/DMA), OFF (Original SNES) */
+    VIDEO_OPT_RESET = 12,       /* [ Reset Video Settings to Default ] */
+    VIDEO_OPT_COUNT = 13
 };
 
 /* Tab 2: Audio Options */
@@ -435,6 +434,11 @@ static bool s_original_mode = false;      /* Original Mode: 4:3 pillarbox all ma
 static bool s_menu_full_font = false;     /* Slideout Menu Font: false = Compact 6px ($C4:0C82), true = Full Size 8px ($C4:0000) */
 static bool s_draw_full_font = false;     /* Active font context during slideout menu rendering & hit-testing */
 static int  s_game_scroll_y = 0;          /* Pixel scroll offset for TAB_GAME_OPTIONS */
+static int  s_game_last_sel_row = -1;     /* Tracks selection changes so manual scroll isn't snapped back */
+static int  s_av_last_sel_row = -1;       /* Tracks selection changes on TAB_VIDEO_OPTIONS */
+static bool s_sb_dragging = false;        /* True while dragging a slideout menu scrollbar thumb */
+static SoeMenuTab s_sb_drag_tab = TAB_GAME_OPTIONS;
+static int  s_sb_drag_grab_offset = 0;    /* Pointer Y offset inside thumb when drag started */
 static uint16_t s_orig_saved_0b15 = 0;    /* Saved $7E:0B15 pattern before entering Original Mode */
 static bool s_orig_prev_in_gameplay = false; /* Tracks title->gameplay transition for Original Mode default checkerboard */
 #ifdef __ANDROID__
@@ -643,9 +647,50 @@ typedef struct {
     int obj_adr;
     uint8_t size;
     uint8_t bright;
+    uint8_t min_row;
+    uint8_t max_row;
+    uint8_t min_col;
+    uint8_t max_col;
     uint32_t tex[64 * 64];
 } SoeSpriteTexCache;
 static SoeSpriteTexCache s_sprite_tex_cache[128];
+
+typedef struct {
+    int cost;
+    uint8_t cur_sl;
+    uint8_t prev_sl;
+} SoeOamMatchPair;
+
+static inline int SoeDecodeOamX(const Ppu *ppu, int sl, uint16_t w0, uint8_t hi)
+{
+    int x = (int)(w0 & 0xFFu) | (((int)hi & 1) << 8);
+    if (ppu->wsOamFullXOn &&
+        (ppu->wsOamFullXValid[sl >> 3] & (1u << (sl & 7))) &&
+        (ppu->wsOamFullX[sl] & 511) == x) {
+        return ppu->wsOamFullX[sl];
+    }
+    if (x >= 256 + (int)ppu->extraRightCur) {
+        x -= 512;
+    } else if (x >= 256 && ppu->wsOamRightHintStrict) {
+        if (!(ppu->wsOamRightHint[sl >> 3] & (1u << (sl & 7)))) {
+            x -= 512;
+        }
+    }
+    return x;
+}
+
+static void SoeSortOamMatchPairs(SoeOamMatchPair *arr, int n)
+{
+    for (int i = 1; i < n; i++) {
+        SoeOamMatchPair key = arr[i];
+        int j = i - 1;
+        while (j >= 0 && arr[j].cost > key.cost) {
+            arr[j + 1] = arr[j];
+            j--;
+        }
+        arr[j + 1] = key;
+    }
+}
 
 /* Toast status message displayed in debug window */
 static char s_debug_toast[64] = "";
@@ -3144,6 +3189,173 @@ static void DrawThemedHighlightRect(uint32_t *pixels, int stride, int frame_h,
                                 tc->inact_r, tc->inact_g, tc->inact_b, 185);
         DrawRectOutline(pixels, stride, frame_h, x, y, w, h,
                         tc->inact_brd_r, tc->inact_brd_g, tc->inact_brd_b, 165);
+    }
+}
+
+typedef struct {
+    int x, y, w, h;
+    int cap_h;
+    int track_y, track_h;
+    int thumb_y, thumb_h;
+    int scroll_pos;
+    int max_scroll;
+    int visible_span;
+    int total_span;
+} SoeScrollbarMetrics;
+
+static void ComputeScrollbarMetrics(int x, int y, int w, int h,
+                                    int scroll_pos, int visible_span, int total_span,
+                                    SoeScrollbarMetrics *out)
+{
+    if (!out) return;
+    int max_scroll = total_span - visible_span;
+    if (max_scroll < 0) max_scroll = 0;
+    if (scroll_pos < 0) scroll_pos = 0;
+    if (scroll_pos > max_scroll) scroll_pos = max_scroll;
+
+    int cap_h = (h >= 26) ? 7 : 0;
+    int track_y = y + cap_h;
+    int track_h = h - 2 * cap_h;
+    if (track_h < 0) track_h = 0;
+
+    int thumb_h = track_h;
+    int thumb_y = track_y;
+    if (max_scroll > 0 && total_span > 0 && track_h > 0) {
+        thumb_h = (int)(((long long)track_h * (long long)visible_span + (long long)(total_span / 2)) / (long long)total_span);
+        int min_thumb = (track_h >= 12) ? 12 : track_h;
+        if (thumb_h < min_thumb) thumb_h = min_thumb;
+        if (thumb_h > track_h) thumb_h = track_h;
+        int thumb_range = track_h - thumb_h;
+        thumb_y = track_y + (int)(((long long)thumb_range * (long long)scroll_pos + (long long)(max_scroll / 2)) / (long long)max_scroll);
+        if (thumb_y < track_y) thumb_y = track_y;
+        if (thumb_y > track_y + thumb_range) thumb_y = track_y + thumb_range;
+    }
+
+    out->x = x;
+    out->y = y;
+    out->w = w;
+    out->h = h;
+    out->cap_h = cap_h;
+    out->track_y = track_y;
+    out->track_h = track_h;
+    out->thumb_y = thumb_y;
+    out->thumb_h = thumb_h;
+    out->scroll_pos = scroll_pos;
+    out->max_scroll = max_scroll;
+    out->visible_span = visible_span;
+    out->total_span = total_span;
+}
+
+static int ScrollbarPosFromThumbY(const SoeScrollbarMetrics *m, int desired_thumb_y)
+{
+    if (!m || m->max_scroll <= 0) return 0;
+    int thumb_range = m->track_h - m->thumb_h;
+    if (thumb_range <= 0) return 0;
+    int rel = desired_thumb_y - m->track_y;
+    if (rel < 0) rel = 0;
+    if (rel > thumb_range) rel = thumb_range;
+    int pos = (int)(((long long)rel * (long long)m->max_scroll + (long long)(thumb_range / 2)) / (long long)thumb_range);
+    if (pos < 0) pos = 0;
+    if (pos > m->max_scroll) pos = m->max_scroll;
+    return pos;
+}
+
+static void DrawThemedScrollbar(uint32_t *pixels, int stride, int frame_h,
+                                const SoeScrollbarMetrics *m,
+                                const SoeUiThemeColors *tc,
+                                bool active_thumb)
+{
+    if (!pixels || !m || !tc || m->max_scroll <= 0 || m->w < 5 || m->h < 12) return;
+
+    /* Recessed track channel */
+    int tr_r = (tc->inact_r * 3) / 4;
+    int tr_g = (tc->inact_g * 3) / 4;
+    int tr_b = (tc->inact_b * 3) / 4;
+    DrawSemiTransparentRect(pixels, stride, frame_h,
+                            m->x, m->y, m->w, m->h,
+                            tr_r, tr_g, tr_b, 195);
+    DrawRectOutline(pixels, stride, frame_h,
+                    m->x, m->y, m->w, m->h,
+                    tc->inact_brd_r, tc->inact_brd_g, tc->inact_brd_b, 180);
+
+    /* Classic top & bottom arrow cap buttons */
+    if (m->cap_h >= 7) {
+        int cx = m->x + m->w / 2;
+
+        /* Top cap */
+        DrawSemiTransparentRect(pixels, stride, frame_h,
+                                m->x + 1, m->y + 1, m->w - 2, m->cap_h - 1,
+                                tc->inact_r, tc->inact_g, tc->inact_b, 215);
+        DrawSemiTransparentRect(pixels, stride, frame_h,
+                                m->x + 1, m->y + m->cap_h - 1, m->w - 2, 1,
+                                tc->inact_brd_r, tc->inact_brd_g, tc->inact_brd_b, 180);
+        {
+            bool can_up = (m->scroll_pos > 0);
+            int ar = can_up ? tc->sel_brd_r : tc->inact_brd_r;
+            int ag = can_up ? tc->sel_brd_g : tc->inact_brd_g;
+            int ab = can_up ? tc->sel_brd_b : tc->inact_brd_b;
+            int aa = can_up ? 240 : 110;
+            int ay = m->y + 2;
+            DrawSemiTransparentRect(pixels, stride, frame_h, cx,     ay,     1, 1, ar, ag, ab, aa);
+            DrawSemiTransparentRect(pixels, stride, frame_h, cx - 1, ay + 1, 3, 1, ar, ag, ab, aa);
+            DrawSemiTransparentRect(pixels, stride, frame_h, cx - 2, ay + 2, 5, 1, ar, ag, ab, aa);
+        }
+
+        /* Bottom cap */
+        int bot_y = m->y + m->h - m->cap_h;
+        DrawSemiTransparentRect(pixels, stride, frame_h,
+                                m->x + 1, bot_y, m->w - 2, m->cap_h - 1,
+                                tc->inact_r, tc->inact_g, tc->inact_b, 215);
+        DrawSemiTransparentRect(pixels, stride, frame_h,
+                                m->x + 1, bot_y, m->w - 2, 1,
+                                tc->inact_brd_r, tc->inact_brd_g, tc->inact_brd_b, 180);
+        {
+            bool can_dn = (m->scroll_pos < m->max_scroll);
+            int ar = can_dn ? tc->sel_brd_r : tc->inact_brd_r;
+            int ag = can_dn ? tc->sel_brd_g : tc->inact_brd_g;
+            int ab = can_dn ? tc->sel_brd_b : tc->inact_brd_b;
+            int aa = can_dn ? 240 : 110;
+            int ay = bot_y + 2;
+            DrawSemiTransparentRect(pixels, stride, frame_h, cx - 2, ay,     5, 1, ar, ag, ab, aa);
+            DrawSemiTransparentRect(pixels, stride, frame_h, cx - 1, ay + 1, 3, 1, ar, ag, ab, aa);
+            DrawSemiTransparentRect(pixels, stride, frame_h, cx,     ay + 2, 1, 1, ar, ag, ab, aa);
+        }
+    }
+
+    /* Draggable proportional thumb */
+    if (m->thumb_h > 0 && m->w >= 5) {
+        int tx = m->x + 1;
+        int tw = m->w - 2;
+        int fill_r = active_thumb ? ClampByte(tc->sel_r + 24) : tc->sel_r;
+        int fill_g = active_thumb ? ClampByte(tc->sel_g + 24) : tc->sel_g;
+        int fill_b = active_thumb ? ClampByte(tc->sel_b + 24) : tc->sel_b;
+        int fill_a = active_thumb ? 250 : 232;
+        int brd_a  = active_thumb ? 255 : 225;
+
+        DrawSemiTransparentRect(pixels, stride, frame_h,
+                                tx, m->thumb_y, tw, m->thumb_h,
+                                fill_r, fill_g, fill_b, fill_a);
+        DrawRectOutline(pixels, stride, frame_h,
+                        tx, m->thumb_y, tw, m->thumb_h,
+                        tc->sel_brd_r, tc->sel_brd_g, tc->sel_brd_b, brd_a);
+
+        /* Subtle center grip ticks */
+        if (tw >= 5) {
+            int gx = tx + 1;
+            int gw = tw - 2;
+            int gy = m->thumb_y + m->thumb_h / 2;
+            if (m->thumb_h >= 12) {
+                DrawSemiTransparentRect(pixels, stride, frame_h, gx, gy - 2, gw, 1,
+                                        tc->sel_brd_r, tc->sel_brd_g, tc->sel_brd_b, 170);
+                DrawSemiTransparentRect(pixels, stride, frame_h, gx, gy,     gw, 1,
+                                        tc->sel_brd_r, tc->sel_brd_g, tc->sel_brd_b, 170);
+                DrawSemiTransparentRect(pixels, stride, frame_h, gx, gy + 2, gw, 1,
+                                        tc->sel_brd_r, tc->sel_brd_g, tc->sel_brd_b, 170);
+            } else if (m->thumb_h >= 8) {
+                DrawSemiTransparentRect(pixels, stride, frame_h, gx, gy, gw, 1,
+                                        tc->sel_brd_r, tc->sel_brd_g, tc->sel_brd_b, 170);
+            }
+        }
     }
 }
 
@@ -6802,7 +7014,8 @@ static void UpdateGameTabScroll(int sel_row)
     int max_scroll = last_y - view_bot;
     if (max_scroll < 0) max_scroll = 0;
 
-    if (sel_row >= 0 && sel_row < GAME_OPT_COUNT) {
+    if (sel_row != s_game_last_sel_row && sel_row >= 0 && sel_row < GAME_OPT_COUNT) {
+        s_game_last_sel_row = sel_row;
         int ry = GetGameTabRowY(sel_row);
         int top_want = ry;
         /* Keep section header visible when highlighting its first row */
@@ -6820,6 +7033,30 @@ static void UpdateGameTabScroll(int sel_row)
     }
     if (s_game_scroll_y < 0) s_game_scroll_y = 0;
     if (s_game_scroll_y > max_scroll) s_game_scroll_y = max_scroll;
+}
+
+static void GetGameTabScrollbarMetrics(int drawer_x, int drawer_w, SoeScrollbarMetrics *out)
+{
+    const int view_top = s_menu_full_font ? 47 : 46;
+    const int view_bot = 183;
+    int rh = GetGameTabRowHeight();
+#ifdef __ANDROID__
+    int last_y = GetGameTabRowY(GAME_OPT_EXIT_TO_DESKTOP) + rh;
+#else
+    int last_y = GetGameTabRowY(GAME_OPT_EXIT_TO_LAUNCHER) + rh;
+#endif
+    ComputeScrollbarMetrics(drawer_x + drawer_w - 12, view_top, 7, view_bot - view_top,
+                            s_game_scroll_y, view_bot - view_top, last_y - view_top, out);
+}
+
+static void GetVideoTabScrollbarMetrics(int drawer_x, int drawer_w, SoeScrollbarMetrics *out)
+{
+    int start_y = 48;
+    int row_h = 9;
+    GetTabRowLayout(TAB_VIDEO_OPTIONS, &start_y, &row_h);
+    int av_vis = GetAvVisibleRows();
+    ComputeScrollbarMetrics(drawer_x + drawer_w - 12, start_y - 1, 7, av_vis * row_h + 1,
+                            s_av_scroll, av_vis, VIDEO_OPT_COUNT, out);
 }
 
 static void GetGameExitButtonBounds(int drawer_x, int drawer_w,
@@ -7053,8 +7290,14 @@ int SoeLoadStateSlot(int slot)
     s_cam_y_prev = extra.cam_y_prev;
     s_cam_x_curr = extra.cam_x_curr;
     s_cam_y_curr = extra.cam_y_curr;
-    s_cam_initialized = (extra.cam_initialized != 0);
-    s_oam_initialized = (extra.oam_initialized != 0);
+    s_cam_initialized = false;
+    s_oam_initialized = false;
+    s_frame_left_prev = 0;
+    s_frame_left_curr = 0;
+    memset(s_oam_suppressed_mask, 0, sizeof(s_oam_suppressed_mask));
+    if (g_snes && g_snes->ppu) {
+        PpuSetWsOamSuppressMask(g_snes->ppu, NULL);
+    }
     memcpy(s_oam_prev, extra.oam_prev, sizeof(s_oam_prev));
     memcpy(s_oam_curr, extra.oam_curr, sizeof(s_oam_curr));
 
@@ -7208,6 +7451,8 @@ static void AdjustTabOption(SoeMenuTab tab, int option_index, int direction)
             s_menu_full_font = !s_menu_full_font;
             s_game_scroll_y = 0;
             s_av_scroll = 0;
+            s_game_last_sel_row = -1;
+            s_av_last_sel_row = -1;
             SoeSaveVideoConfig();
             break;
         case GAME_OPT_DIALOG_THEME:
@@ -7291,16 +7536,6 @@ static void AdjustTabOption(SoeMenuTab tab, int option_index, int direction)
         case VIDEO_OPT_PILLARBOX:
             s_pillarbox_enabled = !s_pillarbox_enabled;
             SoeSaveVideoConfig();
-            break;
-        case VIDEO_OPT_SOLID_DIALOG:
-            s_dialog_theme = (SoeDialogTheme)(((int)s_dialog_theme + direction + DIALOG_THEME_COUNT) % DIALOG_THEME_COUNT);
-            s_solid_dialog_bg = (s_dialog_theme != DIALOG_THEME_ORIGINAL);
-            if (s_dialog_theme == DIALOG_THEME_ORIGINAL &&
-                (uint16_t)(g_ram[0x0B15] | (g_ram[0x0B16] << 8)) == 0x1994u) {
-                g_ram[0x0B15] = 0x44;
-                g_ram[0x0B16] = 0x19;
-            }
-            SoeSaveDialogConfig();
             break;
         case VIDEO_OPT_ASPECT_RATIO:
             g_config.display_aspect = (g_config.display_aspect + direction + 3) % 3;
@@ -8179,10 +8414,47 @@ static bool SDLCALL SlideMenuEventFilter(void *userdata, SDL_Event *event)
                             if (tab_clicked >= 0 && tab_clicked < TAB_COUNT) {
                                 if ((SoeMenuTab)tab_clicked != s_active_tab) {
                                     s_active_tab = (SoeMenuTab)tab_clicked;
+                                    s_sb_dragging = false;
                                     SoePlayUiSfx(0);
                                 }
                                 return false;
                             }
+                        }
+                    }
+
+                    /* Check if a scrollable tab's scrollbar was clicked */
+                    if (s_active_tab == TAB_GAME_OPTIONS || s_active_tab == TAB_VIDEO_OPTIONS) {
+                        SoeScrollbarMetrics sb;
+                        if (s_active_tab == TAB_GAME_OPTIONS) {
+                            GetGameTabScrollbarMetrics(0, drawer_w, &sb);
+                        } else {
+                            GetVideoTabScrollbarMetrics(0, drawer_w, &sb);
+                        }
+                        if (sb.max_scroll > 0 &&
+                            fx >= sb.x - 1 && fx <= sb.x + sb.w &&
+                            fy >= sb.y && fy < sb.y + sb.h) {
+                            int step = (s_active_tab == TAB_GAME_OPTIONS) ? GetGameTabRowHeight() : 1;
+                            int *scroll_ptr = (s_active_tab == TAB_GAME_OPTIONS) ? &s_game_scroll_y : &s_av_scroll;
+                            if (sb.cap_h > 0 && fy < sb.y + sb.cap_h) {
+                                *scroll_ptr -= step;
+                                if (*scroll_ptr < 0) *scroll_ptr = 0;
+                                SoePlayUiSfx(0);
+                            } else if (sb.cap_h > 0 && fy >= sb.y + sb.h - sb.cap_h) {
+                                *scroll_ptr += step;
+                                if (*scroll_ptr > sb.max_scroll) *scroll_ptr = sb.max_scroll;
+                                SoePlayUiSfx(0);
+                            } else if (fy >= sb.thumb_y && fy < sb.thumb_y + sb.thumb_h) {
+                                s_sb_dragging = true;
+                                s_sb_drag_tab = s_active_tab;
+                                s_sb_drag_grab_offset = fy - sb.thumb_y;
+                            } else {
+                                s_sb_dragging = true;
+                                s_sb_drag_tab = s_active_tab;
+                                s_sb_drag_grab_offset = sb.thumb_h / 2;
+                                *scroll_ptr = ScrollbarPosFromThumbY(&sb, fy - s_sb_drag_grab_offset);
+                                SoePlayUiSfx(0);
+                            }
+                            return false;
                         }
                     }
 
@@ -8253,6 +8525,7 @@ static bool SDLCALL SlideMenuEventFilter(void *userdata, SDL_Event *event)
                     }
                 } else {
                     s_menu_open = false;
+                    s_sb_dragging = false;
                     SoePlayUiSfx(2);
                     return false;
                 }
@@ -8265,18 +8538,68 @@ static bool SDLCALL SlideMenuEventFilter(void *userdata, SDL_Event *event)
                 }
             }
         }
+    } else if (event->type == SDL_EVENT_MOUSE_BUTTON_UP) {
+        if (s_sb_dragging) {
+            s_sb_dragging = false;
+            return false;
+        }
+    } else if (event->type == SDL_EVENT_MOUSE_WHEEL && s_menu_open && s_reset_confirm == RESET_CONFIRM_NONE) {
+        int delta = (event->wheel.y > 0) ? -1 : ((event->wheel.y < 0) ? 1 : 0);
+        if (delta != 0 && (s_active_tab == TAB_GAME_OPTIONS || s_active_tab == TAB_VIDEO_OPTIONS)) {
+            int drawer_w = (int)GetMenuWidth();
+            SoeScrollbarMetrics sb;
+            if (s_active_tab == TAB_GAME_OPTIONS) {
+                GetGameTabScrollbarMetrics(0, drawer_w, &sb);
+                if (sb.max_scroll > 0) {
+                    s_game_scroll_y += delta * GetGameTabRowHeight();
+                    if (s_game_scroll_y < 0) s_game_scroll_y = 0;
+                    if (s_game_scroll_y > sb.max_scroll) s_game_scroll_y = sb.max_scroll;
+                }
+            } else {
+                GetVideoTabScrollbarMetrics(0, drawer_w, &sb);
+                if (sb.max_scroll > 0) {
+                    s_av_scroll += delta;
+                    if (s_av_scroll < 0) s_av_scroll = 0;
+                    if (s_av_scroll > sb.max_scroll) s_av_scroll = sb.max_scroll;
+                }
+            }
+            return false;
+        }
     } else if (event->type == SDL_EVENT_MOUSE_MOTION && s_menu_open && g_window) {
         int win_w = 0, win_h = 0;
         SDL_GetWindowSize(g_window, &win_w, &win_h);
         if (win_w > 0 && win_h > 0) {
-            int frame_w = snesrecomp_desktop_frame_width();
-            int frame_h = snesrecomp_desktop_frame_height();
-            if (frame_w <= 0) frame_w = 256;
-            if (frame_h <= 0) frame_h = 224;
-            int fx = (int)(event->motion.x * frame_w / win_w);
-            int fy = (int)(event->motion.y * frame_h / win_h);
+            int fx = -1, fy = -1;
+            WindowToFrameCoords((float)event->motion.x, (float)event->motion.y, &fx, &fy);
             int drawer_w = (int)GetMenuWidth();
+            if (s_sb_dragging) {
+                if (s_active_tab != s_sb_drag_tab || s_reset_confirm != RESET_CONFIRM_NONE) {
+                    s_sb_dragging = false;
+                } else {
+                    SoeScrollbarMetrics sb;
+                    if (s_sb_drag_tab == TAB_GAME_OPTIONS) {
+                        GetGameTabScrollbarMetrics(0, drawer_w, &sb);
+                        s_game_scroll_y = ScrollbarPosFromThumbY(&sb, fy - s_sb_drag_grab_offset);
+                    } else if (s_sb_drag_tab == TAB_VIDEO_OPTIONS) {
+                        GetVideoTabScrollbarMetrics(0, drawer_w, &sb);
+                        s_av_scroll = ScrollbarPosFromThumbY(&sb, fy - s_sb_drag_grab_offset);
+                    }
+                    return false;
+                }
+            }
             if (fx <= drawer_w) {
+                /* Do not hover-select rows while pointer is over the scrollbar */
+                if (s_active_tab == TAB_GAME_OPTIONS || s_active_tab == TAB_VIDEO_OPTIONS) {
+                    SoeScrollbarMetrics sb;
+                    if (s_active_tab == TAB_GAME_OPTIONS) {
+                        GetGameTabScrollbarMetrics(0, drawer_w, &sb);
+                    } else {
+                        GetVideoTabScrollbarMetrics(0, drawer_w, &sb);
+                    }
+                    if (sb.max_scroll > 0 && fx >= sb.x - 1) {
+                        return true;
+                    }
+                }
                 int start_y = 36, row_h = 16;
                 GetTabRowLayout(s_active_tab, &start_y, &row_h);
                 int count = GetTabOptionCount(s_active_tab);
@@ -9647,6 +9970,10 @@ static void SoeComputeRoomContentBoundsX(uint8_t width, uint8_t height,
     }
 
     int max_probe = (span + 15) / 16 + 2;
+    int pad_y0 = ty0 - 16;
+    if (pad_y0 < 0) pad_y0 = 0;
+    int pad_y1 = ty1 + 16;
+    if (pad_y1 >= (int)height) pad_y1 = (int)height - 1;
 
     int content_l = seed_l;
     int stop_l = seed_l - max_probe;
@@ -9657,8 +9984,22 @@ static void SoeComputeRoomContentBoundsX(uint8_t width, uint8_t height,
         } else if (tx - 1 >= 0 && SoeRoomColHasContent(width, height, tx - 1, ty0, ty1, layer_mask)) {
             content_l = tx;
         } else {
-            *out_left_px = content_l * 16;
-            break;
+            /* Do not clamp on an interior chasm/abyss between pillars/bridges of the same
+             * room: if real content exists further left inside the probe window AND this
+             * column is bridged vertically in the surrounding room band, continue scanning. */
+            bool has_beyond = false;
+            for (int bx = tx - 1; bx >= stop_l; bx--) {
+                if (SoeRoomColHasContent(width, height, bx, ty0, ty1, layer_mask)) {
+                    has_beyond = true;
+                    break;
+                }
+            }
+            if (has_beyond && SoeRoomColHasContent(width, height, tx, pad_y0, pad_y1, layer_mask)) {
+                content_l = tx;
+            } else {
+                *out_left_px = content_l * 16;
+                break;
+            }
         }
     }
 
@@ -9671,14 +10012,85 @@ static void SoeComputeRoomContentBoundsX(uint8_t width, uint8_t height,
         } else if (tx + 1 < (int)width && SoeRoomColHasContent(width, height, tx + 1, ty0, ty1, layer_mask)) {
             content_r = tx;
         } else {
-            *out_right_px = (content_r + 1) * 16;
-            break;
+            bool has_beyond = false;
+            for (int bx = tx + 1; bx <= stop_r; bx++) {
+                if (SoeRoomColHasContent(width, height, bx, ty0, ty1, layer_mask)) {
+                    has_beyond = true;
+                    break;
+                }
+            }
+            if (has_beyond && SoeRoomColHasContent(width, height, tx, pad_y0, pad_y1, layer_mask)) {
+                content_r = tx;
+            } else {
+                *out_right_px = (content_r + 1) * 16;
+                break;
+            }
         }
     }
 }
 
+/* Temporal anchor state: prevents discontinuous horizontal screen jumps when
+ * walking vertically past alcoves or room-width transitions. */
+static bool     s_ws_anchor_valid = false;
+static uint16_t s_ws_anchor_map_id = 0xFFFFu;
+static int      s_ws_anchor_extra = 0;
+static int16_t  s_ws_anchor_prev_h = 0;
+static int16_t  s_ws_anchor_prev_v = 0;
+static int      s_ws_anchor_left = 0;
+static int      s_ws_anchor_right = 0;
+
+static void SoeSmoothAnchoredWidescreenMargins(uint16_t room_id, int extra,
+                                               int16_t hscroll_cam, int16_t vscroll_cam,
+                                               int *io_left, int *io_right, bool commit)
+{
+    int target_l = *io_left;
+    int target_r = *io_right;
+    int target_total = target_l + target_r;
+
+    int dh = (int)hscroll_cam - (int)s_ws_anchor_prev_h;
+    int dv = (int)vscroll_cam - (int)s_ws_anchor_prev_v;
+    int abs_dh = (dh < 0) ? -dh : dh;
+    int abs_dv = (dv < 0) ? -dv : dv;
+
+    bool snap = (!s_ws_anchor_valid ||
+                 room_id != s_ws_anchor_map_id ||
+                 extra != s_ws_anchor_extra ||
+                 abs_dh > 16 || abs_dv > 16);
+
+    int out_l = target_l;
+    int out_r = target_r;
+    if (!snap) {
+        /* Allow full 1:1 tracking of horizontal camera motion (abs_dh) plus 1 px/frame
+         * gentle glide when vertical scrolling changes effective room width. */
+        int max_step = abs_dh + 1;
+        int cur_l = s_ws_anchor_left;
+        int diff_l = target_l - cur_l;
+        if (diff_l > max_step) cur_l += max_step;
+        else if (diff_l < -max_step) cur_l -= max_step;
+        else cur_l = target_l;
+
+        if (cur_l < 0) cur_l = 0;
+        if (cur_l > target_total) cur_l = target_total;
+        out_l = cur_l;
+        out_r = target_total - out_l;
+    }
+
+    if (commit) {
+        s_ws_anchor_valid = true;
+        s_ws_anchor_map_id = room_id;
+        s_ws_anchor_extra = extra;
+        s_ws_anchor_prev_h = hscroll_cam;
+        s_ws_anchor_prev_v = vscroll_cam;
+        s_ws_anchor_left = out_l;
+        s_ws_anchor_right = out_r;
+    }
+
+    *io_left = out_l;
+    *io_right = out_r;
+}
+
 static void SoeComputeAnchoredWidescreenMargins(int extra, int16_t hscroll_cam, int16_t vscroll_cam,
-                                                int *out_left, int *out_right)
+                                                int *out_left, int *out_right, bool commit_smooth)
 {
     uint8_t room_w_tiles = g_ram[0x08EE];
     uint8_t room_h_tiles = g_ram[0x08F0];
@@ -9737,6 +10149,9 @@ static void SoeComputeAnchoredWidescreenMargins(int extra, int16_t hscroll_cam, 
             if (right_space > avail_right) right_space = avail_right;
         }
     }
+
+    SoeSmoothAnchoredWidescreenMargins(room_id, extra, hscroll_cam, vscroll_cam,
+                                       &left_space, &right_space, commit_smooth);
 
     *out_left = left_space;
     *out_right = right_space;
@@ -9877,7 +10292,7 @@ void SoeCapturePostSimState(void)
                 int16_t eff_h = SoeGetEffectivePpuHScroll(ppu);
                 int16_t eff_v = SoeGetEffectivePpuVScroll(ppu);
                 int left_space = extra, right_space = extra;
-                SoeComputeAnchoredWidescreenMargins(extra, eff_h, eff_v, &left_space, &right_space);
+                SoeComputeAnchoredWidescreenMargins(extra, eff_h, eff_v, &left_space, &right_space, true);
                 s_cur_left_space = left_space;
                 s_cur_right_space = right_space;
                 PpuSetWidescreenViewAnchor(ppu, true);
@@ -9968,98 +10383,186 @@ void SoeCapturePostSimState(void)
     memset(s_oam_suppressed_mask, 0, sizeof(s_oam_suppressed_mask));
     if (in_gameplay && g_snes && g_snes->ppu) {
         Ppu *ppu = g_snes->ppu;
-        static const uint8_t kSpriteSizes[8][2] = {
-            {8, 16}, {8, 32}, {8, 64}, {16, 32},
-            {16, 64}, {32, 64}, {16, 32}, {16, 32}
-        };
-        int obj_size_mode = PPU_objSize(ppu);
         int extra_margin = SoeGetWidescreenExtra();
         bool menu_mosaic = (extra_margin > 0 && IsMode4MenuMosaicActive(ppu));
         bool high_hz_active = (!s_lock_60fps && s_active_pres_hz > 65.0);
         bool allow_suppress = s_interpolate_sprites && high_hz_active && !menu_mosaic;
 
-        SoeOamSnap old_curr[128];
-        if (s_oam_initialized) {
-            memcpy(old_curr, s_oam_curr, sizeof(old_curr));
-        }
-        s_oam_sim_gen++;
-        if (s_oam_sim_gen == 0) s_oam_sim_gen = 1;
-
-        const int same_tile_max_d = SoeIsEnhancedRingMenuActive() ? 28 : 8;
-        const int rot_tile_max_d = SoeIsEnhancedRingMenuActive() ? 28 : 6;
-
-        for (int sl = 0; sl < 128; sl++) {
-            uint16_t w0 = ppu->oam[sl * 2];
-            uint16_t w1 = ppu->oam[sl * 2 + 1];
-            uint8_t hi = (uint8_t)((ppu->highOam[sl >> 2] >> ((sl & 3) * 2)) & 0x03u);
-
-            int raw_x = (int)(w0 & 0xFFu) | (((int)hi & 1) << 8);
-            if (raw_x >= 256 + (int)ppu->extraRightCur) raw_x -= 512;
-            int raw_y = (int)((w0 >> 8) & 0xFFu);
-            int sy = (raw_y >= 224) ? (raw_y - 256) : raw_y;
-            uint8_t sz = kSpriteSizes[obj_size_mode][(hi >> 1) & 1];
-
-            /* Exclude bottom HUD (sy >= 192) and offscreen/hidden slots */
+        if (!allow_suppress) {
+            s_oam_initialized = false;
+            PpuSetWsOamSuppressMask(ppu, NULL);
+        } else {
+            static const uint8_t kSpriteSizes[8][2] = {
+                {8, 16}, {8, 32}, {8, 64}, {16, 32},
+                {16, 64}, {32, 64}, {16, 32}, {16, 32}
+            };
+            int obj_size_mode = PPU_objSize(ppu);
             int left_bound = (extra_margin > 0) ? (int)ppu->extraLeftCur : 0;
             int right_bound = (extra_margin > 0) ? (int)ppu->extraRightCur : 0;
-            bool is_world_active = (sy + (int)sz > 0) && (sy < 192) &&
-                                   (raw_x + (int)sz > -left_bound) &&
-                                   (raw_x < 256 + right_bound);
 
-            SoeOamSnap cur;
-            cur.x = (int16_t)raw_x;
-            cur.y = (int16_t)sy;
-            cur.w0 = w0;
-            cur.w1 = w1;
-            cur.size = sz;
-            cur.active = is_world_active;
-
-            SoeOamSnap matched = cur;
-            bool found_match = false;
-            if (s_oam_initialized && cur.active) {
-                /* Include H/V flip bits (0xC000) and palette (0x0E00) so mirrored or animated
-                 * halves never falsely match each other across OAM slot shuffles. */
-                uint16_t cur_flip_pal = (uint16_t)(cur.w1 & 0xCE00u);
-                uint16_t cur_identity = (uint16_t)(cur.w1 & 0xCFFFu);
-                if (old_curr[sl].active && old_curr[sl].size == cur.size) {
-                    int adx = abs((int)cur.x - (int)old_curr[sl].x);
-                    int ady = abs((int)cur.y - (int)old_curr[sl].y);
-                    if (adx <= 4 && ady <= 4 &&
-                        (old_curr[sl].w1 & 0xCE00u) == cur_flip_pal) {
-                        matched = old_curr[sl];
-                        found_match = true;
-                    } else if (adx <= same_tile_max_d && ady <= same_tile_max_d &&
-                               (old_curr[sl].w1 & 0xCFFFu) == cur_identity) {
-                        matched = old_curr[sl];
-                        found_match = true;
-                    }
+            SoeOamSnap old_curr[128];
+            uint8_t prev_active[128];
+            int n_prev = 0;
+            bool can_match = s_oam_initialized && !cam_snapped;
+            if (can_match) {
+                memcpy(old_curr, s_oam_curr, sizeof(old_curr));
+                for (int sl = 0; sl < 128; sl++) {
+                    if (old_curr[sl].active) prev_active[n_prev++] = (uint8_t)sl;
                 }
-                /* Fallback for SNES OAM slot rotation: strict match by (size, tile+attr+flip) */
-                if (!found_match) {
-                    int best_dist = 999;
-                    for (int j = 0; j < 128; j++) {
-                        if (!old_curr[j].active || old_curr[j].size != cur.size) continue;
-                        if ((old_curr[j].w1 & 0xCFFFu) != cur_identity) continue;
-                        int adx = abs((int)cur.x - (int)old_curr[j].x);
-                        int ady = abs((int)cur.y - (int)old_curr[j].y);
-                        if (adx <= rot_tile_max_d && ady <= rot_tile_max_d && (adx + ady) < best_dist) {
-                            best_dist = adx + ady;
-                            matched = old_curr[j];
-                            found_match = true;
-                            if (best_dist == 0) break;
+            }
+
+            s_oam_sim_gen++;
+            if (s_oam_sim_gen == 0) s_oam_sim_gen = 1;
+
+            uint8_t cur_active[128];
+            int n_cur = 0;
+            for (int sl = 0; sl < 128; sl++) {
+                uint16_t w0 = ppu->oam[sl * 2];
+                uint16_t w1 = ppu->oam[sl * 2 + 1];
+                uint8_t hi = (uint8_t)((ppu->highOam[sl >> 2] >> ((sl & 3) * 2)) & 0x03u);
+
+                int raw_x = SoeDecodeOamX(ppu, sl, w0, hi);
+                int raw_y = (int)((w0 >> 8) & 0xFFu);
+                int sy = (raw_y >= 224) ? (raw_y - 256) : raw_y;
+                uint8_t sz = kSpriteSizes[obj_size_mode][(hi >> 1) & 1];
+
+                /* Exclude bottom HUD (sy >= 192), offscreen/hidden slots, and PPU left-hint clipped slots */
+                bool left_allowed = true;
+                if (ppu->wsOamLeftHintStrict && raw_x < 0 && raw_x + (int)sz <= 0 &&
+                    raw_x + (int)sz > -left_bound) {
+                    left_allowed = ((ppu->wsOamLeftHint[sl >> 3] & (1u << (sl & 7))) != 0) ||
+                                   (ppu->wsOamMotionGraceOn && ppu->wsOamMotionGrace[sl] != 0);
+                }
+                bool is_world_active = left_allowed &&
+                                       (sy + (int)sz > 0) && (sy < 192) &&
+                                       (raw_x + (int)sz > -left_bound) &&
+                                       (raw_x < 256 + right_bound);
+
+                SoeOamSnap cur;
+                cur.x = (int16_t)raw_x;
+                cur.y = (int16_t)sy;
+                cur.w0 = w0;
+                cur.w1 = w1;
+                cur.size = sz;
+                cur.active = is_world_active;
+
+                s_oam_curr[sl] = cur;
+                s_oam_prev[sl] = cur;
+                s_oam_prev[sl].active = false; /* Unmatched sprites lock to BG subpixel scroll */
+
+                if (is_world_active) {
+                    cur_active[n_cur++] = (uint8_t)sl;
+                    s_oam_suppressed_mask[sl >> 3] |= (uint8_t)(1u << (sl & 7));
+                }
+            }
+
+            /* Two-pass 1-to-1 world-space correspondence matching:
+             * Pass 1 matches identical (size, tile+palette+flip) sprites globally by minimum
+             * world-space displacement, preventing multi-segment chains (same tile) from
+             * cross-matching across OAM slot shuffles.
+             * Pass 2 matches remaining animated sprites (same size, palette+flip, tile changed)
+             * within a tight 4 px world-space radius so animation + slot shuffle stay smooth. */
+            if (can_match && n_cur > 0 && n_prev > 0) {
+                int cam_dx = (int)s_cam_x_curr - (int)s_cam_x_prev;
+                int cam_dy = (int)s_cam_y_curr - (int)s_cam_y_prev;
+                int fl_curr = (int)s_frame_left_curr;
+                int fl_prev = (int)s_frame_left_prev;
+
+                bool ring_anim = SoeIsEnhancedRingMenuActive() && s_ring_open_active;
+                const int pass1_max_w = ring_anim ? 26 : 6;
+                const int pass1_max_s = ring_anim ? 28 : 8;
+                const int pass2_max_w = 4;
+                const int pass2_max_s = 6;
+
+                bool used_cur[128];
+                bool used_prev[128];
+                memset(used_cur, 0, sizeof(used_cur));
+                memset(used_prev, 0, sizeof(used_prev));
+
+                SoeOamMatchPair cands[512];
+                int n_cands = 0;
+
+                /* Pass 1: Exact identity (size + tile + palette + H/V flip) */
+                for (int ci = 0; ci < n_cur; ci++) {
+                    int i = (int)cur_active[ci];
+                    const SoeOamSnap *c = &s_oam_curr[i];
+                    uint16_t cid = (uint16_t)(c->w1 & 0xCFFFu);
+                    int c_fb_x = (int)c->x + fl_curr;
+                    for (int pj = 0; pj < n_prev; pj++) {
+                        int j = (int)prev_active[pj];
+                        const SoeOamSnap *p = &old_curr[j];
+                        if (p->size != c->size || (p->w1 & 0xCFFFu) != cid) continue;
+                        int sdx = c_fb_x - ((int)p->x + fl_prev);
+                        int sdy = (int)c->y - (int)p->y;
+                        if (abs(sdx) > pass1_max_s || abs(sdy) > pass1_max_s) continue;
+                        int wdx = sdx + cam_dx;
+                        int wdy = sdy + cam_dy;
+                        if (abs(wdx) > pass1_max_w || abs(wdy) > pass1_max_w) continue;
+                        int cost = (wdx * wdx + wdy * wdy) * 4 + (i != j ? 1 : 0);
+                        if (n_cands < 512) {
+                            cands[n_cands].cost = cost;
+                            cands[n_cands].cur_sl = (uint8_t)i;
+                            cands[n_cands].prev_sl = (uint8_t)j;
+                            n_cands++;
                         }
                     }
                 }
-            }
-            s_oam_prev[sl] = matched;
-            s_oam_curr[sl] = cur;
+                SoeSortOamMatchPairs(cands, n_cands);
+                for (int k = 0; k < n_cands; k++) {
+                    int i = (int)cands[k].cur_sl;
+                    int j = (int)cands[k].prev_sl;
+                    if (!used_cur[i] && !used_prev[j]) {
+                        used_cur[i] = true;
+                        used_prev[j] = true;
+                        s_oam_prev[i] = old_curr[j];
+                    }
+                }
 
-            if (allow_suppress && cur.active) {
-                s_oam_suppressed_mask[sl >> 3] |= (uint8_t)(1u << (sl & 7));
+                /* Pass 2: Animated tile change (size + palette + H/V flip, tight world radius) */
+                n_cands = 0;
+                for (int ci = 0; ci < n_cur; ci++) {
+                    int i = (int)cur_active[ci];
+                    if (used_cur[i]) continue;
+                    const SoeOamSnap *c = &s_oam_curr[i];
+                    uint16_t cfp = (uint16_t)(c->w1 & 0xCE00u);
+                    int c_fb_x = (int)c->x + fl_curr;
+                    for (int pj = 0; pj < n_prev; pj++) {
+                        int j = (int)prev_active[pj];
+                        if (used_prev[j]) continue;
+                        const SoeOamSnap *p = &old_curr[j];
+                        if (p->size != c->size || (p->w1 & 0xCE00u) != cfp) continue;
+                        int sdx = c_fb_x - ((int)p->x + fl_prev);
+                        int sdy = (int)c->y - (int)p->y;
+                        if (abs(sdx) > pass2_max_s || abs(sdy) > pass2_max_s) continue;
+                        int wdx = sdx + cam_dx;
+                        int wdy = sdy + cam_dy;
+                        if (abs(wdx) > pass2_max_w || abs(wdy) > pass2_max_w) continue;
+                        int dist2 = wdx * wdx + wdy * wdy;
+                        if (dist2 > 18) continue;
+                        int cost = dist2 * 4 + (i != j ? 1 : 0);
+                        if (n_cands < 512) {
+                            cands[n_cands].cost = cost;
+                            cands[n_cands].cur_sl = (uint8_t)i;
+                            cands[n_cands].prev_sl = (uint8_t)j;
+                            n_cands++;
+                        }
+                    }
+                }
+                SoeSortOamMatchPairs(cands, n_cands);
+                for (int k = 0; k < n_cands; k++) {
+                    int i = (int)cands[k].cur_sl;
+                    int j = (int)cands[k].prev_sl;
+                    if (!used_cur[i] && !used_prev[j]) {
+                        used_cur[i] = true;
+                        used_prev[j] = true;
+                        s_oam_prev[i] = old_curr[j];
+                    }
+                }
             }
+
+            s_oam_initialized = true;
+            PpuSetWsOamSuppressMask(ppu, s_oam_suppressed_mask);
         }
-        s_oam_initialized = true;
-        PpuSetWsOamSuppressMask(ppu, allow_suppress ? s_oam_suppressed_mask : NULL);
     } else {
         s_oam_initialized = false;
         if (g_snes && g_snes->ppu) {
@@ -10561,7 +11064,7 @@ void SoeBeginSimFrame(unsigned number)
     uint16_t v_addr = (cam_v_layer == 1) ? 0x0114u : 0x0110u;
     int16_t hscroll_cam = (int16_t)(uint16_t)(g_ram[h_addr] | (g_ram[h_addr + 1u] << 8));
     int16_t vscroll_cam = (int16_t)(uint16_t)(g_ram[v_addr] | (g_ram[v_addr + 1u] << 8));
-    SoeComputeAnchoredWidescreenMargins(extra, hscroll_cam, vscroll_cam, &left_space, &right_space);
+    SoeComputeAnchoredWidescreenMargins(extra, hscroll_cam, vscroll_cam, &left_space, &right_space, false);
 
     s_cur_left_space = left_space;
     s_cur_right_space = right_space;
@@ -10657,7 +11160,15 @@ double SoePresentationHz(double display_refresh)
     /* Match SNES_HOST_NTSC_HZ (60.098811862) exactly whenever locked to 60 FPS OR running
      * on a ~60 Hz display so alpha stays 1.0 (1:1 lockstep with zero drift/blur/judder). */
     const double kNtscSimHz = 60.098811862;
-    if (s_lock_60fps || display_refresh <= 65.0) {
+    if (s_lock_60fps) {
+        s_active_pres_hz = kNtscSimHz;
+        return kNtscSimHz;
+    }
+    if (display_refresh <= 0.0) {
+        /* Probe call from PresentationDecoupled(): never clobber s_active_pres_hz */
+        return (s_active_pres_hz > kNtscSimHz) ? s_active_pres_hz : kNtscSimHz;
+    }
+    if (display_refresh <= 65.0) {
         s_active_pres_hz = kNtscSimHz;
         return kNtscSimHz;
     }
@@ -10829,6 +11340,11 @@ static void RenderInterpolatedSprites(uint32_t *pixels, int stride, int frame_w,
                                       int extra, double alpha)
 {
     if (!pixels || !g_snes || !g_snes->ppu || !s_oam_initialized) return;
+    uint64_t mask_lo = 0, mask_hi = 0;
+    memcpy(&mask_lo, s_oam_suppressed_mask, 8);
+    memcpy(&mask_hi, s_oam_suppressed_mask + 8, 8);
+    if ((mask_lo | mask_hi) == 0u) return;
+
     const Ppu *ppu = g_snes->ppu;
     if (PPU_forcedBlank(ppu)) return;
     int world_h = frame_h;
@@ -10850,6 +11366,7 @@ static void RenderInterpolatedSprites(uint32_t *pixels, int stride, int frame_w,
     bool in_gameplay = ((g_ram[0x0B29] & 0x03) == 0x03);
     bool cam_shifted = (in_gameplay && !s_lock_60fps && alpha >= 0.0 && alpha < 1.0 && s_cam_initialized);
     bool can_interp = s_interpolate_sprites && !s_lock_60fps && alpha >= 0.0 && alpha < 1.0;
+    bool ring_anim = SoeIsEnhancedRingMenuActive() && s_ring_open_active;
 
     /* Match ApplySubpixelCameraScroll's BG shift so OAM sprites remain locked
      * to the subpixel camera grid even when scrolling horizontally/vertically. */
@@ -10872,6 +11389,14 @@ static void RenderInterpolatedSprites(uint32_t *pixels, int stride, int frame_w,
         }
     }
 
+    int z_bias_x = (int)lrint(-bg_cam_shift_x);
+    int z_bias_y = (int)lrint(-bg_cam_shift_y);
+    int z_w = (frame_w <= kPpuMaxFrameWidth) ? frame_w : kPpuMaxFrameWidth;
+    /* Use s_frame_left_curr captured at SoeCapturePostSimState() rather than live
+     * ppu->extraFrameLeft, because host_main resets ppu->extraFrameLeft to the symmetric
+     * budget via PpuSetExtraSpace() before the next frame begins. */
+    int frame_left = (extra > 0) ? (int)s_frame_left_curr : 0;
+
     /* Draw in reverse OAM order (127 -> 0) so lower OAM slots appear in front */
     for (int sl = 127; sl >= 0; sl--) {
         if (!(s_oam_suppressed_mask[sl >> 3] & (1u << (sl & 7)))) continue;
@@ -10880,7 +11405,6 @@ static void RenderInterpolatedSprites(uint32_t *pixels, int stride, int frame_w,
         const SoeOamSnap *prv = &s_oam_prev[sl];
         if (!cur->active) continue;
 
-        int frame_left = (extra > 0) ? (int)ppu->extraFrameLeft : 0;
         double draw_x = (double)cur->x + (double)frame_left + bg_cam_shift_x;
         double draw_y = (double)cur->y + bg_cam_shift_y;
         if (can_interp && prv->active && prv->size == cur->size) {
@@ -10888,7 +11412,7 @@ static void RenderInterpolatedSprites(uint32_t *pixels, int stride, int frame_w,
             int curr_fb_x = (int)cur->x + (int)s_frame_left_curr;
             int dx = curr_fb_x - prev_fb_x;
             int dy = (int)cur->y - (int)prv->y;
-            int max_delta = (SoeIsEnhancedRingMenuActive() && ((prv->w1 & 0xCFFFu) == (cur->w1 & 0xCFFFu))) ? 28 : 12;
+            int max_delta = (ring_anim && ((prv->w1 & 0xCFFFu) == (cur->w1 & 0xCFFFu))) ? 28 : 10;
             if (abs(dx) <= max_delta && abs(dy) <= max_delta) {
                 draw_x = (double)prev_fb_x + (double)dx * alpha + cam_res_shift_x;
                 draw_y = (double)prv->y + (double)dy * alpha + cam_res_shift_y;
@@ -10902,78 +11426,102 @@ static void RenderInterpolatedSprites(uint32_t *pixels, int stride, int frame_w,
         bool hflip = (oam1 & 0x4000u) != 0;
         bool vflip = (oam1 & 0x8000u) != 0;
 
-        /* Decode sprite texels (cached per 60 Hz sim frame & VRAM write count when Enhanced) */
-        uint32_t tex_local[64 * 64];
-        uint32_t *tex = tex_local;
-        bool need_decode = true;
-        if (SoeIsEnhancedRingMenuActive()) {
-            SoeSpriteTexCache *cache = &s_sprite_tex_cache[sl];
-            tex = cache->tex;
-            if (cache->gen == s_oam_sim_gen &&
-                cache->vram_writes == ppu->vramWriteCount &&
-                cache->w1 == oam1 &&
-                cache->obj_adr == obj_adr &&
-                cache->size == (uint8_t)sz &&
-                cache->bright == bright) {
-                need_decode = false;
-            } else {
-                cache->gen = s_oam_sim_gen;
-                cache->vram_writes = ppu->vramWriteCount;
-                cache->w1 = oam1;
-                cache->obj_adr = obj_adr;
-                cache->size = (uint8_t)sz;
-                cache->bright = bright;
-            }
-        }
-        if (need_decode) {
+        /* Decode sprite texels & tight opaque bounds (cached per 60 Hz sim frame & VRAM write count) */
+        SoeSpriteTexCache *cache = &s_sprite_tex_cache[sl];
+        uint32_t *tex = cache->tex;
+        if (cache->gen != s_oam_sim_gen ||
+            cache->vram_writes != ppu->vramWriteCount ||
+            cache->w1 != oam1 ||
+            cache->obj_adr != obj_adr ||
+            cache->size != (uint8_t)sz ||
+            cache->bright != bright) {
+            cache->gen = s_oam_sim_gen;
+            cache->vram_writes = ppu->vramWriteCount;
+            cache->w1 = oam1;
+            cache->obj_adr = obj_adr;
+            cache->size = (uint8_t)sz;
+            cache->bright = bright;
+
+            int min_r = sz, max_r = -1, min_c = sz, max_c = -1;
             for (int row = 0; row < sz; row++) {
                 int used_row = vflip ? (sz - 1 - row) : row;
+                uint32_t *tex_row = tex + row * sz;
                 for (int col = 0; col < sz; col += 8) {
                     int used_col = hflip ? (sz - 1 - col) : col;
                     int used_tile = ((((oam1 & 0xFF) >> 4) + (used_row >> 3)) << 4) |
                                     (((oam1 & 0x0F) + (used_col >> 3)) & 0x0F);
                     const uint16_t *addr = &ppu->vram[(obj_adr + used_tile * 16 + (used_row & 7)) & 0x7FFF];
                     uint32_t plane = (uint32_t)addr[0] | ((uint32_t)addr[8] << 16);
+                    if (plane == 0u) {
+                        memset(tex_row + col, 0, 8 * sizeof(uint32_t));
+                        continue;
+                    }
                     for (int px = 0; px < 8; px++) {
                         int bit = hflip ? px : (7 - px);
                         int c = (int)(((plane >> bit) & 1u) |
                                       (((plane >> (8 + bit)) & 1u) << 1) |
                                       (((plane >> (16 + bit)) & 1u) << 2) |
                                       (((plane >> (24 + bit)) & 1u) << 3));
-                        tex[row * sz + col + px] = (c == 0) ? 0u : obj_pal[pal_off + c];
+                        if (c != 0) {
+                            tex_row[col + px] = obj_pal[pal_off + c];
+                            if (row < min_r) min_r = row;
+                            if (row > max_r) max_r = row;
+                            int cc = col + px;
+                            if (cc < min_c) min_c = cc;
+                            if (cc > max_c) max_c = cc;
+                        } else {
+                            tex_row[col + px] = 0u;
+                        }
                     }
                 }
             }
+            cache->min_row = (uint8_t)min_r;
+            cache->max_row = (max_r >= 0) ? (uint8_t)max_r : 0u;
+            cache->min_col = (uint8_t)min_c;
+            cache->max_col = (max_c >= 0) ? (uint8_t)max_c : 0u;
         }
+
+        if (cache->min_row >= (uint8_t)sz) continue; /* Fully transparent sprite */
+        int min_r = (int)cache->min_row;
+        int max_r = (int)cache->max_row;
+        int min_c = (int)cache->min_col;
+        int max_c = (int)cache->max_col;
 
         int ix = (int)floor(draw_x);
         int iy = (int)floor(draw_y);
         double fx = draw_x - (double)ix;
         double fy = draw_y - (double)iy;
         uint8_t spr_prio_hi = (uint8_t)SPRITE_PRIO_TO_PRIO_HI((oam1 >> 12) & 3u);
-        int z_w = (frame_w <= kPpuMaxFrameWidth) ? frame_w : kPpuMaxFrameWidth;
-        int z_bias = 0;
 
         if (fabs(fx) < 0.001 && fabs(fy) < 0.001) {
             /* Exact integer alignment: crisp 1:1 copy */
-            for (int row = 0; row < sz; row++) {
+            for (int row = min_r; row <= max_r; row++) {
                 int dy = iy + row;
                 if (dy < 0 || dy >= world_h) continue;
                 uint32_t *dst_row = pixels + dy * stride;
-                const uint8_t *zrow = (dy < 240) ? ppu->wsMainPrioHi[dy] : NULL;
-                for (int col = 0; col < sz; col++) {
+                int zy = dy;
+                int zx_off = 0;
+                if (dy < 192) {
+                    zy = dy + z_bias_y;
+                    if (zy < 0) zy = 0; else if (zy > 191) zy = 191;
+                    zx_off = z_bias_x;
+                }
+                const uint8_t *zrow = (zy < 240) ? ppu->wsMainPrioHi[zy] : NULL;
+                const uint32_t *tex_row = tex + row * sz;
+                for (int col = min_c; col <= max_c; col++) {
+                    uint32_t p = tex_row[col];
+                    if (p == 0u) continue;
                     int dx = ix + col;
                     if (dx < 0 || dx >= frame_w) continue;
-                    int zx = dx + z_bias;
+                    int zx = dx + zx_off;
                     if (zrow && zx >= 0 && zx < z_w && zrow[zx] > spr_prio_hi) continue;
-                    uint32_t p = tex[row * sz + col];
-                    if (p != 0u) dst_row[dx] = p;
+                    dst_row[dx] = p;
                 }
             }
         } else {
-            /* Subpixel bilinear coverage compositing */
-            int frac_x = (int)(fx * 256.0);
-            int frac_y = (int)(fy * 256.0);
+            /* Subpixel bilinear coverage compositing (division-free premultiplied blend) */
+            int frac_x = (int)(fx * 256.0 + 0.5);
+            int frac_y = (int)(fy * 256.0 + 0.5);
             if (frac_x < 0) frac_x = 0; else if (frac_x > 256) frac_x = 256;
             if (frac_y < 0) frac_y = 0; else if (frac_y > 256) frac_y = 256;
             /* Sample at (ox - draw_x) = (ox - ix) - fx, so weights are (1-fx, fx) for (tx-1, tx) */
@@ -10982,55 +11530,76 @@ static void RenderInterpolatedSprites(uint32_t *pixels, int stride, int frame_w,
             int w01 = frac_x * (256 - frac_y);
             int w11 = (256 - frac_x) * (256 - frac_y);
 
-            for (int oy = 0; oy <= sz; oy++) {
+            int oy_end = max_r + 1;
+            int ox_end = max_c + 1;
+            for (int oy = min_r; oy <= oy_end; oy++) {
                 int dy = iy + oy;
                 if (dy < 0 || dy >= world_h) continue;
                 uint32_t *dst_row = pixels + dy * stride;
-                const uint8_t *zrow = (dy < 240) ? ppu->wsMainPrioHi[dy] : NULL;
+                int zy = dy;
+                int zx_off = 0;
+                if (dy < 192) {
+                    zy = dy + z_bias_y;
+                    if (zy < 0) zy = 0; else if (zy > 191) zy = 191;
+                    zx_off = z_bias_x;
+                }
+                const uint8_t *zrow = (zy < 240) ? ppu->wsMainPrioHi[zy] : NULL;
                 int sy0 = oy - 1;
                 int sy1 = oy;
-                for (int ox = 0; ox <= sz; ox++) {
+                const uint32_t *trow0 = (sy0 >= 0 && sy0 < sz) ? (tex + sy0 * sz) : NULL;
+                const uint32_t *trow1 = (sy1 >= 0 && sy1 < sz) ? (tex + sy1 * sz) : NULL;
+                for (int ox = min_c; ox <= ox_end; ox++) {
                     int dx = ix + ox;
                     if (dx < 0 || dx >= frame_w) continue;
-                    int zx = dx + z_bias;
-                    if (zrow && zx >= 0 && zx < z_w && zrow[zx] > spr_prio_hi) continue;
                     int sx0 = ox - 1;
                     int sx1 = ox;
 
-                    uint32_t p00 = (sx0 >= 0 && sx0 < sz && sy0 >= 0 && sy0 < sz) ? tex[sy0 * sz + sx0] : 0u;
-                    uint32_t p10 = (sx1 >= 0 && sx1 < sz && sy0 >= 0 && sy0 < sz) ? tex[sy0 * sz + sx1] : 0u;
-                    uint32_t p01 = (sx0 >= 0 && sx0 < sz && sy1 >= 0 && sy1 < sz) ? tex[sy1 * sz + sx0] : 0u;
-                    uint32_t p11 = (sx1 >= 0 && sx1 < sz && sy1 >= 0 && sy1 < sz) ? tex[sy1 * sz + sx1] : 0u;
+                    uint32_t p00 = (trow0 && sx0 >= 0 && sx0 < sz) ? trow0[sx0] : 0u;
+                    uint32_t p10 = (trow0 && sx1 >= 0 && sx1 < sz) ? trow0[sx1] : 0u;
+                    uint32_t p01 = (trow1 && sx0 >= 0 && sx0 < sz) ? trow1[sx0] : 0u;
+                    uint32_t p11 = (trow1 && sx1 >= 0 && sx1 < sz) ? trow1[sx1] : 0u;
 
-                    int cov = ((p00 ? w00 : 0) + (p10 ? w10 : 0) + (p01 ? w01 : 0) + (p11 ? w11 : 0));
-                    if (cov <= 0) continue;
+                    if ((p00 | p10 | p01 | p11) == 0u) continue;
+                    int zx = dx + zx_off;
+                    if (zrow && zx >= 0 && zx < z_w && zrow[zx] > spr_prio_hi) continue;
+
+                    int cov = 0, sr = 0, sg = 0, sb = 0;
+                    if (p00) {
+                        cov += w00;
+                        sr += (int)((p00 >> 16) & 0xFFu) * w00;
+                        sg += (int)((p00 >> 8) & 0xFFu) * w00;
+                        sb += (int)(p00 & 0xFFu) * w00;
+                    }
+                    if (p10) {
+                        cov += w10;
+                        sr += (int)((p10 >> 16) & 0xFFu) * w10;
+                        sg += (int)((p10 >> 8) & 0xFFu) * w10;
+                        sb += (int)(p10 & 0xFFu) * w10;
+                    }
+                    if (p01) {
+                        cov += w01;
+                        sr += (int)((p01 >> 16) & 0xFFu) * w01;
+                        sg += (int)((p01 >> 8) & 0xFFu) * w01;
+                        sb += (int)(p01 & 0xFFu) * w01;
+                    }
+                    if (p11) {
+                        cov += w11;
+                        sr += (int)((p11 >> 16) & 0xFFu) * w11;
+                        sg += (int)((p11 >> 8) & 0xFFu) * w11;
+                        sb += (int)(p11 & 0xFFu) * w11;
+                    }
 
                     if (cov >= 65536) {
-                        int r = (((p00 >> 16) & 0xFF) * w00 + ((p10 >> 16) & 0xFF) * w10 +
-                                 ((p01 >> 16) & 0xFF) * w01 + ((p11 >> 16) & 0xFF) * w11) >> 16;
-                        int g = (((p00 >> 8) & 0xFF) * w00 + ((p10 >> 8) & 0xFF) * w10 +
-                                 ((p01 >> 8) & 0xFF) * w01 + ((p11 >> 8) & 0xFF) * w11) >> 16;
-                        int b = ((p00 & 0xFF) * w00 + (p10 & 0xFF) * w10 +
-                                 (p01 & 0xFF) * w01 + (p11 & 0xFF) * w11) >> 16;
+                        int r = (sr + 32768) >> 16;
+                        int g = (sg + 32768) >> 16;
+                        int b = (sb + 32768) >> 16;
                         dst_row[dx] = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
-                    } else {
+                    } else if (cov > 0) {
                         uint32_t bg = dst_row[dx];
                         int inv = 65536 - cov;
-                        int fr = ((p00 ? ((p00 >> 16) & 0xFF) * w00 : 0) +
-                                  (p10 ? ((p10 >> 16) & 0xFF) * w10 : 0) +
-                                  (p01 ? ((p01 >> 16) & 0xFF) * w01 : 0) +
-                                  (p11 ? ((p11 >> 16) & 0xFF) * w11 : 0)) / cov;
-                        int fg = ((p00 ? ((p00 >> 8) & 0xFF) * w00 : 0) +
-                                  (p10 ? ((p10 >> 8) & 0xFF) * w10 : 0) +
-                                  (p01 ? ((p01 >> 8) & 0xFF) * w01 : 0) +
-                                  (p11 ? ((p11 >> 8) & 0xFF) * w11 : 0)) / cov;
-                        int fb = ((p00 ? (p00 & 0xFF) * w00 : 0) +
-                                  (p10 ? (p10 & 0xFF) * w10 : 0) +
-                                  (p01 ? (p01 & 0xFF) * w01 : 0) +
-                                  (p11 ? (p11 & 0xFF) * w11 : 0)) / cov;
-                        int r = (fr * cov + (int)((bg >> 16) & 0xFF) * inv) >> 16;
-                        int g = (fg * cov + (int)((bg >> 8) & 0xFF) * inv) >> 16;
-                        int b = (fb * cov + (int)(bg & 0xFF) * inv) >> 16;
+                        int r = (sr + (int)((bg >> 16) & 0xFFu) * inv + 32768) >> 16;
+                        int g = (sg + (int)((bg >> 8) & 0xFFu) * inv + 32768) >> 16;
+                        int b = (sb + (int)(bg & 0xFFu) * inv + 32768) >> 16;
                         dst_row[dx] = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
                     }
                 }
@@ -11318,6 +11887,9 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
             const int g_view_top = s_menu_full_font ? 47 : 46;
             const int g_view_bot = 183;
             const int g_rh = GetGameTabRowHeight();
+            SoeScrollbarMetrics g_sb;
+            GetGameTabScrollbarMetrics(drawer_x, drawer_w, &g_sb);
+            int g_list_w = (g_sb.max_scroll > 0) ? (content_w - 6) : content_w;
 
             static const char *const kGameSectionTitles[4] = {
                 "SAVE STATE", "LOAD STATE", "GAME SETTINGS", "MENU SETTINGS"
@@ -11329,7 +11901,7 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                 int htw = MeasureSmallText(ht);
                 DrawSmallText(pixels, stride, frame_h, content_x + 2, hy, ht, tc.subtext_col);
                 int line_x = content_x + 2 + htw + 6;
-                int line_w = (content_x + content_w - 4) - line_x;
+                int line_w = (content_x + g_list_w - 4) - line_x;
                 if (line_w > 0) {
                     DrawSemiTransparentRect(pixels, stride, frame_h,
                                             line_x, hy + (s_menu_full_font ? 4 : 3), line_w, 1,
@@ -11349,7 +11921,7 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                 int text_y = s_menu_full_font ? (row_y + 1) : row_y;
                 if (is_sel) {
                     DrawThemedHighlightRect(pixels, stride, frame_h,
-                                            content_x, box_y, content_w, box_h, &tc, true);
+                                            content_x, box_y, g_list_w, box_h, &tc, true);
                     DrawSmallText(pixels, stride, frame_h, content_x + 3, text_y, ">", 0xFFFFFFFF);
                 }
 
@@ -11408,14 +11980,14 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
 
                 if (i == GAME_OPT_RESET_ALL) {
                     int tw = MeasureSmallText(label_buf);
-                    int cx = content_x + (content_w - tw) / 2;
+                    int cx = content_x + (g_list_w - tw) / 2;
                     DrawSmallText(pixels, stride, frame_h, cx, text_y, label_buf,
                                   is_sel ? 0xFFFFB454u : 0xFFE89838u);
                 } else {
                     DrawSmallText(pixels, stride, frame_h, content_x + 10, text_y, label_buf, is_sel ? tc.sel_text_col : 0xFFFFFFFF);
                     if (val_buf[0]) {
                         int vw = MeasureSmallText(val_buf);
-                        DrawSmallText(pixels, stride, frame_h, content_x + content_w - vw - 8, text_y, val_buf,
+                        DrawSmallText(pixels, stride, frame_h, content_x + g_list_w - vw - 8, text_y, val_buf,
                                       is_sel ? 0xFFFFFFFF : tc.subtext_col);
                     }
                 }
@@ -11460,20 +12032,9 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
 #endif
             }
 
-            /* Scroll indicators when Game tab extends beyond viewport */
-            {
-#ifdef __ANDROID__
-                int g_last_y = GetGameTabRowY(GAME_OPT_EXIT_TO_DESKTOP) + g_rh;
-#else
-                int g_last_y = GetGameTabRowY(GAME_OPT_EXIT_TO_LAUNCHER) + g_rh;
-#endif
-                if (s_game_scroll_y > 0) {
-                    DrawSmallText(pixels, stride, frame_h, content_x + content_w - 6, g_view_top, "^", tc.sel_text_col);
-                }
-                if (g_last_y - s_game_scroll_y > g_view_bot) {
-                    DrawSmallText(pixels, stride, frame_h, content_x + content_w - 6, g_view_bot - (s_menu_full_font ? 10 : 8), "v", tc.sel_text_col);
-                }
-            }
+            /* Consistent themed scrollbar when Game tab extends beyond viewport */
+            DrawThemedScrollbar(pixels, stride, frame_h, &g_sb, &tc,
+                                s_sb_dragging && s_sb_drag_tab == TAB_GAME_OPTIONS);
 
             /* Live dynamic description of highlighted option */
             static const char *const kGameDescs[GAME_OPT_COUNT] = {
@@ -11579,12 +12140,19 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
         else if (s_active_tab == TAB_VIDEO_OPTIONS) {
             /* Tab 1: A/V Options (scrollable window) */
             int av_vis = GetAvVisibleRows();
-            if (sel_row < s_av_scroll) s_av_scroll = sel_row;
-            if (sel_row >= s_av_scroll + av_vis) s_av_scroll = sel_row - av_vis + 1;
+            if (sel_row != s_av_last_sel_row) {
+                s_av_last_sel_row = sel_row;
+                if (sel_row < s_av_scroll) s_av_scroll = sel_row;
+                if (sel_row >= s_av_scroll + av_vis) s_av_scroll = sel_row - av_vis + 1;
+            }
             int max_av_scroll = VIDEO_OPT_COUNT - av_vis;
             if (max_av_scroll < 0) max_av_scroll = 0;
             if (s_av_scroll < 0) s_av_scroll = 0;
             if (s_av_scroll > max_av_scroll) s_av_scroll = max_av_scroll;
+
+            SoeScrollbarMetrics v_sb;
+            GetVideoTabScrollbarMetrics(drawer_x, drawer_w, &v_sb);
+            int v_list_w = (v_sb.max_scroll > 0) ? (content_w - 6) : content_w;
 
             for (int r = 0; r < av_vis; r++) {
                 int i = s_av_scroll + r;
@@ -11597,7 +12165,7 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
 
                 if (is_sel) {
                     DrawThemedHighlightRect(pixels, stride, frame_h,
-                                            content_x, box_y, content_w, box_h, &tc, true);
+                                            content_x, box_y, v_list_w, box_h, &tc, true);
                     DrawSmallText(pixels, stride, frame_h, content_x + 2, text_y, ">", 0xFFFFFFFF);
                 }
 
@@ -11623,11 +12191,6 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                     snprintf(label_buf, sizeof(label_buf), "Per-Map Pillarbox Clamping");
                     snprintf(val_buf, sizeof(val_buf), "%s",
                              s_original_mode ? "All 4:3 (Orig)" : (s_pillarbox_enabled ? "Enabled" : "Disabled"));
-                    break;
-                case VIDEO_OPT_SOLID_DIALOG:
-                    snprintf(label_buf, sizeof(label_buf), "Dialog Box Theme");
-                    snprintf(val_buf, sizeof(val_buf), "%s",
-                             s_original_mode ? "Original (Orig)" : kDialogThemeNames[s_dialog_theme]);
                     break;
                 case VIDEO_OPT_ASPECT_RATIO:
                     snprintf(label_buf, sizeof(label_buf), "Display Aspect Mode");
@@ -11685,40 +12248,28 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
 
                 if (i == VIDEO_OPT_RESET) {
                     int tw = MeasureSmallText(label_buf);
-                    int cx = content_x + (content_w - tw) / 2;
+                    int cx = content_x + (v_list_w - tw) / 2;
                     DrawSmallText(pixels, stride, frame_h, cx, text_y, label_buf,
                                   is_sel ? 0xFFFFB454u : 0xFFE89838u);
                 } else {
                     DrawSmallText(pixels, stride, frame_h, content_x + 10, text_y, label_buf, is_sel ? tc.sel_text_col : 0xFFFFFFFF);
                     if (val_buf[0]) {
                         int vw = MeasureSmallText(val_buf);
-                        DrawSmallText(pixels, stride, frame_h, content_x + content_w - vw - 8, text_y, val_buf,
+                        DrawSmallText(pixels, stride, frame_h, content_x + v_list_w - vw - 8, text_y, val_buf,
                                       is_sel ? 0xFFFFFFFF : tc.subtext_col);
                     }
                 }
             }
 
-            if (s_av_scroll > 0) {
-                int ax = content_x + content_w - 6;
-                int ay = start_y + 2;
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax + 2, ay,     1, 1, 255, 255, 144, 240);
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax + 1, ay + 1, 3, 1, 255, 255, 144, 240);
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax,     ay + 2, 5, 1, 255, 255, 144, 240);
-            }
-            if (s_av_scroll + av_vis < VIDEO_OPT_COUNT) {
-                int ax = content_x + content_w - 6;
-                int ay = start_y + (av_vis - 1) * row_h + 2;
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax,     ay,     5, 1, 255, 255, 144, 240);
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax + 1, ay + 1, 3, 1, 255, 255, 144, 240);
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax + 2, ay + 2, 1, 1, 255, 255, 144, 240);
-            }
+            /* Consistent themed scrollbar for Video options */
+            DrawThemedScrollbar(pixels, stride, frame_h, &v_sb, &tc,
+                                s_sb_dragging && s_sb_drag_tab == TAB_VIDEO_OPTIONS);
 
             /* Live dynamic description of highlighted option */
             static const char *const kVideoDescs[VIDEO_OPT_COUNT] = {
                 "* Expands field of view to 16:9 or 21:9 ultrawide.",
                 "* Aligns HUD meters to left margin or 4:3 center.",
                 "* Clamps pillarbox on maps with edge distortion.",
-                "* Renders dialogue boxes as solid glass blue or dither.",
                 "* Switches between 4:3 CRT TV, 8:7 square & 1:1.",
                 "* Adjusts native window scale multiplier or fullscreen.",
                 "* Syncs presentation to display refresh (Off/On/Adaptive).",
@@ -12527,19 +13078,12 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                 DrawSmallText(pixels, stride, frame_h, jb_x + 20, row_y, song_buf, col);
             }
 
-            if (s_jukebox_scroll > 0) {
-                int ax = jb_x + jb_w - 14;
-                int ay = jb_start_y + 2;
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax + 2, ay,     1, 1, 255, 255, 144, 240);
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax + 1, ay + 1, 3, 1, 255, 255, 144, 240);
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax,     ay + 2, 5, 1, 255, 255, 144, 240);
-            }
-            if (s_jukebox_scroll + kJukeboxVisibleRows < s_jukebox_song_count) {
-                int ax = jb_x + jb_w - 14;
-                int ay = jb_start_y + (kJukeboxVisibleRows - 1) * jb_row_h + 2;
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax,     ay,     5, 1, 255, 255, 144, 240);
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax + 1, ay + 1, 3, 1, 255, 255, 144, 240);
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax + 2, ay + 2, 1, 1, 255, 255, 144, 240);
+            {
+                SoeScrollbarMetrics jb_sb;
+                ComputeScrollbarMetrics(jb_x + jb_w - 16, jb_start_y - 1, 7,
+                                        kJukeboxVisibleRows * jb_row_h + 1,
+                                        s_jukebox_scroll, kJukeboxVisibleRows, s_jukebox_song_count, &jb_sb);
+                DrawThemedScrollbar(pixels, stride, frame_h, &jb_sb, &jb_tc, false);
             }
 
             DrawSemiTransparentRect(pixels, stride, frame_h,
@@ -12619,19 +13163,12 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                 DrawSmallText(pixels, stride, frame_h, kt_x + 20, row_y, row_buf, col);
             }
 
-            if (s_key_trade_scroll > 0) {
-                int ax = kt_x + kt_w - 14;
-                int ay = kt_start_y + 2;
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax + 2, ay,     1, 1, 255, 255, 144, 240);
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax + 1, ay + 1, 3, 1, 255, 255, 144, 240);
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax,     ay + 2, 5, 1, 255, 255, 144, 240);
-            }
-            if (s_key_trade_scroll + kKeyTradeVisibleRows < kKeyTradeItemCount) {
-                int ax = kt_x + kt_w - 14;
-                int ay = kt_start_y + (kKeyTradeVisibleRows - 1) * kt_row_h + 2;
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax,     ay,     5, 1, 255, 255, 144, 240);
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax + 1, ay + 1, 3, 1, 255, 255, 144, 240);
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax + 2, ay + 2, 1, 1, 255, 255, 144, 240);
+            {
+                SoeScrollbarMetrics kt_sb;
+                ComputeScrollbarMetrics(kt_x + kt_w - 16, kt_start_y - 1, 7,
+                                        kKeyTradeVisibleRows * kt_row_h + 1,
+                                        s_key_trade_scroll, kKeyTradeVisibleRows, kKeyTradeItemCount, &kt_sb);
+                DrawThemedScrollbar(pixels, stride, frame_h, &kt_sb, &kt_tc, false);
             }
 
             DrawSemiTransparentRect(pixels, stride, frame_h,
@@ -12729,19 +13266,12 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
                 DrawSmallText(pixels, stride, frame_h, wp_x + 20, row_y, row_buf, col);
             }
 
-            if (s_warp_scroll > 0) {
-                int ax = wp_x + wp_w - 14;
-                int ay = wp_start_y + 2;
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax + 2, ay,     1, 1, 255, 255, 144, 240);
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax + 1, ay + 1, 3, 1, 255, 255, 144, 240);
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax,     ay + 2, 5, 1, 255, 255, 144, 240);
-            }
-            if (s_warp_scroll + kWarpVisibleRows < s_warp_location_count) {
-                int ax = wp_x + wp_w - 14;
-                int ay = wp_start_y + (kWarpVisibleRows - 1) * wp_row_h + 2;
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax,     ay,     5, 1, 255, 255, 144, 240);
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax + 1, ay + 1, 3, 1, 255, 255, 144, 240);
-                DrawSemiTransparentRect(pixels, stride, frame_h, ax + 2, ay + 2, 1, 1, 255, 255, 144, 240);
+            {
+                SoeScrollbarMetrics wp_sb;
+                ComputeScrollbarMetrics(wp_x + wp_w - 16, wp_start_y - 1, 7,
+                                        kWarpVisibleRows * wp_row_h + 1,
+                                        s_warp_scroll, kWarpVisibleRows, s_warp_location_count, &wp_sb);
+                DrawThemedScrollbar(pixels, stride, frame_h, &wp_sb, &wp_tc, false);
             }
 
             DrawSemiTransparentRect(pixels, stride, frame_h,

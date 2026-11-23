@@ -8,6 +8,19 @@ A native PC static recompilation port of **Secret of Evermore** (SNES, USA), bui
 
 ## What's New
 
+### v0.9.14
+- **What's Fixed — Subpixel Sprite Interpolation Glitching & Horizontal Teleporting:**
+  - **Fixed Widescreen Edge Sprite Teleporting (+81 px / −81 px):** Fixed `RenderInterpolatedSprites()` reading the live `ppu->extraFrameLeft` (which `host_main` resets to the symmetric widescreen budget before the next frame begins) on `alpha == 1.0` presentations and unmatched/newly-spawned sprites. It now always uses the captured `s_frame_left_curr` from `SoeCapturePostSimState()`, eliminating the violent horizontal jumping to/from the right (or left) near view-anchored map edges. Also resets interpolation state cleanly on save-state load (`SoeLoadStateSlot()`).
+  - **Two-Pass 1-to-1 World-Space OAM Correspondence Matching:** Replaced greedy per-slot matching (and stopped applying the 28 px Enhanced Ring Menu opening radius during normal gameplay) with a global 1-to-1 minimum world-space distance matcher across camera scroll and `extraFrameLeft` deltas. Pass 1 matches identical `(size, tile + palette + flip)` sprites globally so multi-segment enemies sharing tiles (such as Bugmuck vines/tentacles) never cross-match or snap across OAM slot shuffles; Pass 2 tracks animated tile changes 1-to-1 within a tight 4 px world radius; newly spawned sprites lock cleanly to the subpixel background.
+  - **Fixed High-Hz Presentation Rate Clobbering:** `SoePresentationHz()` no longer overwrites `s_active_pres_hz` to 60.1 Hz when probed with `display_refresh <= 0` by `PresentationDecoupled()`, keeping high-refresh sprite interpolation reliably active on 100 Hz+ displays.
+  - **Matching PPU Widescreen OAM X-Decoding:** Added `SoeDecodeOamX()` + left-hint visibility checks matching `PpuDecodeOamX()` so margin sprites never wrap by 512 px.
+- **Enhanced & Optimized Subpixel Sprite Renderer (Off by Default):**
+  - Unconditionally enabled the per-frame `s_sprite_tex_cache` with tight opaque bounding-box tracking (`min_row..max_row`, `min_col..max_col`) and fast-skip for empty 8 px tile slivers and fully transparent sprites (removing the 16 KB per-call stack buffer).
+  - Replaced 3 integer divisions per edge pixel in bilinear sprite compositing with exact rounded premultiplied blending (`(sum + bg * inv + 32768) >> 16`), removing edge darkening and speeding up high-Hz composition.
+  - Aligned world Z-buffer (`wsMainPrioHi`) lookups with the subpixel camera shift (`z_bias_x`, `z_bias_y`) on scanlines `0..191` for crisp foreground occlusion while scrolling.
+  - **Default:** *Subpixel Sprite Interpolation* remains **Off** (`OFF (60 Hz Snap)`) by default out of the box and after resetting defaults.
+- **All Platforms Updated (`v0.9.14`):** Rebuilt and updated Linux x64, Android arm64 APK (`versionCode 914`), and Windows x64 Setup Pack releases.
+
 ### v0.9.13
 - **New `MENU SETTINGS` Section & Full-Size Native SNES Menu Font:** Added a **MENU SETTINGS** section under the **Game** tab (grouping **Menu Font** and **Dialog Box Theme**).
   - **Menu Font (`Compact (6px)` / `Full Size (8px)`):** Toggle the slide-out menu between the compact 6px HUD font (`$C4:0C82`) and Secret of Evermore's native full-size 8px in-game dialog/menu font (`$C4:0000`) with matching 1px drop shadows — saved in `Configs/video_config.json`.
