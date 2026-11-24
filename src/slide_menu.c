@@ -1781,19 +1781,23 @@ static void ApplyBloomFilter(uint8_t *dst, size_t pitch, int w, int h,
     int stride = (int)(pitch / 4);
     uint32_t *src_pixels = (uint32_t *)dst;
 
-    /* Precompute soft-knee scale LUT for luma 0..255 */
-    int32_t scale_lut[256];
-    for (int l = 0; l < 256; l++) {
-        if (l > threshold) {
-            int excess = l - threshold;
-            int num = excess * excess;
-            int den = (255 - threshold) * l;
-            if (den < 1) den = 1;
-            int scale = (num * 256) / den;
-            if (scale > 256) scale = 256;
-            scale_lut[l] = scale;
-        } else {
-            scale_lut[l] = 0;
+    /* Precompute soft-knee scale LUT for luma 0..255 (cached per threshold) */
+    static int32_t scale_lut[256];
+    static int s_scale_lut_thresh = -1;
+    if (s_scale_lut_thresh != threshold) {
+        s_scale_lut_thresh = threshold;
+        for (int l = 0; l < 256; l++) {
+            if (l > threshold) {
+                int excess = l - threshold;
+                int num = excess * excess;
+                int den = (255 - threshold) * l;
+                if (den < 1) den = 1;
+                int scale = (num * 256) / den;
+                if (scale > 256) scale = 256;
+                scale_lut[l] = scale;
+            } else {
+                scale_lut[l] = 0;
+            }
         }
     }
 
@@ -1807,10 +1811,13 @@ static void ApplyBloomFilter(uint8_t *dst, size_t pitch, int w, int h,
     }
 
     /* 1. Threshold Bright-Pass Extraction with soft-knee */
+    uint8_t row_has_bright[512];
+    bool any_bright = false;
     for (int y = 0; y < h; y++) {
         const uint32_t *src_row = src_pixels + y * stride;
         uint32_t *bright_row = s_bright_buf + y * w;
         int x = 0;
+        bool row_bright = false;
 
 #if defined(__AVX2__)
         const __m256i v_ff = _mm256_set1_epi32(0xFF);
@@ -1838,6 +1845,7 @@ static void ApplyBloomFilter(uint8_t *dst, size_t pitch, int w, int h,
                 continue;
             }
 
+            row_bright = true;
             __m256i scale = _mm256_i32gather_epi32((const int *)scale_lut, luma, 4);
             __m256i br = _mm256_srli_epi32(_mm256_mullo_epi32(r, scale), 8);
             __m256i bg = _mm256_srli_epi32(_mm256_mullo_epi32(g, scale), 8);
@@ -1868,6 +1876,7 @@ static void ApplyBloomFilter(uint8_t *dst, size_t pitch, int w, int h,
             int luma = (54 * r + 183 * g + 19 * b) >> 8;
 
             if (luma > threshold) {
+                row_bright = true;
                 int scale = scale_lut[luma];
 
                 int br = (r * scale) >> 8;
@@ -1888,12 +1897,17 @@ static void ApplyBloomFilter(uint8_t *dst, size_t pitch, int w, int h,
                 bright_row[x] = 0;
             }
         }
+        if (y < 512) row_has_bright[y] = row_bright ? 1 : 0;
+        if (row_bright) any_bright = true;
     }
+
+    if (!any_bright && blend != BLOOM_BLEND_SCREEN) return;
 
     /* 2. Horizontal Blur Pass */
     int div = 2 * radius + 1;
+    const uint32_t inv_div_16 = (uint32_t)((65536 + div - 1) / div);
 #if defined(__AVX2__)
-    const uint16_t inv_div_u16 = (uint16_t)((65536 + div - 1) / div);
+    const uint16_t inv_div_u16 = (uint16_t)inv_div_16;
     const __m256i v_inv_div = _mm256_set1_epi16((short)inv_div_u16);
     const __m256i v_zero = _mm256_setzero_si256();
 #endif
@@ -1901,6 +1915,10 @@ static void ApplyBloomFilter(uint8_t *dst, size_t pitch, int w, int h,
     for (int y = 0; y < h; y++) {
         const uint32_t *in_row = s_bright_buf + y * w;
         uint32_t *out_row = s_temp_buf + y * w;
+        if (y < 512 && !row_has_bright[y]) {
+            memset(out_row, 0, (size_t)w * sizeof(uint32_t));
+            continue;
+        }
 
 #if defined(__AVX2__)
         if (w >= 2 * radius + 8) {
@@ -1963,18 +1981,24 @@ static void ApplyBloomFilter(uint8_t *dst, size_t pitch, int w, int h,
         }
 
         for (int x = 0; x < w; x++) {
-            out_row[x] = ((uint32_t)(sum_r / div) << 16) |
-                         ((uint32_t)(sum_g / div) << 8) |
-                         (uint32_t)(sum_b / div);
+            if ((sum_r | sum_g | sum_b) == 0) {
+                out_row[x] = 0;
+            } else {
+                out_row[x] = (((uint32_t)sum_r * inv_div_16) & 0x00FF0000u) |
+                             ((((uint32_t)sum_g * inv_div_16) >> 8) & 0x0000FF00u) |
+                             (((uint32_t)sum_b * inv_div_16) >> 16);
+            }
 
             int left_idx = (x - radius < 0) ? 0 : (x - radius);
             int right_idx = (x + radius + 1 >= w) ? (w - 1) : (x + radius + 1);
             uint32_t p_left = in_row[left_idx];
             uint32_t p_right = in_row[right_idx];
 
-            sum_r += ((p_right >> 16) & 0xFF) - ((p_left >> 16) & 0xFF);
-            sum_g += ((p_right >> 8) & 0xFF) - ((p_left >> 8) & 0xFF);
-            sum_b += (p_right & 0xFF) - (p_left & 0xFF);
+            if (p_left != p_right) {
+                sum_r += (int)((p_right >> 16) & 0xFF) - (int)((p_left >> 16) & 0xFF);
+                sum_g += (int)((p_right >> 8) & 0xFF) - (int)((p_left >> 8) & 0xFF);
+                sum_b += (int)(p_right & 0xFF) - (int)(p_left & 0xFF);
+            }
         }
     }
 
@@ -1988,10 +2012,13 @@ static void ApplyBloomFilter(uint8_t *dst, size_t pitch, int w, int h,
     const uint32_t *row_ptrs[9];
 
     for (int y = 0; y < h; y++) {
+        bool span_has_bright = (h >= 512) || (blend == BLOOM_BLEND_SCREEN);
         for (int k = -radius; k <= radius; k++) {
             int cy = (y + k < 0) ? 0 : ((y + k >= h) ? (h - 1) : (y + k));
             row_ptrs[k + radius] = s_temp_buf + cy * w;
+            if (!span_has_bright && cy < 512 && row_has_bright[cy]) span_has_bright = true;
         }
+        if (!span_has_bright) continue;
         uint32_t *dst_row = src_pixels + y * stride;
         int x = 0;
 
@@ -2056,14 +2083,20 @@ static void ApplyBloomFilter(uint8_t *dst, size_t pitch, int w, int h,
             int sum_r = 0, sum_g = 0, sum_b = 0;
             for (int k = 0; k < div; k++) {
                 uint32_t p = row_ptrs[k][x];
-                sum_r += (p >> 16) & 0xFF;
-                sum_g += (p >> 8) & 0xFF;
-                sum_b += p & 0xFF;
+                if (p) {
+                    sum_r += (int)((p >> 16) & 0xFF);
+                    sum_g += (int)((p >> 8) & 0xFF);
+                    sum_b += (int)(p & 0xFF);
+                }
             }
 
-            int bl_r = (sum_r / div * intensity) >> 8;
-            int bl_g = (sum_g / div * intensity) >> 8;
-            int bl_b = (sum_b / div * intensity) >> 8;
+            if (blend != BLOOM_BLEND_SCREEN && (sum_r | sum_g | sum_b) == 0) {
+                continue;
+            }
+
+            int bl_r = (int)((((uint32_t)sum_r * inv_div_16) >> 16) * (uint32_t)intensity) >> 8;
+            int bl_g = (int)((((uint32_t)sum_g * inv_div_16) >> 16) * (uint32_t)intensity) >> 8;
+            int bl_b = (int)((((uint32_t)sum_b * inv_div_16) >> 16) * (uint32_t)intensity) >> 8;
 
             uint32_t orig = dst_row[x];
             int or = (orig >> 16) & 0xFF;
@@ -10270,8 +10303,11 @@ static void SoeApplyHudWidescreenConfig(Ppu *ppu, int left_space, int right_spac
     }
 }
 
+static uint64_t s_post_sim_gen = 0;
+
 void SoeCapturePostSimState(void)
 {
+    s_post_sim_gen++;
     bool in_gameplay = ((g_ram[0x0B29] & 0x03) == 0x03);
     int dx_cam = 0, dy_cam = 0;
     bool cam_snapped = false;
@@ -10612,6 +10648,7 @@ void SoeBeginSimFrame(unsigned number)
     static const char *s_open_debug_env = NULL;
     static const char *s_auto_warp_env = NULL;
     static const char *s_cli_export_maps_env = NULL;
+    static const char *s_cli_export_one_map_env = NULL;
     static const char *s_cli_export_music_env = NULL;
     static const char *s_cli_export_sfx_env = NULL;
     static const char *s_cli_export_spc_env = NULL;
@@ -10622,6 +10659,7 @@ void SoeBeginSimFrame(unsigned number)
         s_open_debug_env = getenv("SOE_OPEN_DEBUG_TEST");
         s_auto_warp_env = getenv("SOE_AUTO_WARP_TEST");
         s_cli_export_maps_env = getenv("SOE_EXPORT_ALL_MAPS");
+        s_cli_export_one_map_env = getenv("SOE_EXPORT_MAP");
         s_cli_export_music_env = getenv("SOE_EXPORT_ALL_MUSIC");
         s_cli_export_sfx_env = getenv("SOE_EXPORT_ALL_SFX");
         s_cli_export_spc_env = getenv("SOE_EXPORT_ALL_SPC");
@@ -10683,7 +10721,7 @@ void SoeBeginSimFrame(unsigned number)
         }
     }
 
-    const char *one_map_env = getenv("SOE_EXPORT_MAP");
+    const char *one_map_env = s_cli_export_one_map_env;
     if (one_map_env && one_map_env[0] && number == 10) {
         uint16_t m = (uint16_t)atoi(one_map_env);
         WatchdogSetEnabled(0);
@@ -11621,16 +11659,19 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
 {
     s_warp_native_ov_active = false;
 
-    /* 1. Present the PPU field */
-    RtlWidescreenPresent(dst, pitch, field, frame_w, frame_h);
-
     uint16_t current_map = GetLoadedMapId();
     bool map_pillarboxed = s_original_mode || (s_map_pillarbox[current_map & 0xFF] == 0);
     int extra = SoeGetWidescreenExtra();
     bool in_gameplay = ((g_ram[0x0B29] & 0x03) == 0x03);
+    bool menu_mosaic = (!s_original_mode && extra > 0 && g_snes && g_snes->ppu &&
+                        IsMode4MenuMosaicActive(g_snes->ppu));
 
-    /* Apply subpixel camera scroll interpolation across display presentation refreshes */
-    if (in_gameplay && !s_lock_60fps && alpha >= 0.0 && alpha < 1.0 && s_cam_initialized) {
+    /* Compute subpixel camera scroll offset up front so static repeat presents
+     * at 100 Hz+ can reuse the post-CRT/Bloom buffer without re-running filters. */
+    double shift_x = 0.0, shift_y = 0.0;
+    bool has_subpix_shift = false;
+    if (in_gameplay && !s_lock_60fps && s_active_pres_hz > 65.0 &&
+        alpha >= 0.0 && alpha <= 1.0 && s_cam_initialized) {
         int dx = (int)s_cam_x_curr - (int)s_cam_x_prev;
         int dy = (int)s_cam_y_curr - (int)s_cam_y_prev;
         if (abs(dx) <= 16 && abs(dy) <= 16) {
@@ -11638,51 +11679,141 @@ int SoeDrawFrame(uint8_t *dst, size_t pitch, const uint8_t *field,
             double px_curr = (double)s_cam_x_curr + s_cam_res_x_curr;
             double py_prev = (double)s_cam_y_prev + s_cam_res_y_prev;
             double py_curr = (double)s_cam_y_curr + s_cam_res_y_curr;
-            double shift_x = (px_prev + (px_curr - px_prev) * alpha) - (double)s_cam_x_curr;
-            double shift_y = (py_prev + (py_curr - py_prev) * alpha) - (double)s_cam_y_curr;
-            if (fabs(shift_x) >= 0.001 || fabs(shift_y) >= 0.001) {
-                ApplySubpixelCameraScroll((uint32_t *)dst, (int)(pitch / 4), frame_w, frame_h,
-                                          shift_x, shift_y);
-            }
+            shift_x = (px_prev + (px_curr - px_prev) * alpha) - (double)s_cam_x_curr;
+            shift_y = (py_prev + (py_curr - py_prev) * alpha) - (double)s_cam_y_curr;
+            has_subpix_shift = (fabs(shift_x) >= 0.001 || fabs(shift_y) >= 0.001);
         }
     }
-    RenderInterpolatedSprites((uint32_t *)dst, (int)(pitch / 4), frame_w, frame_h, extra, alpha);
-    bool menu_mosaic = (!s_original_mode && extra > 0 && g_snes && g_snes->ppu &&
-                        IsMode4MenuMosaicActive(g_snes->ppu));
+    bool has_interp_sprites = (s_interpolate_sprites && !s_lock_60fps &&
+                               s_active_pres_hz > 65.0 && s_oam_initialized);
+    bool fx_active = (s_crt_preset != CRT_PRESET_OFF) ||
+                     (s_bloom_preset != BLOOM_PRESET_OFF && s_bloom_intensity != BLOOM_INTENSITY_OFF);
+    bool wp_active = (g_snes && g_snes->ppu) ? IsWindowPrefsActive(g_snes->ppu) : false;
 
-    /* Tile Mode 4 menu screens (Save Select + Level/Stat/Act/Edit/Alchemy) across margins */
-    if (menu_mosaic) {
-        DrawMode4MenuSideMosaic(g_snes->ppu, (uint32_t *)dst, (int)(pitch / 4),
-                                frame_w, frame_h, extra);
-    }
+    /* Cache post-CRT/Bloom frame for identical repeat presents (e.g. 100 Hz+
+     * standing still, menus, dialogue, or paused drawer). */
+    static uint32_t *s_fx_cache = NULL;
+    static int s_fx_cache_cap = 0;
+    static bool s_fx_cache_valid = false;
+    static unsigned s_fx_cache_frame = 0;
+    static uint64_t s_fx_cache_gen = 0;
+    static const uint8_t *s_fx_cache_field = NULL;
+    static int s_fx_cache_w = 0, s_fx_cache_h = 0, s_fx_cache_extra = 0;
+    static uint64_t s_fx_cache_key = 0;
 
-    /* 1.5. Pure-C Programmatic Dialog Box & Window Prefs Live Preview (before CRT & Bloom filters) */
-    if (SoeGetActiveDialogTheme() != DIALOG_THEME_ORIGINAL && s_dialog_capture_active) {
-        SoeRenderProgrammaticDialogs((uint32_t *)dst, (int)(pitch / 4), frame_w, frame_h);
-    }
-    SoeRenderWindowPrefsOverlay((uint32_t *)dst, (int)(pitch / 4), frame_w, frame_h);
+    uint64_t fx_key =
+        ((uint64_t)(s_crt_preset & 0xF)) |
+        ((uint64_t)(s_crt_density & 0xF) << 4) |
+        ((uint64_t)(s_crt_opacity & 0xF) << 8) |
+        ((uint64_t)(s_crt_thickness & 0xF) << 12) |
+        ((uint64_t)(s_crt_mask & 0xF) << 16) |
+        ((uint64_t)(s_crt_bloom & 0xF) << 20) |
+        ((uint64_t)(s_crt_vignette & 0xF) << 24) |
+        ((uint64_t)(s_bloom_preset & 0xF) << 28) |
+        ((uint64_t)(s_bloom_intensity & 0xF) << 32) |
+        ((uint64_t)(s_bloom_threshold & 0xF) << 36) |
+        ((uint64_t)(s_bloom_radius & 0xF) << 40) |
+        ((uint64_t)(s_bloom_blend & 0xF) << 44) |
+        ((uint64_t)(s_bloom_tint & 0xF) << 48) |
+        ((uint64_t)(SoeGetActiveDialogTheme() & 0xF) << 52) |
+        ((uint64_t)(s_dialog_capture_active ? 1u : 0u) << 56) |
+        ((uint64_t)(menu_mosaic ? 1u : 0u) << 57) |
+        ((uint64_t)(s_original_mode ? 1u : 0u) << 58);
 
-    /* 2. CRT filter effect */
-    if (s_crt_preset != CRT_PRESET_OFF) {
-        ApplyCrtFilter(dst, pitch, frame_w, frame_h,
-                       s_crt_preset,
-                       s_crt_density,
-                       s_crt_opacity,
-                       s_crt_thickness,
-                       s_crt_mask,
-                       s_crt_bloom,
-                       s_crt_vignette);
-    }
+    bool can_use_fx_cache = fx_active && !has_subpix_shift && !has_interp_sprites && !wp_active;
+    bool fx_cache_hit = can_use_fx_cache && s_fx_cache_valid &&
+                        s_fx_cache_frame == s_frame_counter &&
+                        s_fx_cache_gen == s_post_sim_gen &&
+                        s_fx_cache_field == field &&
+                        s_fx_cache_w == frame_w && s_fx_cache_h == frame_h &&
+                        s_fx_cache_extra == extra && s_fx_cache_key == fx_key;
 
-    /* 3. General Bloom filter effect */
-    if (s_bloom_preset != BLOOM_PRESET_OFF && s_bloom_intensity != BLOOM_INTENSITY_OFF) {
-        ApplyBloomFilter(dst, pitch, frame_w, frame_h,
-                         s_bloom_preset,
-                         s_bloom_intensity,
-                         s_bloom_threshold,
-                         s_bloom_radius,
-                         s_bloom_blend,
-                         s_bloom_tint);
+    if (fx_cache_hit) {
+        int dst_stride = (int)(pitch / 4);
+        if (dst_stride == frame_w) {
+            memcpy(dst, s_fx_cache, (size_t)frame_w * (size_t)frame_h * sizeof(uint32_t));
+        } else {
+            for (int y = 0; y < frame_h; y++) {
+                memcpy((uint32_t *)dst + y * dst_stride,
+                       s_fx_cache + y * frame_w,
+                       (size_t)frame_w * sizeof(uint32_t));
+            }
+        }
+    } else {
+        /* 1. Present the PPU field */
+        RtlWidescreenPresent(dst, pitch, field, frame_w, frame_h);
+
+        if (has_subpix_shift) {
+            ApplySubpixelCameraScroll((uint32_t *)dst, (int)(pitch / 4), frame_w, frame_h,
+                                      shift_x, shift_y);
+        }
+        RenderInterpolatedSprites((uint32_t *)dst, (int)(pitch / 4), frame_w, frame_h, extra, alpha);
+
+        /* Tile Mode 4 menu screens (Save Select + Level/Stat/Act/Edit/Alchemy) across margins */
+        if (menu_mosaic) {
+            DrawMode4MenuSideMosaic(g_snes->ppu, (uint32_t *)dst, (int)(pitch / 4),
+                                    frame_w, frame_h, extra);
+        }
+
+        /* 1.5. Pure-C Programmatic Dialog Box & Window Prefs Live Preview (before CRT & Bloom filters) */
+        if (SoeGetActiveDialogTheme() != DIALOG_THEME_ORIGINAL && s_dialog_capture_active) {
+            SoeRenderProgrammaticDialogs((uint32_t *)dst, (int)(pitch / 4), frame_w, frame_h);
+        }
+        SoeRenderWindowPrefsOverlay((uint32_t *)dst, (int)(pitch / 4), frame_w, frame_h);
+
+        /* 2. CRT filter effect */
+        if (s_crt_preset != CRT_PRESET_OFF) {
+            ApplyCrtFilter(dst, pitch, frame_w, frame_h,
+                           s_crt_preset,
+                           s_crt_density,
+                           s_crt_opacity,
+                           s_crt_thickness,
+                           s_crt_mask,
+                           s_crt_bloom,
+                           s_crt_vignette);
+        }
+
+        /* 3. General Bloom filter effect */
+        if (s_bloom_preset != BLOOM_PRESET_OFF && s_bloom_intensity != BLOOM_INTENSITY_OFF) {
+            ApplyBloomFilter(dst, pitch, frame_w, frame_h,
+                             s_bloom_preset,
+                             s_bloom_intensity,
+                             s_bloom_threshold,
+                             s_bloom_radius,
+                             s_bloom_blend,
+                             s_bloom_tint);
+        }
+
+        if (can_use_fx_cache && frame_w > 0 && frame_h > 0) {
+            int needed = frame_w * frame_h;
+            if (needed > s_fx_cache_cap) {
+                free(s_fx_cache);
+                s_fx_cache = (uint32_t *)malloc((size_t)needed * sizeof(uint32_t));
+                s_fx_cache_cap = s_fx_cache ? needed : 0;
+            }
+            if (s_fx_cache) {
+                int dst_stride = (int)(pitch / 4);
+                if (dst_stride == frame_w) {
+                    memcpy(s_fx_cache, dst, (size_t)needed * sizeof(uint32_t));
+                } else {
+                    for (int y = 0; y < frame_h; y++) {
+                        memcpy(s_fx_cache + y * frame_w,
+                               (const uint32_t *)dst + y * dst_stride,
+                               (size_t)frame_w * sizeof(uint32_t));
+                    }
+                }
+                s_fx_cache_valid = true;
+                s_fx_cache_frame = s_frame_counter;
+                s_fx_cache_gen = s_post_sim_gen;
+                s_fx_cache_field = field;
+                s_fx_cache_w = frame_w;
+                s_fx_cache_h = frame_h;
+                s_fx_cache_extra = extra;
+                s_fx_cache_key = fx_key;
+            }
+        } else {
+            s_fx_cache_valid = false;
+        }
     }
 
     /* Auto-hide mouse cursor after 3 seconds of inactivity */

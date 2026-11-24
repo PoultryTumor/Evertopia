@@ -692,11 +692,15 @@ void snes_savestate_menu_note_frame(const uint32_t *fb, int w, int h)
 static void sample_thumb(const uint32_t *fb, int w, int h)
 {
     int x, y;
+    uint32_t x_step = ((uint32_t)w << 16) / (uint32_t)SSM_THUMB_W;
     for (y = 0; y < SSM_THUMB_H; y++) {
         const uint32_t *row = fb + (size_t)(y * h / SSM_THUMB_H) * (size_t)w;
         uint32_t *out = s_live_thumb + (size_t)y * SSM_THUMB_W;
-        for (x = 0; x < SSM_THUMB_W; x++)
-            out[x] = row[x * w / SSM_THUMB_W] | 0xFF000000u;
+        uint32_t x_acc = 0;
+        for (x = 0; x < SSM_THUMB_W; x++) {
+            out[x] = row[x_acc >> 16] | 0xFF000000u;
+            x_acc += x_step;
+        }
     }
     s_have_live_thumb = 1;
 }

@@ -152,6 +152,20 @@ static void capture(void) {
         fprintf(stderr, "[snes_rewind] snapshot is %zu bytes; ring is %.1f MB\n",
                 s_blob_size,
                 (double)s_blob_size * (double)s_depth / (1024.0 * 1024.0));
+        /* Pre-allocate and fault-in every ring slot once up front so the first
+         * 60 snapshots don't trigger 2-3 ms demand-paging stutter spikes during
+         * live gameplay. */
+        size_t slot_cap = s_blob_size + (s_blob_size / 8) + 4096;
+        for (int i = 0; i < s_depth; i++) {
+            if (!s_ring[i].blob) {
+                s_ring[i].blob = (uint8_t *)calloc(1, slot_cap);
+                if (s_ring[i].blob) {
+                    s_ring[i].cap = slot_cap;
+                    for (size_t off = 0; off < slot_cap; off += 4096)
+                        s_ring[i].blob[off] = 0;
+                }
+            }
+        }
     }
 
     slot = &s_ring[s_head];
@@ -195,15 +209,27 @@ void snes_rewind_note_frame(void) {
     capture();
 }
 
+int snes_rewind_will_capture_next(void) {
+    if (!snes_rewind_enabled() || s_open) return 0;
+#if defined(SNESRECOMP_NET)
+    if (snes_netplay_active()) return 0;
+#endif
+    return (s_frame_tick + 1 >= s_interval) ? 1 : 0;
+}
+
 void snes_rewind_note_framebuffer(const uint32_t *fb, int width, int height) {
     int x, y;
     if (!snes_rewind_enabled() || !fb || width <= 0 || height <= 0 || s_open)
         return;
+    uint32_t x_step = ((uint32_t)width << 16) / (uint32_t)RW_THUMB_W;
     for (y = 0; y < RW_THUMB_H; y++) {
         const uint32_t *row = fb + (size_t)(y * height / RW_THUMB_H) * (size_t)width;
         uint32_t *out = s_live_thumb + (size_t)y * RW_THUMB_W;
-        for (x = 0; x < RW_THUMB_W; x++)
-            out[x] = row[x * width / RW_THUMB_W] | 0xFF000000u;
+        uint32_t x_acc = 0;
+        for (x = 0; x < RW_THUMB_W; x++) {
+            out[x] = row[x_acc >> 16] | 0xFF000000u;
+            x_acc += x_step;
+        }
     }
     s_have_live_thumb = 1;
 }

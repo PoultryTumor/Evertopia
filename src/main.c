@@ -34,7 +34,9 @@
 #include "snesrecomp_rom_identity.h"  /* generated from rom_identity.txt */
 #include "snes/snes.h"
 #include "snes/ppu.h"
+#include "snes/interp_bridge.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef RECOMP_LAUNCHER
@@ -242,6 +244,10 @@ static void SoeConfigureLauncher(struct RecompLauncherCGameInfo *gi)
 
 static void SoeAfterSnesInit(void)
 {
+    /* Declare Secret of Evermore's main-loop VBlank wait ($80:858F: CMP $0100 / BEQ $858F)
+     * as an interrupt-only idle poll so the interpreter replays it cleanly to the frame
+     * deadline instead of executing ~3,500 redundant iterations per frame. */
+    interp_bridge_set_idle_poll(0x80858Fu);
     SoeInitUiSfx();
 #ifdef __ANDROID__
     SoeAndroidFirstBootExtract(SoeAssetCacheInit);
@@ -312,6 +318,10 @@ __attribute__((visibility("default"))) int SDL_main(int argc, char **argv)
     SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
     /* Allow controllers to work cleanly even when USB/Bluetooth devices attach. */
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+#elif defined(__linux__)
+    /* On Linux NVIDIA GLX, default __GL_YIELD busy-spins a CPU core during VSync
+     * waits. USLEEP yields cleanly while waiting for VBlank unless user overrides. */
+    setenv("__GL_YIELD", "USLEEP", 0);
 #endif
     /* Check for --export-maps argument */
     for (int i = 1; i < argc; i++) {

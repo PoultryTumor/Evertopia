@@ -8,6 +8,15 @@ A native PC static recompilation port of **Secret of Evermore** (SNES, USA), bui
 
 ## What's New
 
+### v1.0.0
+- **Smooth Frame Pacing & High-Refresh VSync Lock:**
+  - Fixed an audio buffer watermark collision (`HOST_AUDIO_HIGH_WATER == RTL_AUDIO_TARGET_NATIVES = 1600`) that stalled `RtlRunFrame()` for 4–12 ms every frame waiting on audio callbacks; raised `HOST_AUDIO_HIGH_WATER` to `4096` for stutter-free audio and simulation.
+  - Hardened decoupled high-refresh (100 Hz+) VSync pacing with dynamic sim/draw work prediction, instant VSync lock after boot/loadstate/menu close, precision low-CPU `SDL_DelayNS` hybrid deadline sleeps, unconditional 3-PBO OpenGL uploads, and continuous subpixel camera residuals across `alpha == 1.0` VBlanks (eliminating 20 Hz scroll hitches).
+  - Added Linux X11 compositor bypass (`SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR=1`) for Cinnamon/Muffin fullscreen and default `__GL_YIELD=USLEEP` to eliminate NVIDIA GLX VSync busy-spin.
+- **CPU & Render Performance Overhaul (~48% Lower CPU Usage):**
+  - Declared Secret of Evermore's `$80:858F` VBlank wait loop as an interrupt-only idle poll (cutting interpreted instructions in half), enabled bit-exact fast runtime defaults (`SLICE8` CRC32, `FUSED` ROM reads, `NATIVE` APU timing & DSP mixing, `HLE` frame staging & 8bpp PPU), pre-allocated rewind ring buffers to eliminate demand-paging spikes, and added Bloom empty-row skipping + static-frame post-FX caching.
+- **All Platforms Updated (`v1.0.0`):** Rebuilt and published Linux x64 Setup Pack, Android arm64 APK (`versionCode 10000`), and Windows x64 Setup Pack.
+
 ### v0.9.14
 - **What's Fixed — Subpixel Sprite Interpolation Glitching & Horizontal Teleporting:**
   - **Fixed Widescreen Edge Sprite Teleporting (+81 px / −81 px):** Fixed `RenderInterpolatedSprites()` reading the live `ppu->extraFrameLeft` (which `host_main` resets to the symmetric widescreen budget before the next frame begins) on `alpha == 1.0` presentations and unmatched/newly-spawned sprites. It now always uses the captured `s_frame_left_curr` from `SoeCapturePostSimState()`, eliminating the violent horizontal jumping to/from the right (or left) near view-anchored map edges. Also resets interpolation state cleanly on save-state load (`SoeLoadStateSlot()`).

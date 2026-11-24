@@ -36,6 +36,16 @@ set(SNESRECOMP_ENABLE_MODS ON CACHE BOOL
     "Mod package loader + trusted plugins (required for every title)" FORCE)
 set(SNESRECOMP_CRC32_IMPL "SLICE8" CACHE STRING
     "IEEE CRC implementation (BYTE or SLICE8)")
+set(SNESRECOMP_INTERP_READ_IMPL "FUSED" CACHE STRING
+    "Interpreter ROM read decoding (REFERENCE or FUSED)")
+set(SNESRECOMP_APU_TIME_IMPL "NATIVE" CACHE STRING
+    "APU time advancement (LLE or NATIVE)")
+set(SNESRECOMP_DSP_MIX_IMPL "NATIVE" CACHE STRING
+    "DSP voice mixing (LLE or NATIVE)")
+set(SNESRECOMP_FRAME_IMPL "HLE" CACHE STRING
+    "Desktop frame composition (LLE or HLE)")
+set(SNESRECOMP_PPU_8BPP_IMPL "HLE" CACHE STRING
+    "8bpp tiled renderer (LLE or HLE)")
 include(${SNESRECOMP_ROOT}/runner/runner.cmake)
 
 set(_SOE_SOURCES

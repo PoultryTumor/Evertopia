@@ -366,15 +366,38 @@ static void ProfileEnd(unsigned stage, double start) {
 }
 static void WaitUntil(double deadline) {
   double profile_start = ProfileStart();
-  /* Short deadline wait: a fixed 1ms sleep on every presentation-only
-   * iteration unnecessarily overshoots near deadlines. */
+  /* Precision hybrid sleep: sleep with sub-ms resolution until ~0.30 ms before
+   * the deadline, then briefly yield/pause so frame deadlines land within a few
+   * microseconds without burning CPU on tight SDL_Delay(0) syscall loops. */
   double now = MonotonicSeconds();
   while (now < deadline) {
-    double remaining_ms = (deadline - now) * 1000;
-    if (remaining_ms > 1.5)
-      SDL_Delay((Uint32)(remaining_ms - 0.5));
-    else
+    double remaining = deadline - now;
+    if (remaining > 0.0004) {
+      double sleep_s = remaining - 0.0003;
+#if SNESRECOMP_SDL3
+      SDL_DelayNS((Uint64)(sleep_s * 1e9));
+#elif !defined(_WIN32)
+      struct timespec ts;
+      ts.tv_sec = (time_t)sleep_s;
+      ts.tv_nsec = (long)((sleep_s - (double)ts.tv_sec) * 1e9);
+      nanosleep(&ts, NULL);
+#else
+      if (remaining > 0.0015)
+        SDL_Delay((Uint32)((remaining - 0.0005) * 1000.0));
+      else
+        SDL_Delay(0);
+#endif
+    } else {
+#if defined(_MSC_VER)
+      YieldProcessor();
+#elif defined(__x86_64__) || defined(__i386__)
+      __asm__ __volatile__("pause" ::: "memory");
+#elif defined(__aarch64__) || defined(__arm__)
+      __asm__ __volatile__("yield" ::: "memory");
+#else
       SDL_Delay(0);
+#endif
+    }
     now = MonotonicSeconds();
   }
   ProfileEnd(kProfileWait, profile_start);
@@ -1466,7 +1489,9 @@ static void NoteStateFrame(void) {
   if (g_ppu && g_ppu->renderBuffer) {
     int width = g_game->native_widescreen ? g_snes_width : 256;
     snes_savestate_menu_note_frame((const uint32_t *)g_ppu->renderBuffer, width, g_snes_height);
-    snes_rewind_note_framebuffer((const uint32_t *)g_ppu->renderBuffer, width, g_snes_height);
+    if (snes_rewind_will_capture_next()) {
+      snes_rewind_note_framebuffer((const uint32_t *)g_ppu->renderBuffer, width, g_snes_height);
+    }
   }
   snes_rewind_note_frame();
 }
@@ -1580,17 +1605,23 @@ static void DrawPpuFrameWithPerf(void);
 static double s_last_vsync_done = 0.0;
 static bool s_vsync_blocks = false;
 static int s_vsync_fast_streak = 0;
+static double s_sim_work_ema = 0.0025; /* guest + raster + compose work estimate */
 
 static void HostResetVideoClock(SnesHostClock *c, double now,
                                 double sim_hz, double pres_hz, bool decoupled) {
   snes_host_clock_reset(c, now, sim_hz, pres_hz);
   s_last_vsync_done = 0.0;
-  s_vsync_blocks = false;
+  /* When VSync is active, optimistically assume hardware VSync paces swaps so
+   * boot, loadstate, and menu-close lock onto VBlank on frame 1 instead of
+   * spending ~30 frames in software-timer pacing waiting for a slow swap.
+   * PresentWithPacedClock still demotes to false after 4 fast sub-period swaps
+   * if the driver forces VSync off. */
+  s_vsync_blocks = (VSyncInterval() > 0);
   s_vsync_fast_streak = 0;
   /* Start the first decoupled present ~0.72 of a presentation period after
    * reset so the first 60 Hz simulation finishes well before its present,
    * avoiding 3.7ms / 12.9ms collision sawtooths on non-blocking presents. */
-  if (decoupled && pres_hz > sim_hz && pres_hz > 0.0) {
+  if (decoupled && pres_hz > sim_hz && pres_hz > 0.0 && !s_vsync_blocks) {
     c->next_presentation = now + 0.72 / pres_hz;
   }
 }
@@ -1598,10 +1629,10 @@ static void HostResetVideoClock(SnesHostClock *c, double now,
 static void PresentWithPacedClock(SnesHostClock *video_clock, bool paced_custom,
                                   double presentation_hz, bool menu_paused) {
   bool vsync_active = (VSyncInterval() > 0);
+  double period = (presentation_hz > 0.0) ? (1.0 / presentation_hz) : 0.0;
   double presented_at = MonotonicSeconds();
   double alpha_time = presented_at;
-  if (paced_custom && vsync_active && s_vsync_blocks && s_last_vsync_done > 0.0 && presentation_hz > 0.0) {
-    double period = 1.0 / presentation_hz;
+  if (paced_custom && vsync_active && s_vsync_blocks && s_last_vsync_done > 0.0 && period > 0.0) {
     if (presented_at - s_last_vsync_done < 0.25) {
       alpha_time = s_last_vsync_done + period;
       while (alpha_time + 0.0005 < presented_at) alpha_time += period;
@@ -1614,11 +1645,19 @@ static void PresentWithPacedClock(SnesHostClock *video_clock, bool paced_custom,
   double present_end = MonotonicSeconds();
   double present_dur = present_end - presented_at;
   if (vsync_active) {
+    double since_last = (s_last_vsync_done > 0.0) ? (present_end - s_last_vsync_done) : period;
     if (present_dur >= 0.0015) {
       s_last_vsync_done = present_end;
       s_vsync_fast_streak = 0;
       s_vsync_blocks = true;
-    } else if (present_dur < 0.0012 && ++s_vsync_fast_streak >= 4) {
+    } else if (s_vsync_blocks && period > 0.0 && since_last >= period * 0.75) {
+      /* Work+wait finished close to the VBlank edge so SwapWindow only blocked
+       * briefly (< 1.5 ms), yet the inter-present interval still matches the
+       * display refresh. Keep VSync-locked pacing instead of dropping out. */
+      s_last_vsync_done = present_end;
+      s_vsync_fast_streak = 0;
+    } else if (present_dur < 0.0012 && (period <= 0.0 || since_last < period * 0.55) &&
+               ++s_vsync_fast_streak >= 4) {
       s_vsync_blocks = false;
       s_last_vsync_done = 0.0;
     }
@@ -1633,12 +1672,11 @@ static void PresentWithPacedClock(SnesHostClock *video_clock, bool paced_custom,
     video_clock->next_presentation = present_end;
     ++video_clock->presentations;
   } else {
-    double period = (presentation_hz > 0.0) ? (1.0 / presentation_hz) : 0.0;
     if (paced_custom && period > 0.0 &&
         (presented_at - video_clock->next_presentation) > period * 0.25) {
       /* If simulation crossed next_presentation (60.0988 Hz beating against
-       * 120 Hz), re-anchor the grid from post-sim presented_at so the next
-       * present lands 8.33ms later instead of locking into a 13ms/3ms sawtooth. */
+       * high refresh), re-anchor the grid from post-sim presented_at so the next
+       * present lands one display period later instead of locking into a sawtooth. */
       video_clock->next_presentation = presented_at + period;
       ++video_clock->presentations;
     } else {
@@ -2502,7 +2540,11 @@ static _Thread_local uint32_t g_audio_stalled_read;
 static bool g_audio_primed;
 static uint32_t g_audio_reset_req = 1u;
 #define HOST_AUDIO_PREFILL 640u
-#define HOST_AUDIO_HIGH_WATER 1600u
+/* Must stay well above RTL_AUDIO_TARGET_NATIVES (1600u) + one frame (~534u)
+ * so ordinary 60 Hz gameplay never stalls inside RtlRunFrame() waiting on the
+ * audio callback, while still capping runaway NMI-disabled loaders well below
+ * DSP_SAMPLE_RING (8192u). */
+#define HOST_AUDIO_HIGH_WATER 4096u
 #if SNESRECOMP_SDL3
 /* SDL3 replaced the pull callback with an SDL_AudioStream the app pushes into,
  * so the mixer needs a scratch buffer sized to whatever the stream asks for. */
@@ -4311,6 +4353,11 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
     g_config.audio_samples = kDefaultSamples;
 
   SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+#ifdef SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR
+  /* Unredirect fullscreen windows on X11 compositors (Cinnamon/Muffin, KWin,
+   * Marco, XFWM) so the desktop compositor cannot add double-VSync judder. */
+  SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "1");
+#endif
 
   // set up SDL
   SDL_SetMainReady();
@@ -4937,8 +4984,23 @@ error_reading:;
       double wait_now = MonotonicSeconds();
       bool avoid_vsync_overshoot = false;
       if (paced_custom && snes_host_clock_presentation_due(&video_clock, wait_now)) {
-        avoid_vsync_overshoot = (VSyncInterval() > 0 && s_vsync_blocks) &&
-            ((video_clock.next_simulation - wait_now) < (0.7 / presentation_hz));
+        if (VSyncInterval() > 0 && s_vsync_blocks && presentation_hz > 0.0) {
+          double period = 1.0 / presentation_hz;
+          double next_vsync = (s_last_vsync_done > 0.0 && (wait_now - s_last_vsync_done) < 0.25)
+                                  ? (s_last_vsync_done + period)
+                                  : (wait_now + period);
+          while (next_vsync + 0.0005 < wait_now) next_vsync += period;
+          /* Only wait for next_simulation instead of presenting an interpolated
+           * frame if simulation + raster + compose can safely finish before the
+           * upcoming VBlank (including CPU powersave/800 MHz headroom); otherwise
+           * present now so we never miss a refresh. */
+          double est_work = s_sim_work_ema * 1.45 + 0.0018;
+          double min_headroom = period * 0.45;
+          if (min_headroom < 0.0045) min_headroom = 0.0045;
+          if (est_work < min_headroom) est_work = min_headroom;
+          if (est_work > period * 0.75) est_work = period * 0.75;
+          avoid_vsync_overshoot = (video_clock.next_simulation + est_work) < next_vsync;
+        }
         if (!avoid_vsync_overshoot) {
           PresentWithPacedClock(&video_clock, true, presentation_hz,
                                 game->menu_paused && game->menu_paused());
@@ -5194,6 +5256,15 @@ error_reading:;
     NoteStateFrame();
     g_audio_producer_active = false;
     ProfileEnd(kProfileRaster, profile_start);
+    {
+      double sim_work = MonotonicSeconds() - guest_start;
+      if (sim_work > 0.0 && sim_work < 0.05) {
+        /* Fast upward attack, gentle downward decay so a sudden heavier frame
+         * immediately increases VBlank safety margin. */
+        double alpha_ema = (sim_work > s_sim_work_ema) ? 0.35 : 0.08;
+        s_sim_work_ema += alpha_ema * (sim_work - s_sim_work_ema);
+      }
+    }
     profile_start = ProfileStart();
     if (state_trace && frameCtr >= trace_first)
       fprintf(state_trace, "%u,%08x,%04x,%04x,%04x,%04x,%04x,%02x,%02x,%02x\n",

@@ -59,6 +59,10 @@ int snes_rewind_enabled(void);
  * save-state menu is up, and never during netplay). */
 void snes_rewind_note_frame(void);
 
+/* True if the next snes_rewind_note_frame() call will capture a snapshot
+ * (so the caller can skip thumbnail downsampling on non-capture frames). */
+int snes_rewind_will_capture_next(void);
+
 /* Offer the presented frame as the thumbnail for the NEXT capture. Cheap: it
  * downsamples into a small fixed buffer and keeps nothing else. */
 void snes_rewind_note_framebuffer(const uint32_t *fb, int width, int height);

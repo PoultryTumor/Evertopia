@@ -458,7 +458,7 @@ static void OpenGLRenderer_BeginDraw(int width, int height, uint8 **pixels, int 
    * invalidation (orphaning) so the host writes the staged frame once
    * directly into driver-mapped DMA memory. */
   if (!g_config.mode7.enabled && g_pbo[0] != 0) {
-    g_pbo_index = (g_pbo_index + 1) % (g_triple_buffering ? 3 : 2);
+    g_pbo_index = (g_pbo_index + 1) % kNumUploadPbos;
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, g_pbo[g_pbo_index]);
     glBufferData(GL_PIXEL_UNPACK_BUFFER, (GLsizeiptr)byte_size, NULL, GL_STREAM_DRAW);
     void *mapped = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, (GLsizeiptr)byte_size,
@@ -618,7 +618,7 @@ static void OpenGLRenderer_EndDraw(void) {
       glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
     } else if (g_pbo[0] != 0 && g_screen_buffer != NULL) {
       size_t byte_size = (size_t)g_draw_width * (size_t)g_draw_height * 4u;
-      g_pbo_index = (g_pbo_index + 1) % (g_triple_buffering ? 3 : 2);
+      g_pbo_index = (g_pbo_index + 1) % kNumUploadPbos;
       glBindBuffer(GL_PIXEL_UNPACK_BUFFER, g_pbo[g_pbo_index]);
       glBufferData(GL_PIXEL_UNPACK_BUFFER, (GLsizeiptr)byte_size, NULL, GL_STREAM_DRAW);
       void *mapped = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, (GLsizeiptr)byte_size,
